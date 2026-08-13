@@ -1,0 +1,53 @@
+[package]
+name = "trxscan"
+version = "0.0.0"
+edition = "2021"
+description = "Headless diffusion-MRI simulator: Fiberfox physics in Rust, on trx-rs/odx-rs"
+license = "MIT OR Apache-2.0"
+repository = ""
+publish = false
+
+# Every external dependency is OPTIONAL and OFF by default so the scaffold builds
+# with pure std (the implemented `scheme` module + its tests need nothing). Turn on
+# a feature as you implement the module that needs it (see docs/PORT-PLAN.md).
+[features]
+default = []
+# I/O: TRX streamlines + NIfTI tissue maps + 4D DWI writer
+io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra"]
+# k-space acquisition stage (FFT-based)
+kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr"]
+# config parsing (replaces the .ffp XML)
+config = ["dep:serde", "dep:toml"]
+# ground-truth ODF/peak export + optional SH `todf` fast-mode (pulls odx-rs → hdf5)
+odx = ["dep:odx-rs", "io"]
+# command-line front end
+cli = ["dep:clap", "dep:anyhow", "io", "kspace", "config"]
+# parallelism
+par = ["dep:rayon"]
+
+[[bin]]
+name = "trxscan-stagea"
+path = "src/bin/trxscan_stagea.rs"
+required-features = ["io"]
+
+[[bin]]
+name = "trxscan"
+path = "src/bin/trxscan.rs"
+required-features = ["io"]
+
+[dependencies]
+# --- your crates (path deps to siblings; see README layout) ---
+trx-rs = { path = "../rust/trx-rs", optional = true }
+odx-rs = { path = "../odx-rs", optional = true }
+# --- I/O + math (versions matched to trxviz-core / odx-rs) ---
+nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
+ndarray = { version = "0.16", optional = true }
+nalgebra = { version = "0.33", optional = true }
+rustfft = { version = "6", optional = true }
+rand = { version = "0.8", optional = true }
+rand_distr = { version = "0.4", optional = true }
+rayon = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
