@@ -4,8 +4,9 @@
 //! (see [`crate::scheme`]): pass Fiberfox-encoded gradients (`unit_bvec * sqrt(b/b_max)`) and set
 //! `b_value = b_max`.
 //!
-//! [`Stick`] is implemented and tested (it's the load-bearing intra-axonal model). [`Tensor`] and
-//! [`Ball`] carry their algorithm in the doc comment; fill them in per `docs/PORT-PLAN.md`.
+//! [`Stick`] (intra-axonal), [`Tensor`] (cylindrically-symmetric zeppelin), and [`Ball`]
+//! (isotropic GM / CSF free water) are implemented and unit-tested. The general `d2 != d3` tensor,
+//! which needs a kernel-frame rotation, is not yet handled.
 
 use crate::Vec3;
 

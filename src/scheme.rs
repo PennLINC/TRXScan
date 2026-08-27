@@ -9,7 +9,7 @@
 //! and the effective b-value is `b_max * (b_i / b_max) = b_i`. (This is the `b2q=True` path in
 //! PennBBL's `fiberfox-wrapper/simulate_scheme.py`.)
 //!
-//! This module is dependency-free (pure std) and fully implemented.
+//! This module is dependency-free (pure std).
 
 use std::fmt;
 use std::path::Path;

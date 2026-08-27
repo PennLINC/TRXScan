@@ -3,7 +3,7 @@
 //!
 //! Port of `IntersectImage` (`Algorithms/itkTractsToDWIImageFilter.cpp:1105`). Unlike TRXViz's
 //! `BoundaryContactField` (midpoint voxel, isotropic axis-aligned grid), this is a proper
-//! parametric voxel traversal bound to the acquisition grid. See `docs/PORT-PLAN.md`.
+//! parametric voxel traversal bound to the acquisition grid.
 //!
 //! Method: map both endpoints into continuous voxel coordinates with `world_to_voxel`; the segment
 //! is `p(t) = a_v + t·(b_v − a_v)`, `t ∈ [0,1]`. Collect every integer-boundary crossing `t`, and

@@ -1,4 +1,4 @@
-//! Stage A assembly: streamlines + tissue maps → clean per-voxel, per-gradient signal.
+//! Signal-stage assembly: streamlines + tissue maps → clean per-voxel, per-gradient signal.
 //!
 //! Port of the accumulation + normalization in `itkTractsToDWIImageFilter.cpp:1108–1230`.
 //!
@@ -11,9 +11,19 @@
 //! **Design note (FORCE).** The per-voxel result this builds *is* a Gaussian multi-tensor mixture
 //! — the same object dipy's FORCE (`dipy.sims.force`) samples parametrically. The difference is
 //! that here the fiber orientations come from the **tractogram**, not a Watson/Bingham prior, so
-//! there's no library coverage gap (FORCE FINDINGS §1) and the geometry is ground truth. Retaining
-//! this mixture (orientations + weights + diffusivities per voxel) is the natural hook to later
-//! emit FORCE's closed-form ground-truth scalars (DKI/MAP-MRI/QTI/RISH). See docs.
+//! there's no library coverage gap and the geometry is ground truth. Retaining this mixture
+//! (orientations + weights + diffusivities per voxel) is the natural hook to later emit FORCE's
+//! closed-form ground-truth scalars (DKI/MAP-MRI/QTI/RISH).
+//!
+//! **Histogram-first path.** [`generate_mixture`] + [`signal_from_mixture`]
+//! re-express that same accumulation with the marginalization *deferred*: segments land in a
+//! per-voxel orientation histogram ([`crate::mixture::MixtureField`]) and the signal is computed
+//! **from** the histogram, so the signal-stage DWI and the closed-form ground truth of
+//! [`crate::microstructure`] derive from one object and cannot disagree by construction. Deferring
+//! also buys the two things the per-segment path cannot express: per-streamline (SIFT2) weights
+//! and a dispersion kernel. Both paths expect the caller to set `params.b_value = scheme.b_max`
+//! (what the binaries do) — the per-volume b-value rides in the gradient norm, see
+//! [`crate::scheme`].
 
 use crate::mat;
 use crate::raster::Grid;
@@ -44,11 +54,20 @@ pub struct CompartmentParams {
     pub t2_fiber: f32,              // T2 (ms) of the fiber (intra+extra) compartment
     pub t2_gm: f32,
     pub t2_csf: f32,
+    /// fraction of the GM compartment that is a **restricted** (soma/neurite) ball — the
+    /// non-Gaussian-looking signal real GM keeps at high b; a second Gaussian, so every
+    /// closed form stays exact (FORCE's soma slot). Order-of-magnitude values, not fitted.
+    pub gm_restricted_frac: f64,
+    /// diffusivity of the restricted GM ball (mm^2/s)
+    pub d_soma: f64,
 }
 
 impl Default for CompartmentParams {
     fn default() -> Self {
         // Diffusivities match the Fiberfox ffp used for the reference dataset (neonatal-ish).
+        // NOTE the T2s: at TE ~88 ms, 180 vs 220 ms nearly cancel — neonatal data has weak
+        // GM/WM contrast at low b, and so does this parameter set. For adult subjects use
+        // [`CompartmentParams::adult`].
         CompartmentParams {
             b_value: 1000.0,
             fiber_radius_mm: 1.0,
@@ -61,6 +80,58 @@ impl Default for CompartmentParams {
             t2_fiber: 180.0,
             t2_gm: 220.0,
             t2_csf: 2500.0,
+            gm_restricted_frac: 0.15,
+            d_soma: 0.0003,
+        }
+    }
+}
+
+impl CompartmentParams {
+    /// Adult 3T parameter set. T2s per relaxometry literature (Stanisz 2005 / Wansapura 1999:
+    /// WM ≈ 70 ms, cortical GM ≈ 100 ms at 3T) — at TE ~88 ms these give the familiar
+    /// GM-brighter-than-WM b0/low-b contrast that the neonatal set lacks. Diffusivities:
+    /// intra-axonal axial 1.7e-3 (standard-model range), extra-axonal (1.7, 0.6, 0.6)e-3 —
+    /// the 0.55/0.45 mixture lands WM MD ≈ 0.75e-3 — and GM ball 0.85e-3, adult cortical MD.
+    pub fn adult() -> Self {
+        CompartmentParams {
+            b_value: 1000.0,
+            fiber_radius_mm: 1.0,
+            intra_frac: 0.55,
+            extra_frac: 0.45,
+            d_intra: 0.0017,
+            d_extra: (0.0017, 0.0006, 0.0006),
+            d_gm: 0.00085,
+            d_csf: 0.003,
+            t2_fiber: 70.0,
+            t2_gm: 100.0,
+            t2_csf: 2000.0,
+            gm_restricted_frac: 0.20,
+            d_soma: 0.0003,
+        }
+    }
+
+    /// Infant (~3–6 mo) parameter set: largely **unmyelinated** WM — high diffusivity and low
+    /// anisotropy (infant DTI literature: WM MD ≈ 1.2–1.4e-3, FA low outside the PLIC). Lower
+    /// intra-axonal fraction (0.35) and high extra-axonal radial diffusivity give a mixture
+    /// WM MD ≈ 1.15e-3; GM ball 1.3e-3. T2s keep the neonatal ffp values — infant WM/GM T2s
+    /// are long and *similar*, so the weak b0 GM/WM contrast this produces is itself
+    /// age-appropriate. (A myelination *gradient* — PLIC/splenium restricted, periphery free —
+    /// needs per-voxel parameter maps; this is the best a global set can do.)
+    pub fn infant() -> Self {
+        CompartmentParams {
+            b_value: 1000.0,
+            fiber_radius_mm: 1.0,
+            intra_frac: 0.35,
+            extra_frac: 0.65,
+            d_intra: 0.0019,
+            d_extra: (0.0019, 0.0012, 0.0012),
+            d_gm: 0.0013,
+            d_csf: 0.003,
+            t2_fiber: 180.0,
+            t2_gm: 220.0,
+            t2_csf: 2500.0,
+            gm_restricted_frac: 0.25,
+            d_soma: 0.0003,
         }
     }
 }
@@ -72,7 +143,7 @@ pub struct CleanDwi {
     pub data: Vec<f32>,
 }
 
-/// Per-compartment clean signals kept separate (so Stage B can apply per-compartment T2), each in
+/// Per-compartment clean signals kept separate (so the acquisition stage can apply per-compartment T2), each in
 /// the same layout as [`CleanDwi`]. `t2[i]` (ms) is the T2 of `images[i]`.
 pub struct Compartments {
     pub dims: [usize; 3],
@@ -95,7 +166,7 @@ impl Compartments {
     }
 }
 
-/// Assemble Stage A as a mixed S/S₀ signal (compartment sum, no T2).
+/// Assemble the signal stage as a mixed S/S₀ signal (compartment sum, no T2).
 pub fn generate_clean_signal(
     grid: &Grid,
     positions: &[[f64; 3]],
@@ -107,8 +178,8 @@ pub fn generate_clean_signal(
     generate_compartments(grid, positions, offsets, tissue, scheme, params).mixed()
 }
 
-/// Assemble Stage A keeping the fiber / GM / CSF compartments separate (for per-tissue T2 in
-/// Stage B). `positions` is flat world-mm points; `offsets` is CSR (len = n_streamlines+1).
+/// Assemble the signal stage keeping the fiber / GM / CSF compartments separate (for per-tissue T2
+/// in the acquisition stage). `positions` is flat world-mm points; `offsets` is CSR (len = n_streamlines+1).
 pub fn generate_compartments(
     grid: &Grid,
     positions: &[[f64; 3]],
@@ -246,11 +317,277 @@ pub fn generate_compartments(
     }
 }
 
-/// Motion-aware Stage A — the faithful port of Fiberfox's `SimulateMotion`: for each volume, the
+/// Rasterize the streamlines into the **per-voxel orientation histogram** — the primary signal-stage
+/// object — instead of marginalizing to a signal at accumulation time.
+///
+/// The segment loop is the one in [`generate_compartments`]: same iteration, same
+/// `mat::normalize` degenerate-direction skip, same [`Grid::intersect_segment`] hits. What changes
+/// is where the weight goes. For streamline `s` with weight `w_s` (SIFT2 / Fiberfox's dropped
+/// `fiberWeight`; `weights == None` ⇒ every `w_s = 1`), each voxel hit of
+/// each segment contributes `w = w_s · length · π·r²` to that voxel's histogram row:
+///
+/// - `kappa == None` — all of `w` on [`crate::sphere::HemiSphere::nearest`] (plain binning);
+/// - `kappa == Some(k)` — spread by a sign-free Watson kernel `K_v = exp(k·((v·d̂)² − 1))`,
+///   normalized so `Σ_v K_v = 1`. That is the fixel dispersion — the
+///   orientation spread the curvature-regularized tractogram smooths away — and because it is
+///   normalized, the row **sum** is independent of `k`. Subtracting 1 in the exponent (rather than
+///   scaling by `exp(k)` afterwards) keeps it ≤ 0, so large `k` underflows to 0 instead of
+///   overflowing to inf.
+///
+/// Tissue fractions are normalized per voxel exactly as [`generate_compartments`] does (mask
+/// check, `tot ≤ 1e-9` skip, `wm+gm+csf = 1`); voxels that fail either check are left at 0.
+/// [`crate::mixture::MixtureField::fallback`] marks masked WM voxels whose row is empty — the
+/// hindered-isotropic case, which [`signal_from_mixture`] and the closed forms must both treat as
+/// an isotropic Gaussian at `md`, or truth and signal disagree where the tractogram is sparse.
+pub fn generate_mixture(
+    grid: &Grid,
+    positions: &[[f64; 3]],
+    offsets: &[u32],
+    weights: Option<&[f32]>,
+    tissue: &TissueFractions,
+    params: &CompartmentParams,
+    kappa: Option<f64>,
+    sphere: crate::sphere::HemiSphere,
+) -> crate::mixture::MixtureField {
+    let [nx, ny, nz] = grid.dims;
+    let nvox = nx * ny * nz;
+    let nvert = sphere.len();
+    let flat = |v: [usize; 3]| v[0] + nx * (v[1] + ny * v[2]);
+    let seg_area = PI * params.fiber_radius_mm * params.fiber_radius_mm;
+    let n_streamlines = offsets.len().saturating_sub(1);
+
+    // SERIAL on purpose — do NOT copy the chunked-buffer pattern from `generate_compartments`.
+    // This accumulation is geometry-only (no per-gradient inner loop), so there is little for
+    // rayon to amortize, and a parallel version would need n_groups × (nvox·nvert) f64 buffers:
+    // gigabytes at 321 vertices on any real grid. The parallel win moves to
+    // `signal_from_mixture`, which is the O(nvox·nvert·ngrad) half and writes disjoint chunks.
+    let mut hist = vec![0.0f64; nvox * nvert];
+    let mut kern: Vec<(usize, f64)> = Vec::with_capacity(nvert);
+    for s in 0..n_streamlines {
+        let w_s = weights.map_or(1.0, |w| w.get(s).copied().unwrap_or(1.0) as f64);
+        if w_s == 0.0 {
+            continue;
+        }
+        let (lo, hi) = (offsets[s] as usize, offsets[s + 1] as usize);
+        for j in lo..hi.saturating_sub(1) {
+            let (a, b) = (positions[j], positions[j + 1]);
+            let dir = mat::normalize(mat::sub(b, a));
+            if mat::norm(dir) < 0.5 {
+                continue;
+            }
+            let hits = grid.intersect_segment(a, b);
+            if hits.is_empty() {
+                continue;
+            }
+            // orientation kernel for this segment — identical for every voxel it crosses
+            kern.clear();
+            match kappa {
+                None => kern.push((sphere.nearest(dir), 1.0)),
+                Some(k) => {
+                    let mut sum = 0.0;
+                    for (i, v) in sphere.verts.iter().enumerate() {
+                        let d = mat::dot(*v, dir);
+                        let kv = (k * (d * d - 1.0)).exp();
+                        if kv < 1e-8 {
+                            continue; // relative to K_max = 1 (an exactly aligned vertex)
+                        }
+                        kern.push((i, kv));
+                        sum += kv;
+                    }
+                    if sum > 0.0 {
+                        for e in kern.iter_mut() {
+                            e.1 /= sum;
+                        }
+                    } else {
+                        // κ so large that even the nearest vertex underflowed → plain binning
+                        kern.push((sphere.nearest(dir), 1.0));
+                    }
+                }
+            }
+            for h in &hits {
+                let base = flat(h.voxel) * nvert;
+                let w = w_s * h.length * seg_area;
+                for &(i, kv) in &kern {
+                    hist[base + i] += w * kv;
+                }
+            }
+        }
+    }
+
+    let (mut wm, mut gm, mut csf) = (vec![0.0f32; nvox], vec![0.0f32; nvox], vec![0.0f32; nvox]);
+    let mut fallback = vec![0u8; nvox];
+    for vox in 0..nvox {
+        if tissue.mask[vox] == 0 {
+            continue;
+        }
+        let (mut wf, mut gf, mut cf) =
+            (tissue.wm[vox] as f64, tissue.gm[vox] as f64, tissue.csf[vox] as f64);
+        let tot = wf + gf + cf;
+        if tot <= 1e-9 {
+            continue;
+        }
+        wf /= tot;
+        gf /= tot;
+        cf /= tot;
+        wm[vox] = wf as f32;
+        gm[vox] = gf as f32;
+        csf[vox] = cf as f32;
+        let row: f64 = hist[vox * nvert..(vox + 1) * nvert].iter().sum();
+        fallback[vox] = (wf > 0.0 && row < 1e-12) as u8;
+    }
+
+    crate::mixture::MixtureField {
+        dims: grid.dims,
+        sphere,
+        odf: hist.iter().map(|&x| x as f32).collect(),
+        wm,
+        gm,
+        csf,
+        fallback,
+        params: *params,
+        myelin: None,
+    }
+}
+
+/// Evaluate the clean signal **from** a [`crate::mixture::MixtureField`] — the second half
+/// of the histogram-first path. Returns the same
+/// fiber/GM/CSF [`Compartments`] as [`generate_compartments`], so the acquisition stage is unaffected.
+///
+/// Per voxel, `S_fiber(g) = wm · Σ_v odf[v]·(f_intra·stick(g,v) + f_extra·zeppelin(g,v)) / Σ_v
+/// odf[v]`, with the vertex responses precomputed once into an `nvert × ngrad` table (the cost
+/// shift `O(hits·ngrad) → O(hits) + O(nvox·nvert·ngrad)` of the histogram-first path). An empty row falls back
+/// to the hindered isotropic `exp(-b·|g|²·md)` of [`generate_compartments`] — the same formula,
+/// flagged by [`crate::mixture::MixtureField::fallback`].
+///
+/// As everywhere in the signal stage, the caller is expected to have built the mixture with
+/// `params.b_value = scheme.b_max` (what the binaries pass): the per-volume b-value rides in the
+/// gradient norm, so `scheme` here must be the *same* scheme that set `b_max`.
+pub fn signal_from_mixture(mix: &crate::mixture::MixtureField, scheme: &GradientScheme) -> Compartments {
+    let ngrad = scheme.len();
+    let nvox = mix.nvox();
+    let p = mix.params;
+    let t2 = vec![p.t2_fiber, p.t2_gm, p.t2_csf];
+    if ngrad == 0 {
+        return Compartments { dims: mix.dims, ngrad, images: vec![Vec::new(); 3], t2 };
+    }
+    let grads = scheme.fiberfox_gradients();
+    let stick = Stick { b_value: p.b_value, diffusivity: p.d_intra };
+    let extra = Tensor { b_value: p.b_value, eigenvalues: p.d_extra };
+    let gm = Ball { b_value: p.b_value, diffusivity: p.d_gm };
+    let csf = Ball { b_value: p.b_value, diffusivity: p.d_csf };
+    let soma = Ball { b_value: p.b_value, diffusivity: p.d_soma };
+
+    // response table: resp[v*ngrad + g] = the WM fiber response of a segment along vertex v
+    let mut resp = vec![0.0f64; mix.nvert() * ngrad];
+    for (v, vert) in mix.sphere.verts.iter().enumerate() {
+        for g in 0..ngrad {
+            resp[v * ngrad + g] =
+                p.intra_frac * stick.simulate(grads[g], *vert) + p.extra_frac * extra.simulate(grads[g], *vert);
+        }
+    }
+    // GM = (1−f_r)·free ball + f_r·restricted (soma) ball — keeps real GM's high-b signal
+    let gm_resp: Vec<f64> = (0..ngrad)
+        .map(|g| {
+            (1.0 - p.gm_restricted_frac) * gm.simulate(grads[g])
+                + p.gm_restricted_frac * soma.simulate(grads[g])
+        })
+        .collect();
+    let csf_resp: Vec<f64> = (0..ngrad).map(|g| csf.simulate(grads[g])).collect();
+    let md = mix.md_fallback();
+    let iso: Vec<f64> =
+        (0..ngrad).map(|g| (-p.b_value * mat::dot(grads[g], grads[g]) * md).exp()).collect();
+
+    // one voxel → its ngrad-long slice of each compartment image (read-only over everything else).
+    // With a myelin map, the WM compartment's parameters are lerped per voxel between `mix.params`
+    // (unmyelinated) and `CompartmentParams::adult()` (myelinated) — the global response table
+    // only serves the m ≈ 0 fast path; myelinated voxels evaluate their nonzero bins directly.
+    let adult = CompartmentParams::adult();
+    let voxel = |vox: usize, fib: &mut [f32], gmo: &mut [f32], cso: &mut [f32]| {
+        if !mix.is_masked(vox) {
+            return;
+        }
+        let (wf, gf, cf) = (mix.wm[vox] as f64, mix.gm[vox] as f64, mix.csf[vox] as f64);
+        let row = mix.odf_row(vox);
+        let nz: Vec<(usize, f64)> =
+            row.iter().enumerate().filter(|(_, &w)| w != 0.0).map(|(v, &w)| (v, w as f64)).collect();
+        let tot: f64 = nz.iter().map(|&(_, w)| w).sum();
+        let m = mix.myelin.as_ref().map(|mm| mm[vox] as f64).unwrap_or(0.0);
+        if m <= 1e-3 {
+            for g in 0..ngrad {
+                let fiber_resp = if tot > 1e-12 {
+                    nz.iter().map(|&(v, w)| w * resp[v * ngrad + g]).sum::<f64>() / tot
+                } else {
+                    iso[g] // no streamline support → hindered isotropic
+                };
+                fib[g] = (wf * fiber_resp) as f32;
+                gmo[g] = (gf * gm_resp[g]) as f32;
+                cso[g] = (cf * csf_resp[g]) as f32;
+            }
+        } else {
+            let li = |a: f64, b: f64| a + (b - a) * m;
+            let stick_m = Stick { b_value: p.b_value, diffusivity: li(p.d_intra, adult.d_intra) };
+            let extra_m = Tensor {
+                b_value: p.b_value,
+                eigenvalues: (
+                    li(p.d_extra.0, adult.d_extra.0),
+                    li(p.d_extra.1, adult.d_extra.1),
+                    li(p.d_extra.2, adult.d_extra.2),
+                ),
+            };
+            let (fi, fe) = (li(p.intra_frac, adult.intra_frac), li(p.extra_frac, adult.extra_frac));
+            let md_m = (extra_m.eigenvalues.0 + extra_m.eigenvalues.1 + extra_m.eigenvalues.2) / 3.0;
+            for g in 0..ngrad {
+                let fiber_resp = if tot > 1e-12 {
+                    nz.iter()
+                        .map(|&(v, w)| {
+                            let vert = mix.sphere.verts[v];
+                            w * (fi * stick_m.simulate(grads[g], vert)
+                                + fe * extra_m.simulate(grads[g], vert))
+                        })
+                        .sum::<f64>()
+                        / tot
+                } else {
+                    (-p.b_value * mat::dot(grads[g], grads[g]) * md_m).exp()
+                };
+                fib[g] = (wf * fiber_resp) as f32;
+                gmo[g] = (gf * gm_resp[g]) as f32;
+                cso[g] = (cf * csf_resp[g]) as f32;
+            }
+        }
+    };
+
+    let mut fiber_img = vec![0.0f32; nvox * ngrad];
+    let mut gm_img = vec![0.0f32; nvox * ngrad];
+    let mut csf_img = vec![0.0f32; nvox * ngrad];
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        // Disjoint per-voxel chunks of the three outputs. Unlike the segment accumulation there is
+        // nothing to duplicate — `resp` and `mix` are shared read-only — so plain `par_chunks_mut`
+        // is right here and the buffer-per-chunk dance of `generate_compartments` is not needed.
+        fiber_img
+            .par_chunks_mut(ngrad)
+            .zip(gm_img.par_chunks_mut(ngrad))
+            .zip(csf_img.par_chunks_mut(ngrad))
+            .enumerate()
+            .for_each(|(vox, ((f, g), c))| voxel(vox, f, g, c));
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let it = fiber_img.chunks_mut(ngrad).zip(gm_img.chunks_mut(ngrad)).zip(csf_img.chunks_mut(ngrad));
+        for (vox, ((f, g), c)) in it.enumerate() {
+            voxel(vox, f, g, c);
+        }
+    }
+
+    Compartments { dims: mix.dims, ngrad, images: vec![fiber_img, gm_img, csf_img], t2 }
+}
+
+/// Motion-aware signal stage — the faithful port of Fiberfox's `SimulateMotion`: for each volume, the
 /// streamlines are rigidly transformed by that volume's pose (so segment directions pick up the
 /// rotation → the fiber–gradient angle changes correctly), the tissue maps are resampled by the
 /// same pose, and the volume's signal is **re-rasterized and re-simulated** from the moved head.
-/// Rotation is about the FOV centre; the fieldmap is left in scanner space for Stage B.
+/// Rotation is about the FOV centre; the fieldmap is left in scanner space for the acquisition stage.
 ///
 /// Cost ≈ ×n_volumes the rasterization (parallel over volumes with `par`) — that's the price of
 /// doing it right, and it captures both the geometric and directional motion effects that the
@@ -373,6 +710,8 @@ pub fn generate_compartments_moving(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mixture::MixtureField;
+    use crate::sphere::HemiSphere;
 
     fn grid_1mm(n: usize) -> Grid {
         Grid {
@@ -415,5 +754,130 @@ mod tests {
         // a voxel off the fiber (no WM, no signal)
         let off = flat(3, 4, 4) * dwi.ngrad;
         assert_eq!(dwi.data[off], 0.0);
+    }
+
+    // --- histogram-first path ---
+
+    const N: usize = 6;
+    /// b0, b1000 ∥x (∥ fiber), b1000 ∥y (⊥ fiber).
+    const BVAL: &str = "0 1000 1000";
+    const BVEC: &str = "0 1 0\n0 0 1\n0 0 0";
+
+    #[inline]
+    fn fl(x: usize, y: usize, z: usize) -> usize {
+        x + N * (y + N * z)
+    }
+
+    /// The single-fiber fixture: 6³ 1 mm grid, one straight x-aligned streamline through the
+    /// y=z=2 voxel row, WM=1 + mask=1 along it. `extra_wm` adds WM voxels with no streamline.
+    fn fiber_fixture(extra_wm: &[[usize; 3]]) -> (Grid, Vec<[f64; 3]>, Vec<u32>, TissueFractions) {
+        let nv = N * N * N;
+        let (mut wm, gm, csf, mut mask) = (vec![0f32; nv], vec![0f32; nv], vec![0f32; nv], vec![0u8; nv]);
+        for x in 0..N {
+            wm[fl(x, 2, 2)] = 1.0;
+            mask[fl(x, 2, 2)] = 1;
+        }
+        for v in extra_wm {
+            wm[fl(v[0], v[1], v[2])] = 1.0;
+            mask[fl(v[0], v[1], v[2])] = 1;
+        }
+        let tissue = TissueFractions { dims: [N, N, N], wm, gm, csf, mask };
+        (grid_1mm(N), vec![[0.2, 2.5, 2.5], [5.8, 2.5, 2.5]], vec![0u32, 2], tissue)
+    }
+
+    #[test]
+    fn mixture_single_fiber_matches_per_segment_path() {
+        let (grid, positions, offsets, tissue) = fiber_fixture(&[]);
+        let scheme = GradientScheme::from_str(BVAL, BVEC).unwrap();
+        let params = CompartmentParams { b_value: 1000.0, ..Default::default() };
+
+        let want = generate_clean_signal(&grid, &positions, &offsets, &tissue, &scheme, &params);
+        let mix =
+            generate_mixture(&grid, &positions, &offsets, None, &tissue, &params, None, HemiSphere::icosphere(3));
+        let got = signal_from_mixture(&mix, &scheme).mixed();
+
+        // the fiber is ∥x, which IS an icosphere vertex, so binning is exact here
+        let v = fl(3, 2, 2) * got.ngrad;
+        for g in 0..3 {
+            let (a, b) = (got.data[v + g], want.data[v + g]);
+            assert!((a - b).abs() < 1e-3, "grad {g}: from-mixture {a} vs per-segment {b}");
+        }
+        let (s_b0, s_par, s_perp) = (got.data[v], got.data[v + 1], got.data[v + 2]);
+        assert!((s_b0 - 1.0).abs() < 1e-4, "b0 should be ~1, got {s_b0}");
+        assert!(s_par < s_perp, "∥-fiber should attenuate more: {s_par} vs {s_perp}");
+        assert_eq!(got.data[fl(3, 4, 4) * got.ngrad], 0.0, "off-fiber voxel stays empty");
+    }
+
+    #[test]
+    fn streamline_weights_scale_the_histogram() {
+        let (grid, positions, _, tissue) = fiber_fixture(&[]);
+        let params = CompartmentParams::default();
+        let mix = |pos: &[[f64; 3]], off: &[u32], w: &[f32]| {
+            generate_mixture(&grid, pos, off, Some(w), &tissue, &params, None, HemiSphere::icosphere(3))
+        };
+        // two identical streamlines at weight 1 == one streamline at weight 2
+        let twice = [positions[0], positions[1], positions[0], positions[1]];
+        let a = mix(&twice, &[0, 2, 4], &[1.0, 1.0]);
+        let b = mix(&positions, &[0, 2], &[2.0]);
+        assert!(a.odf.iter().any(|&x| x > 0.0), "histogram must not be empty");
+        for (i, (x, y)) in a.odf.iter().zip(b.odf.iter()).enumerate() {
+            assert!((x - y).abs() <= 1e-6 * x.abs().max(1.0), "bin {i}: {x} vs {y}");
+        }
+        // weight 0 contributes nothing at all — the WM voxel then has no streamline support
+        let z = mix(&positions, &[0, 2], &[0.0]);
+        assert!(z.odf.iter().all(|&x| x == 0.0), "zero-weight streamline must not accumulate");
+        assert_eq!(z.fallback[fl(3, 2, 2)], 1);
+    }
+
+    #[test]
+    fn watson_kappa_spreads_orientation_weight() {
+        let (grid, positions, offsets, tissue) = fiber_fixture(&[]);
+        let scheme = GradientScheme::from_str(BVAL, BVEC).unwrap();
+        let params = CompartmentParams { b_value: 1000.0, ..Default::default() };
+        let vox = fl(3, 2, 2);
+        let mix = |k: Option<f64>| {
+            generate_mixture(&grid, &positions, &offsets, None, &tissue, &params, k, HemiSphere::icosphere(3))
+        };
+        let sig = |m: &MixtureField| {
+            let d = signal_from_mixture(m, &scheme).mixed();
+            [d.data[vox * 3], d.data[vox * 3 + 1], d.data[vox * 3 + 2]]
+        };
+        let nonzero = |m: &MixtureField| m.odf_row(vox).iter().filter(|&&x| x > 0.0).count();
+        let total = |m: &MixtureField| m.odf_row(vox).iter().map(|&x| x as f64).sum::<f64>();
+
+        let (sharp, disp) = (mix(None), mix(Some(20.0)));
+        assert_eq!(nonzero(&sharp), 1, "nearest-vertex binning is a delta");
+        assert!(nonzero(&disp) > nonzero(&sharp), "κ=20 must spread, got {} bins", nonzero(&disp));
+        // the kernel is normalized, so the row sum is κ-independent (1e-6, not 1e-9: `odf` is f32)
+        let (t0, t1) = (total(&sharp), total(&disp));
+        assert!((t1 - t0).abs() <= 1e-6 * t0, "row sum must not change with κ: {t1} vs {t0}");
+
+        let (a, b) = (sig(&sharp), sig(&disp));
+        assert!(b[2] - b[1] < a[2] - a[1], "dispersion lowers anisotropy: {b:?} vs {a:?}");
+        // κ → ∞ collapses back onto the aligned vertex
+        let c = sig(&mix(Some(1e6)));
+        for g in 0..3 {
+            assert!((c[g] - a[g]).abs() < 1e-6, "grad {g}: κ=1e6 gives {} vs binned {}", c[g], a[g]);
+        }
+    }
+
+    #[test]
+    fn fallback_flags_wm_voxels_without_streamlines() {
+        let (grid, positions, offsets, tissue) = fiber_fixture(&[[3, 4, 4]]);
+        let scheme = GradientScheme::from_str(BVAL, BVEC).unwrap();
+        let params = CompartmentParams { b_value: 1000.0, ..Default::default() };
+        let mix =
+            generate_mixture(&grid, &positions, &offsets, None, &tissue, &params, None, HemiSphere::icosphere(3));
+        let (on, off) = (fl(3, 2, 2), fl(3, 4, 4));
+        assert_eq!(mix.fallback[on], 0, "the fiber voxel has streamline support");
+        assert_eq!(mix.fallback[off], 1, "WM with no streamline must be flagged");
+
+        let d = signal_from_mixture(&mix, &scheme).mixed();
+        let s = [d.data[off * 3], d.data[off * 3 + 1], d.data[off * 3 + 2]];
+        let md = (params.d_extra.0 + params.d_extra.1 + params.d_extra.2) / 3.0;
+        let want = (-params.b_value * md).exp() as f32; // |g|² = 1 on the b=1000 shell
+        assert!((s[0] - 1.0).abs() < 1e-6, "b0 unattenuated: {}", s[0]);
+        assert!((s[1] - s[2]).abs() < 1e-7, "hindered fallback is isotropic: {} vs {}", s[1], s[2]);
+        assert!(s[1] < 1.0 && (s[1] - want).abs() < 1e-6, "exp(-b·|g|²·md): {} vs {want}", s[1]);
     }
 }
