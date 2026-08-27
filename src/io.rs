@@ -313,6 +313,17 @@ pub fn write_dwi(out_prefix: &Path, dwi: &CleanDwi, grid: &Grid, scheme: &Gradie
 /// Write a **complex** DWI as BIDS `part-mag` / `part-phase` NIfTIs (phase in radians) + shared
 /// `.bval`/`.bvec` + JSON sidecars — the layout `dwidenoise`/`dwidenoise2` consume for complex
 /// denoising. `out_prefix` is a BIDS stem, e.g. `.../sub-01_ses-V02_dir-AP_run-01`.
+/// Acquisition facts the BIDS JSON sidecars record. A plain struct (not
+/// `kspace::Acquisition`) so `io` stays usable without the `kspace` feature.
+pub struct SidecarInfo {
+    pub reverse_pe: bool,
+    pub total_readout_time: f64, // s
+    pub echo_time: f64,          // s
+    pub partial_fourier: f64,
+    pub accel: usize,
+    pub mb: usize,
+}
+
 pub fn write_complex_dwi(
     out_prefix: &str,
     dims: [usize; 3],
@@ -321,16 +332,83 @@ pub fn write_complex_dwi(
     phase: &[f32],
     grid: &Grid,
     scheme: &GradientScheme,
+    info: &SidecarInfo,
 ) -> R<()> {
     let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
     write_4d(&p("_part-mag_dwi.nii.gz"), dims, ngrad, mag, grid)?;
     write_4d(&p("_part-phase_dwi.nii.gz"), dims, ngrad, phase, grid)?;
     write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)?;
+    // The simulated PE axis is y; forward polarity is "j", --reverse-pe is "j-",
+    // and the two distort in opposite directions (topup/DRBUDDI-ready).
+    let ped = if info.reverse_pe { "j-" } else { "j" };
+    let ees = info.total_readout_time / dims[1].saturating_sub(1).max(1) as f64;
+    let common = format!(
+        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
+         \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
+         \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
+         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}",
+        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
+    );
     std::fs::write(p("_part-mag_dwi.json"),
-        "{\n  \"Manufacturer\": \"TRXScan\",\n  \"ImageComparison\": \"magnitude\"\n}\n")?;
+        format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
     std::fs::write(p("_part-phase_dwi.json"),
-        "{\n  \"Manufacturer\": \"TRXScan\",\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}\n")?;
+        format!("{{\n{common},\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}}\n"))?;
     Ok(())
+}
+
+/// Keep `n` streamlines, sampled without replacement with probability proportional to the SIFT2
+/// weight (uniform when unweighted): Efraimidis-Spirakis exponential keys from a SplitMix64 hashed
+/// per streamline index, so the same `n` and `seed` select the same subset in every binary.
+/// Survivors get uniform weights (total/n), keeping the weighted density unbiased in expectation.
+/// Selecting the top-n *by weight* instead would gut over-tracked bundles: SIFT2 weights are
+/// tight around 1 and high weight means under-tracked, not important.
+pub fn subsample_streamlines(
+    positions: Vec<[f64; 3]>,
+    offsets: Vec<u32>,
+    weights: Option<Vec<f32>>,
+    n: usize,
+    seed: u64,
+) -> (Vec<[f64; 3]>, Vec<u32>, Option<Vec<f32>>) {
+    let total = offsets.len().saturating_sub(1);
+    if n >= total {
+        println!("subsample: {n} >= {total} streamlines, keeping all");
+        return (positions, offsets, weights);
+    }
+    let mut keys: Vec<(f64, u32)> = (0..total as u32)
+        .map(|i| {
+            let mut z = (seed ^ (i as u64).wrapping_mul(0xA24B_AED4_963E_E407))
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let u = ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64; // in (0,1)
+            let w = weights.as_ref().map_or(1.0, |w| (w[i as usize] as f64).max(1e-12));
+            (u.ln() / w, i)
+        })
+        .collect();
+    keys.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+    let mut idx: Vec<u32> = keys[..n].iter().map(|k| k.1).collect();
+    idx.sort_unstable();
+
+    let total_w: f64 = weights.as_ref().map_or(total as f64, |w| w.iter().map(|&x| x as f64).sum());
+    let kept_w: f64 = weights
+        .as_ref()
+        .map_or(n as f64, |w| idx.iter().map(|&i| w[i as usize] as f64).sum());
+    let mut new_pos = Vec::new();
+    let mut new_off = Vec::with_capacity(n + 1);
+    new_off.push(0u32);
+    for &i in &idx {
+        let (s0, e0) = (offsets[i as usize] as usize, offsets[i as usize + 1] as usize);
+        new_pos.extend_from_slice(&positions[s0..e0]);
+        new_off.push(new_pos.len() as u32);
+    }
+    println!(
+        "subsample: kept {n}/{total} streamlines (seed {seed}), {:.1}% of vertices, {:.1}% of weight -> uniform",
+        100.0 * new_pos.len() as f64 / positions.len().max(1) as f64,
+        100.0 * kept_w / total_w,
+    );
+    let new_weights = weights.map(|_| vec![(total_w / n as f64) as f32; n]);
+    (new_pos, new_off, new_weights)
 }
 
 #[cfg(test)]

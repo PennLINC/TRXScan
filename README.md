@@ -128,6 +128,8 @@ sidecars. Options add realism (defaults in brackets):
 | `--kappa <κ>` | — | Watson dispersion applied to the orientation histogram |
 | `--params <preset>` | neonatal | compartment preset: `neonatal`, `adult`, or `infant` |
 | `--myelin <nii>` | — | per-voxel myelination (0..1); lerps WM toward the `adult` endpoint |
+| `--seed <n>` | 0 | noise/dropout realization + `--subsample` draw; 0 reproduces the historical output |
+| `--subsample <N>` | — | keep N streamlines, sampled ∝ SIFT2 weight (survivors re-weighted uniform) |
 
 With `--mb > 1` and `--dropout-rate > 0` it also writes `<out>_desc-dropout_slices.tsv` — the
 dropped-shot ground truth for scoring `eddy --repol` or SHORELine outlier detection.
@@ -147,6 +149,11 @@ trxscan-microstructure \
   --streamlines tracts.trx --out out/sub-01 \
   --kappa 15 --weights sift2_weights --big-delta 0.030 --small-delta 0.010
 ```
+
+`--subsample <N> --seed <n>` work here too and select the **identical** subset as `trxscan`
+given the same values, so ground truth and simulated data always describe the same phantom.
+Sampling is probability-proportional-to-weight (never top-N by weight, which would gut the
+over-tracked bundles); survivors get uniform weights so the density stays unbiased.
 
 Writes 27 maps as `<out>_<name>.nii.gz` — `fa md rd ad ak rk mk mkt kfa micro_fa coherence k_bulk
 k_shear rtop rtap rtpp msd qiv ng ngpar ngperp pa gfa qa icvf odi isovf`. `--big-delta` /

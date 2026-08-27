@@ -115,6 +115,16 @@ struct Cli {
     /// Per-voxel myelination map (0..1): lerps the WM compartment toward the adult endpoint
     #[arg(long, value_name = "NII")]
     myelin: Option<PathBuf>,
+
+    /// Global random seed: selects the noise/dropout realization and drives --subsample.
+    /// The default (0) reproduces the historical output for identical inputs.
+    #[arg(long, default_value_t = 0, value_name = "SEED")]
+    seed: u64,
+    /// Keep only N streamlines, sampled with probability proportional to the SIFT2 weight
+    /// (uniform without weights). The same N and --seed select the identical subset in
+    /// trxscan-microstructure, so simulated data and ground truth describe the same phantom.
+    #[arg(long, value_name = "N")]
+    subsample: Option<usize>,
 }
 
 /// Deterministically pick DWI shots to corrupt: each DWI volume gets a dropout event with
@@ -154,8 +164,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kappa = cli.kappa.filter(|k| *k > 0.0);
 
     let (tissue, grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
-    let (positions, offsets, weights) =
+    let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
+    if let Some(n) = cli.subsample {
+        (positions, offsets, weights) =
+            io::subsample_streamlines(positions, offsets, weights, n, cli.seed);
+    }
     let scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
     let (fmap, fgrid) = io::load_volume(&cli.fmap)?;
     if fgrid.dims != grid.dims {
@@ -210,7 +224,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
     if cli.mb > 1 && cli.dropout_rate > 0.0 {
         let n_shots = (grid.dims[2] / cli.mb).max(1);
-        let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, 0xB10C_5EED);
+        let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate,
+            0xB10C_5EED ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let gt = motion::apply_multiband_motion(
             &mut comp.images, grid.dims, comp.ngrad, grid.voxel_to_world,
             cli.mb, true, &scheme.bvals, scheme.b_max, &events);
@@ -247,6 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_coils: cli.coils,
         accel: cli.accel,
         acs_lines: 24,
+        seed: cli.seed,
     };
     // per-volume eddy gradient = unit bvec × b-value (b0 → zero → no eddy)
     let gradients: Vec<[f64; 3]> = (0..scheme.len())
@@ -264,7 +280,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.accel > 1 { "+GRAPPA" } else { "" },
         t.elapsed());
 
-    io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme)?;
+    let sidecar = io::SidecarInfo {
+        reverse_pe: cli.reverse_pe,
+        total_readout_time: acq.t_line * grid.dims[1] as f64 / 1000.0,
+        echo_time: acq.t_echo / 1000.0,
+        partial_fourier: acq.partial_fourier,
+        accel: cli.accel,
+        mb: cli.mb,
+    };
+    io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
     Ok(())
 }

@@ -88,6 +88,7 @@ pub struct Acquisition {
     pub n_coils: usize,       // receiver coils (1 = uniform single coil); ring-arranged sensitivities
     pub accel: usize,         // GRAPPA acceleration R (1 = fully sampled); undersamples PE lines
     pub acs_lines: usize,     // GRAPPA autocalibration lines (fully-sampled central PE band)
+    pub seed: u64,            // mixed into every derived per-slice seed; 0 reproduces legacy output
 }
 
 /// Spatial sensitivity of `coil` (of `n_coils` arranged in a ring) at pixel `(x,y)`. Uniform for a
@@ -128,6 +129,7 @@ impl Default for Acquisition {
             n_coils: 1,
             accel: 1,
             acs_lines: 24,
+            seed: 0,
         }
     }
 }
@@ -517,7 +519,8 @@ pub fn simulate_acquisition(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37);
+            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
+                .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let out = simulate_slice(&refs, t2, &fslice, nx, ny, z, nz, acq, gradients[g], seed);
             for y in 0..ny {
                 for x in 0..nx {

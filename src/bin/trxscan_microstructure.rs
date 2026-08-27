@@ -85,6 +85,15 @@ struct Cli {
     /// Per-voxel myelination map (0..1): lerps the WM compartment toward the adult endpoint
     #[arg(long, value_name = "NII")]
     myelin: Option<PathBuf>,
+
+    /// Random seed for --subsample; match trxscan's --seed so ground truth and simulation
+    /// describe the same phantom
+    #[arg(long, default_value_t = 0, value_name = "SEED")]
+    seed: u64,
+    /// Keep only N streamlines, sampled with probability proportional to the SIFT2 weight
+    /// (uniform without weights); identical N and --seed select the identical subset in trxscan
+    #[arg(long, value_name = "N")]
+    subsample: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -92,8 +101,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kappa = cli.kappa.filter(|k| *k > 0.0);
 
     let (tissue, grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
-    let (positions, offsets, weights) =
+    let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
+    if let Some(n) = cli.subsample {
+        (positions, offsets, weights) =
+            io::subsample_streamlines(positions, offsets, weights, n, cli.seed);
+    }
     let n_streamlines = offsets.len().saturating_sub(1);
     println!(
         "grid {:?}  {} streamlines{}  kappa {:?}",
