@@ -1,9 +1,9 @@
 //! Readout schemes: `tick → (kx, ky)` k-space trajectory and per-tick timing.
 //!
-//! [`SingleShotEpi`] is a faithful port of `Sequences/mitkSingleShotEpi.h` (implemented + tested).
+//! [`SingleShotEpi`] is a faithful port of `Sequences/mitkSingleShotEpi.h`.
 //! Fast/Conventional spin-echo (`mitkFastSpinEcho.h`, `mitkConventionalSpinEcho.h`) can follow the
 //! same trait later. The `AcquisitionType` interface is purely in-plane — slice timing for
-//! multiband lives in `motion`/`kspace` (see `docs/FEATURES.md`).
+//! multiband lives in `motion`/`kspace`.
 
 /// In-plane readout trajectory + timing. `tick` runs `0..kx_max*ky_max` in acquisition order.
 pub trait Readout {
