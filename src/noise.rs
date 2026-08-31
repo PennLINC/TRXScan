@@ -3,7 +3,7 @@
 //!
 //! Fiberfox adds noise in **k-space, per coil**, with variance scaled by partial Fourier and
 //! `1/(kx·ky)` (`itkKspaceImageFilter.cpp:80`) — so for GRAPPA the g-factor amplification emerges
-//! naturally from reconstructing undersampled noisy multi-coil data (see `docs/FEATURES.md`).
+//! naturally from reconstructing undersampled noisy multi-coil data.
 //! Implement complex-Gaussian in k-space (physically correct); Rician/χ² are the magnitude-image
 //! equivalents for quick tests. Use `rand`/`rand_distr` behind the `kspace` feature.
 

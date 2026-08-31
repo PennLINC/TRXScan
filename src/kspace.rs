@@ -1,5 +1,6 @@
-//! Stage B: per-slice k-space acquisition. **v1 = EPI geometric distortion + T2* relaxation,
-//! single coil.** Faithful port of the core DFT in `Algorithms/itkKspaceImageFilter.cpp:452`:
+//! Acquisition stage — per-slice k-space: EPI geometric distortion, T2* relaxation, eddy
+//! currents, Nyquist ghosting, partial Fourier, Gibbs ringing, spikes, multi-coil combine, and
+//! GRAPPA. Faithful port of the core DFT in `Algorithms/itkKspaceImageFilter.cpp:452`:
 //!
 //! ```text
 //! kspace[kx,ky] = (1/N) Σ_{x,y} f(x,y)·exp( i·2π·( kx·x + ky·y + φ ) ),   φ = fmap(x,y)·t(ky)
@@ -9,10 +10,9 @@
 //! readout time increases with the PE line) is what warps EPI along the phase-encode axis — the
 //! same physics that makes AP/PA reverse-PE pairs distort oppositely (the DRBUDDI/topup target).
 //!
-//! v1 uses direct sums (O(N³) via 1D factoring), std-only, exact — no FFT-convention ambiguity, and
-//! it's the oracle-comparable reference. The perf path (time-segmented FFT via `rustfft`, the
-//! `kspace` feature) and the remaining artifacts (eddy, ghosts, partial Fourier, ringing, spikes,
-//! multi-coil, GRAPPA) layer on next; see `docs/PORT-PLAN.md` / `docs/FEATURES.md`.
+//! The transform is a direct sum (O(N³) via 1D factoring), std-only and exact — no FFT-convention
+//! ambiguity, so it stays directly comparable against Fiberfox. A faster time-segmented FFT path
+//! (via `rustfft`, behind the `kspace` feature) is not yet written.
 
 use crate::readout::{Readout, SingleShotEpi};
 use std::f64::consts::TAU;
@@ -66,7 +66,7 @@ impl Rng {
     }
 }
 
-/// Acquisition parameters for the k-space stage (v1 subset).
+/// Acquisition parameters for the k-space stage.
 #[derive(Debug, Clone)]
 pub struct Acquisition {
     pub t_line: f64,      // ms per PE line
@@ -88,6 +88,7 @@ pub struct Acquisition {
     pub n_coils: usize,       // receiver coils (1 = uniform single coil); ring-arranged sensitivities
     pub accel: usize,         // GRAPPA acceleration R (1 = fully sampled); undersamples PE lines
     pub acs_lines: usize,     // GRAPPA autocalibration lines (fully-sampled central PE band)
+    pub seed: u64,            // mixed into every derived per-slice seed; 0 reproduces legacy output
 }
 
 /// Spatial sensitivity of `coil` (of `n_coils` arranged in a ring) at pixel `(x,y)`. Uniform for a
@@ -128,6 +129,7 @@ impl Default for Acquisition {
             n_coils: 1,
             accel: 1,
             acs_lines: 24,
+            seed: 0,
         }
     }
 }
@@ -484,7 +486,7 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
 }
 
 /// Run the k-space acquisition over a whole 4D clean-signal volume: every (volume, slice) through
-/// [`simulate_slice`]. `clean` is the Stage-A signal in `(x+nx*(y+ny*z))*ngrad + g` layout; `fmap`
+/// [`simulate_slice`]. `clean` is the clean signal in `(x+nx*(y+ny*z))*ngrad + g` layout; `fmap`
 /// is the off-resonance field (Hz) on the same grid. v1 treats the mixed signal as one compartment
 /// with an effective T2 (`t2_eff`, ms) — per-tissue T2 for realistic b0 contrast is a refinement.
 /// Returns `(magnitude, phase)` 4D arrays (phase in radians, atan2), same layout — the complex pair
@@ -517,7 +519,8 @@ pub fn simulate_acquisition(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37);
+            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
+                .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let out = simulate_slice(&refs, t2, &fslice, nx, ny, z, nz, acq, gradients[g], seed);
             for y in 0..ny {
                 for x in 0..nx {

@@ -8,7 +8,7 @@
 //!   persists → monotonic drift.
 //! - **Trajectory** (new): an explicit per-volume (or per slice-group) 6-DOF pose — the thing
 //!   Fiberfox can't take from its CLI. Enables drift+sneeze, real motion traces, and multiband
-//!   within-volume motion (see `docs/FEATURES.md`).
+//!   within-volume motion.
 //!
 //! The applied per-unit transform must also be handed to [`crate::kspace`] so the fieldmap warp
 //! tracks the moved head (Fiberfox: `SetTranslation`/`SetRotationMatrix`, `:270`).

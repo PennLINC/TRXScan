@@ -23,9 +23,141 @@ type R<T> = Result<T, Box<dyn Error>>;
 
 /// Load a tractogram (TRX/TRK/TCK/VTK) as CSR: flat world-mm positions + per-streamline offsets.
 pub fn load_streamlines(path: &Path) -> R<(Vec<[f64; 3]>, Vec<u32>)> {
+    let (pos, offsets, _) = load_streamlines_weighted(path, None)?;
+    Ok((pos, offsets))
+}
+
+/// As [`load_streamlines`], plus an optional **per-streamline weight** array taken from the
+/// tractogram's data-per-streamline (dps) fields — SIFT2 weights, or the `fiberWeight` this port
+/// dropped from Fiberfox. Feed the result to
+/// [`crate::compartments::generate_mixture`].
+///
+/// `dps_name == None` ⇒ `Ok((.., None))`, i.e. every streamline weighs 1: a TRK with no
+/// properties, or a TRX with no dps, simply loads unweighted. `Some(name)` is an assertion that
+/// the field is there — a missing name (or a length that disagrees with the streamline count) is
+/// an error, not a silent fallback.
+pub fn load_streamlines_weighted(
+    path: &Path,
+    dps_name: Option<&str>,
+) -> R<(Vec<[f64; 3]>, Vec<u32>, Option<Vec<f32>>)> {
     let t = trx_rs::read_tractogram(path, &trx_rs::ConversionOptions::default())?;
-    let pos = t.positions().iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
-    Ok((pos, t.offsets().to_vec()))
+    let pos: Vec<[f64; 3]> =
+        t.positions().iter().map(|p| [p[0] as f64, p[1] as f64, p[2] as f64]).collect();
+    let offsets = t.offsets().to_vec();
+    let n = offsets.len().saturating_sub(1);
+    let weights = match dps_name {
+        None => None,
+        Some(name) => {
+            let arr = t.dps_arrays().get(name).ok_or_else(|| {
+                let mut have: Vec<&str> = t.dps_names().collect();
+                have.sort_unstable();
+                let have = if have.is_empty() { "(none)".to_string() } else { have.join(", ") };
+                format!("dps field {name:?} not in {}; available dps: {have}", path.display())
+            })?;
+            let w = dps_as_f32(arr, name)?;
+            if w.len() != n {
+                return Err(format!(
+                    "dps field {name:?} has {} values but the tractogram has {n} streamlines",
+                    w.len()
+                )
+                .into());
+            }
+            Some(w)
+        }
+    };
+    Ok((pos, offsets, weights))
+}
+
+/// Resolve a CLI weight spec: `None` ⇒ unweighted; a spec naming an **existing file** ⇒ MRtrix
+/// text weights ([`read_weights_txt`], count-checked); anything else ⇒ a TRX dps field name
+/// ([`load_streamlines_weighted`]). The one loader both binaries share.
+pub fn load_streamlines_spec(
+    path: &Path,
+    weight_spec: Option<&str>,
+) -> R<(Vec<[f64; 3]>, Vec<u32>, Option<Vec<f32>>)> {
+    let txt = weight_spec.filter(|w| Path::new(w).exists());
+    let (pos, offsets, mut weights) =
+        load_streamlines_weighted(path, weight_spec.filter(|_| txt.is_none()))?;
+    if let Some(t) = txt {
+        let w = read_weights_txt(Path::new(t))?;
+        let n = offsets.len().saturating_sub(1);
+        if w.len() != n {
+            return Err(format!(
+                "weights file {t} has {} values but the tractogram has {n} streamlines",
+                w.len()
+            )
+            .into());
+        }
+        weights = Some(w);
+    }
+    Ok((pos, offsets, weights))
+}
+
+/// Read MRtrix-style per-streamline weights from a text file (`tcksift2` output): lines starting
+/// with `#` are comments, everything else is whitespace-separated floats, one weight per
+/// streamline in tractogram order. The TCK + weights.txt pair is the MRtrix-ecosystem equivalent
+/// of a TRX dps field; validate the count against the tractogram at the call site.
+pub fn read_weights_txt(path: &Path) -> R<Vec<f32>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut w = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            w.push(tok.parse::<f32>().map_err(|_| {
+                format!("weights file {}: bad float {tok:?}", path.display())
+            })?);
+        }
+    }
+    if w.is_empty() {
+        return Err(format!("weights file {} has no values", path.display()).into());
+    }
+    Ok(w)
+}
+
+/// One scalar dps array → per-streamline f32.
+///
+/// Read through the raw bytes rather than `DataArray::cast_slice`: [`trx_rs::Tractogram`] holds
+/// dps in an owned `Vec<u8>`, which carries no alignment guarantee for f32/f64, and bytemuck
+/// *panics* on a misaligned cast. TRX stores little-endian, which is also what `cast_slice` would
+/// have assumed.
+fn dps_as_f32(arr: &trx_rs::DataArray, name: &str) -> R<Vec<f32>> {
+    use trx_rs::DType;
+    if arr.ncols() != 1 {
+        return Err(format!("dps field {name:?} has {} columns; expected a scalar", arr.ncols()).into());
+    }
+    let b = arr.as_bytes();
+    Ok(match arr.dtype() {
+        DType::Float16 => b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        DType::Float32 => {
+            b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        }
+        DType::Float64 => b
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+            .collect(),
+        other => {
+            return Err(format!("dps field {name:?} has dtype {other}; expected a float field").into())
+        }
+    })
+}
+
+/// IEEE-754 binary16 → f32. TRX's f16 arrays are common and `half` is not a dependency here
+/// (trx-rs doesn't re-export it), so decode the bit pattern directly.
+fn f16_to_f32(h: u16) -> f32 {
+    let (sign, exp, mant) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as u32, (h & 0x3ff) as u32);
+    let bits = match exp {
+        0 if mant == 0 => sign << 31,                                     // ±0
+        0 => {
+            // subnormal: renormalize so the leading 1 becomes implicit
+            let shift = mant.leading_zeros() - 21; // 1..=10
+            (sign << 31) | ((113 - shift) << 23) | ((mant << (13 + shift)) & 0x7f_ffff)
+        }
+        0x1f => (sign << 31) | 0x7f80_0000 | (mant << 13),                // ±inf / NaN
+        _ => (sign << 31) | ((exp + 112) << 23) | (mant << 13),           // bias 15 → 127
+    };
+    f32::from_bits(bits)
 }
 
 /// voxel→world affine from a NIfTI header: sform if active, else qform quaternion.
@@ -134,6 +266,31 @@ fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Gr
     Ok(())
 }
 
+/// Write one 3D scalar volume (layout `x + nx*(y + ny*z)`) as NIfTI-1 with the given affine.
+fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
+    let [nx, ny, nz] = dims;
+    let arr =
+        ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
+    let hdr = header_for_grid(grid.voxel_to_world);
+    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
+    Ok(())
+}
+
+/// Write named 3D scalar maps as `<out_prefix>_<name>.nii.gz` siblings (the cs-odf
+/// `--microstructure-nifti` convention). `maps[i]` pairs with `names[i]`.
+pub fn write_scalar_maps(
+    out_prefix: &str,
+    dims: [usize; 3],
+    names: &[&str],
+    maps: &[Vec<f32>],
+    grid: &Grid,
+) -> R<()> {
+    for (name, map) in names.iter().zip(maps) {
+        write_3d(&PathBuf::from(format!("{out_prefix}_{name}.nii.gz")), dims, map, grid)?;
+    }
+    Ok(())
+}
+
 fn write_bval_bvec(bval: &Path, bvec: &Path, scheme: &GradientScheme) -> R<()> {
     let line = scheme.bvals.iter().map(|b| format!("{b}")).collect::<Vec<_>>().join(" ");
     std::fs::write(bval, format!("{line}\n"))?;
@@ -156,6 +313,17 @@ pub fn write_dwi(out_prefix: &Path, dwi: &CleanDwi, grid: &Grid, scheme: &Gradie
 /// Write a **complex** DWI as BIDS `part-mag` / `part-phase` NIfTIs (phase in radians) + shared
 /// `.bval`/`.bvec` + JSON sidecars — the layout `dwidenoise`/`dwidenoise2` consume for complex
 /// denoising. `out_prefix` is a BIDS stem, e.g. `.../sub-01_ses-V02_dir-AP_run-01`.
+/// Acquisition facts the BIDS JSON sidecars record. A plain struct (not
+/// `kspace::Acquisition`) so `io` stays usable without the `kspace` feature.
+pub struct SidecarInfo {
+    pub reverse_pe: bool,
+    pub total_readout_time: f64, // s
+    pub echo_time: f64,          // s
+    pub partial_fourier: f64,
+    pub accel: usize,
+    pub mb: usize,
+}
+
 pub fn write_complex_dwi(
     out_prefix: &str,
     dims: [usize; 3],
@@ -164,14 +332,134 @@ pub fn write_complex_dwi(
     phase: &[f32],
     grid: &Grid,
     scheme: &GradientScheme,
+    info: &SidecarInfo,
 ) -> R<()> {
     let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
     write_4d(&p("_part-mag_dwi.nii.gz"), dims, ngrad, mag, grid)?;
     write_4d(&p("_part-phase_dwi.nii.gz"), dims, ngrad, phase, grid)?;
     write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)?;
+    // The simulated PE axis is y; forward polarity is "j", --reverse-pe is "j-",
+    // and the two distort in opposite directions (topup/DRBUDDI-ready).
+    let ped = if info.reverse_pe { "j-" } else { "j" };
+    let ees = info.total_readout_time / dims[1].saturating_sub(1).max(1) as f64;
+    let common = format!(
+        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
+         \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
+         \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
+         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}",
+        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
+    );
     std::fs::write(p("_part-mag_dwi.json"),
-        "{\n  \"Manufacturer\": \"TRXScan\",\n  \"ImageComparison\": \"magnitude\"\n}\n")?;
+        format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
     std::fs::write(p("_part-phase_dwi.json"),
-        "{\n  \"Manufacturer\": \"TRXScan\",\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}\n")?;
+        format!("{{\n{common},\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}}\n"))?;
     Ok(())
+}
+
+/// Keep `n` streamlines, sampled without replacement with probability proportional to the SIFT2
+/// weight (uniform when unweighted): Efraimidis-Spirakis exponential keys from a SplitMix64 hashed
+/// per streamline index, so the same `n` and `seed` select the same subset in every binary.
+/// Survivors get uniform weights (total/n), keeping the weighted density unbiased in expectation.
+/// Selecting the top-n *by weight* instead would gut over-tracked bundles: SIFT2 weights are
+/// tight around 1 and high weight means under-tracked, not important.
+pub fn subsample_streamlines(
+    positions: Vec<[f64; 3]>,
+    offsets: Vec<u32>,
+    weights: Option<Vec<f32>>,
+    n: usize,
+    seed: u64,
+) -> (Vec<[f64; 3]>, Vec<u32>, Option<Vec<f32>>) {
+    let total = offsets.len().saturating_sub(1);
+    if n >= total {
+        println!("subsample: {n} >= {total} streamlines, keeping all");
+        return (positions, offsets, weights);
+    }
+    let mut keys: Vec<(f64, u32)> = (0..total as u32)
+        .map(|i| {
+            let mut z = (seed ^ (i as u64).wrapping_mul(0xA24B_AED4_963E_E407))
+                .wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let u = ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64; // in (0,1)
+            let w = weights.as_ref().map_or(1.0, |w| (w[i as usize] as f64).max(1e-12));
+            (u.ln() / w, i)
+        })
+        .collect();
+    keys.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
+    let mut idx: Vec<u32> = keys[..n].iter().map(|k| k.1).collect();
+    idx.sort_unstable();
+
+    let total_w: f64 = weights.as_ref().map_or(total as f64, |w| w.iter().map(|&x| x as f64).sum());
+    let kept_w: f64 = weights
+        .as_ref()
+        .map_or(n as f64, |w| idx.iter().map(|&i| w[i as usize] as f64).sum());
+    let mut new_pos = Vec::new();
+    let mut new_off = Vec::with_capacity(n + 1);
+    new_off.push(0u32);
+    for &i in &idx {
+        let (s0, e0) = (offsets[i as usize] as usize, offsets[i as usize + 1] as usize);
+        new_pos.extend_from_slice(&positions[s0..e0]);
+        new_off.push(new_pos.len() as u32);
+    }
+    println!(
+        "subsample: kept {n}/{total} streamlines (seed {seed}), {:.1}% of vertices, {:.1}% of weight -> uniform",
+        100.0 * new_pos.len() as f64 / positions.len().max(1) as f64,
+        100.0 * kept_w / total_w,
+    );
+    let new_weights = weights.map(|_| vec![(total_w / n as f64) as f32; n]);
+    (new_pos, new_off, new_weights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_decode_matches_known_bit_patterns() {
+        for (bits, want) in [
+            (0x0000u16, 0.0f32), (0x8000, -0.0), (0x3c00, 1.0), (0xbc00, -1.0),
+            (0x3555, 0.333_251_95), (0x4900, 10.0), (0x7bff, 65504.0), (0x0400, 6.103_515_6e-5),
+            (0x0001, 5.960_464_5e-8), (0x03ff, 6.097_555_2e-5), // smallest / largest subnormal
+        ] {
+            let got = f16_to_f32(bits);
+            assert!((got - want).abs() <= 1e-12 * want.abs().max(1e-7), "{bits:#06x}: {got} vs {want}");
+        }
+        assert!(f16_to_f32(0x7c00).is_infinite() && f16_to_f32(0x7c00) > 0.0);
+        assert!(f16_to_f32(0x7e00).is_nan());
+    }
+
+    /// Round-trip an in-memory tractogram with a dps array through a temp TRX and read the
+    /// weights back. No network, no fixture file.
+    #[test]
+    fn dps_weights_round_trip_through_a_trx() {
+        use trx_rs::dtype::DType;
+        use trx_rs::mmap_backing::vec_to_bytes;
+        use trx_rs::{DataArray, Tractogram};
+
+        let mut t = Tractogram::new();
+        t.push_streamline(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]).unwrap();
+        t.push_streamline(&[[0.0, 1.0, 0.0], [0.0, 2.0, 0.0], [0.0, 3.0, 0.0]]).unwrap();
+        t.insert_dps("weights", DataArray::owned_bytes(vec_to_bytes(vec![2.5f32, 0.5]), 1, DType::Float32));
+        t.insert_dps("w64", DataArray::owned_bytes(vec_to_bytes(vec![1.25f64, 4.0]), 1, DType::Float64));
+
+        let dir = std::env::temp_dir().join(format!("trxscan_dps_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("weighted.trx");
+        trx_rs::write_tractogram(&path, &t, &trx_rs::ConversionOptions::default()).unwrap();
+
+        let (pos, offsets, w) = load_streamlines_weighted(&path, Some("weights")).unwrap();
+        assert_eq!(pos.len(), 5);
+        assert_eq!(offsets, vec![0, 2, 5]);
+        assert_eq!(w.unwrap(), vec![2.5f32, 0.5]);
+        assert_eq!(load_streamlines_weighted(&path, Some("w64")).unwrap().2.unwrap(), vec![1.25f32, 4.0]);
+        // no dps requested → unweighted, and the plain loader still agrees
+        assert!(load_streamlines_weighted(&path, None).unwrap().2.is_none());
+        assert_eq!(load_streamlines(&path).unwrap().1, vec![0, 2, 5]);
+        // a missing field is an error that lists what is actually there
+        let e = load_streamlines_weighted(&path, Some("nope")).unwrap_err().to_string();
+        assert!(e.contains("nope") && e.contains("weights"), "unhelpful error: {e}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

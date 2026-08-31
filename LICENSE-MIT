@@ -1,0 +1,30 @@
+MIT License
+
+Copyright (c) 2026 Matt Cieslak and TRXScan contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----
+
+Note: This MIT license (and the Apache-2.0 alternative in LICENSE-APACHE)
+applies to the original TRXScan code. TRXScan's diffusion-simulation physics is
+a Rust port of MITK-Diffusion's Fiberfox, and its closed-form microstructure
+scalars are ported from DIPY. Both upstreams are BSD-3-Clause; their notices are
+retained in LICENSE-MITK and LICENSE-DIPY, and the derived files are identified
+there and in the module-level doc comments.

@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+# Claude Code scratch worktrees
+/.claude/worktrees/
