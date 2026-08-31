@@ -14,6 +14,7 @@
 //! ambiguity, so it stays directly comparable against Fiberfox. A faster time-segmented FFT path
 //! (via `rustfft`, behind the `kspace` feature) is not yet written.
 
+use crate::phase::{PhaseModel, ShotPhase};
 use crate::readout::{Readout, SingleShotEpi};
 use std::f64::consts::TAU;
 
@@ -310,7 +311,10 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
                         gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
                     phi += (acq.eddy_strength * lin + acq.eddy_quad * quad) * eddy_decay;
                 }
-                modimg[at(x, y)] = C::cis(TAU * phi).scale(f_real);
+                // Pre-readout object phase, already in radians, so it is added outside the TAU
+                // factor that scales the distortion/eddy term.
+                let phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
+                modimg[at(x, y)] = C::cis(TAU * phi + phi0).scale(f_real);
             }
         }
         // inner y-sum over the SIM grid → g(x), then an x-DFT evaluated only at acquired kx
@@ -387,6 +391,37 @@ pub fn simulate_slice_kspace(inp: &SliceInput, acq: &Acquisition) -> Vec<(f64, f
         .into_iter()
         .map(|c| (c.re, c.im))
         .collect()
+}
+
+/// Sample a [`PhaseModel`] onto one slice of the simulation grid.
+///
+/// Positions are in **acquired-voxel units** from the FOV centre, so the same coefficients describe
+/// the same physical field at any oversampling factor `o`. The half-cell offset matches the forward
+/// transform's registration convention (see [`simulate_slice`]).
+pub fn phase_slice(
+    model: &PhaseModel,
+    shot: &ShotPhase,
+    snx: usize,
+    sny: usize,
+    o: usize,
+    z: usize,
+    nz: usize,
+) -> Vec<f64> {
+    let (sxs, sys) = (snx as f64 / 2.0, sny as f64 / 2.0);
+    let off = (o as f64 - 1.0) / 2.0;
+    let zc = z as f64 - nz as f64 / 2.0;
+    let mut v = vec![0.0f64; snx * sny];
+    for y in 0..sny {
+        for x in 0..snx {
+            let r = [
+                (x as f64 - sxs - off) / o as f64,
+                (y as f64 - sys - off) / o as f64,
+                zc,
+            ];
+            v[x + snx * y] = model.at(r, shot);
+        }
+    }
+    v
 }
 
 /// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
@@ -924,6 +959,78 @@ mod tests {
             accel: 1,
             ..Acquisition::default_for(nx, ny)
         }
+    }
+
+    /// Build a step-edge SliceInput on the sim grid, optionally with an object phase field.
+    fn step_input<'a>(
+        comps: &'a [&'a [f32]],
+        fmap: &'a [f32],
+        phase0: Option<&'a [f64]>,
+        snx: usize, sny: usize, nx: usize, ny: usize,
+    ) -> SliceInput<'a> {
+        SliceInput {
+            compartments: comps, t2: &[100.0], fmap, phase0,
+            sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+        }
+    }
+
+    #[test]
+    fn global_phase_rotation_is_exact() {
+        // Rotating the object by exp(i*alpha) must rotate the reconstructed image by exactly
+        // exp(i*alpha) and leave its magnitude untouched. A gauge invariance no phase-histogram
+        // statistic can substitute for (spec 4.1.5).
+        let (nx, ny, o) = (16usize, 16usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let acq = clean(nx, ny);
+        let base = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &acq);
+        let alpha = 0.7f64;
+        let field = vec![alpha; snx * sny];
+        let rot = simulate_slice(&step_input(&comps, &fmap, Some(&field), snx, sny, nx, ny), &acq);
+        let (sa, ca) = alpha.sin_cos();
+        for i in 0..nx * ny {
+            let (re, im) = (base[i].0 as f64, base[i].1 as f64);
+            let (er, ei) = (re * ca - im * sa, re * sa + im * ca);
+            assert!((rot[i].0 as f64 - er).abs() < 1e-6, "re mismatch at {i}");
+            assert!((rot[i].1 as f64 - ei).abs() < 1e-6, "im mismatch at {i}");
+            let m0 = (re * re + im * im).sqrt();
+            let m1 = ((rot[i].0 as f64).powi(2) + (rot[i].1 as f64).powi(2)).sqrt();
+            assert!((m0 - m1).abs() < 1e-6, "magnitude changed at {i}");
+        }
+    }
+
+    #[test]
+    fn object_phase_puts_ringing_in_both_channels() {
+        // The original defect: with a real object the image is real to machine precision, so all
+        // ringing sits in Re and part-phase is degenerate. With object phase it must not.
+        let (nx, ny, o) = (16usize, 16usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let acq = clean(nx, ny);
+        let ratio = |v: &Vec<(f32, f32)>| {
+            let mr = v.iter().map(|p| p.0.abs()).fold(0.0f32, f32::max);
+            let mi = v.iter().map(|p| p.1.abs()).fold(0.0f32, f32::max);
+            (mi / mr) as f64
+        };
+        // Without object phase the image is real APART FROM the deliberate even-N band
+        // asymmetry (spec 3.4), whose residual `even_matrix_window_asymmetry_is_intentional`
+        // bounds at 0.05. Use that same bound here: a tighter one would contradict it.
+        let none = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &acq);
+        let r_none = ratio(&none);
+        assert!(r_none < 0.05, "no-phase Im/Re should be only the even-N residual: {r_none}");
+        let ramp: Vec<f64> = (0..snx * sny)
+            .map(|i| 0.9 * ((i % snx) as f64 - snx as f64 / 2.0) / snx as f64)
+            .collect();
+        let withph = simulate_slice(&step_input(&comps, &fmap, Some(&ramp), snx, sny, nx, ny), &acq);
+        let r_ph = ratio(&withph);
+        assert!(r_ph > 0.1, "phase should move energy into Im: {r_ph}");
+        // And the effect must dominate the asymmetry residual, not merely exceed a threshold.
+        assert!(r_ph > 5.0 * r_none, "object phase {r_ph} vs even-N residual {r_none}");
     }
 
     #[test]
