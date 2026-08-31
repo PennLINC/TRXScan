@@ -204,12 +204,10 @@ pub fn step_hires(snx: usize, sny: usize, edge: f64) -> Vec<f32> {
     v
 }
 
-/// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
-/// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms); `fmap` is
-/// the off-resonance field (Hz), same sim-grid layout. Only the central `nx*ny` block of the sim
-/// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
-/// transform rather than by discarding a computed k-space (spec 3.1).
-pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
+/// Build the acquired k-space for one coil, complete with the ringing mask, spikes and thermal
+/// noise, but before GRAPPA, reconstruction and coil combination. Shared by [`simulate_slice`] and
+/// [`simulate_slice_kspace`] so tests can inspect the coefficients before reconstruction.
+fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
     assert!(
@@ -243,16 +241,12 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
     let at = |x: usize, y: usize| x + snx * y; // SIM-grid image index
     let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
 
-    // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
-    let ncoils = acq.n_coils.max(1);
     let accel = acq.accel.max(1);
     let acs_half = (acq.acs_lines / 2) as i64;
     // acquired PE line? every R-th line (phase-aligned to k-space centre) plus the central ACS band.
     let acquired = |ky: usize| -> bool {
         accel <= 1 || (ky as i64 - ys as i64).abs() <= acs_half || ky % accel == ys % accel
     };
-    let mut coil_kspace: Vec<Vec<C>> = Vec::with_capacity(ncoils);
-    for coil in 0..ncoils {
     // ---- forward: build k-space, factored as  Σ_x e^{..kx x}[ Σ_y mod(x,y) e^{..ky y} ] ----
     // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
     // per ky, but that keeps the whole build at O(N³).
@@ -383,8 +377,35 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
         }
     }
 
-    coil_kspace.push(kspace);
-    } // coil loop
+    kspace
+}
+
+/// The acquired k-space of the first coil, before reconstruction. Layout `kx + nx*ky`.
+/// Used by the convergence tests (spec 4.1.6); not part of the simulation path.
+pub fn simulate_slice_kspace(inp: &SliceInput, acq: &Acquisition) -> Vec<(f64, f64)> {
+    build_coil_kspace(inp, acq, 0, acq.n_coils.max(1))
+        .into_iter()
+        .map(|c| (c.re, c.im))
+        .collect()
+}
+
+/// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
+/// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms); `fmap` is
+/// the off-resonance field (Hz), same sim-grid layout. Only the central `nx*ny` block of the sim
+/// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
+/// transform rather than by discarding a computed k-space (spec 3.1).
+pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
+    let [nx, ny] = inp.acq_matrix;
+    let (xs, ys) = (nx / 2, ny / 2);
+    let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
+
+    // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
+    let ncoils = acq.n_coils.max(1);
+    let accel = acq.accel.max(1);
+    let mut coil_kspace: Vec<Vec<C>> = Vec::with_capacity(ncoils);
+    for coil in 0..ncoils {
+        coil_kspace.push(build_coil_kspace(inp, acq, coil, ncoils));
+    }
 
     // GRAPPA: fill the un-acquired PE lines with a kernel calibrated on the ACS band across coils.
     if accel > 1 {
@@ -959,5 +980,41 @@ mod tests {
         let row = ny / 2;
         let peak = (nx / 2 + 1..nx).map(|x| out[x + nx * row].0 as f64).fold(f64::MIN, f64::max);
         assert!(peak > 1.05, "expected intrinsic overshoot, got peak {peak:.4}");
+    }
+
+    #[test]
+    fn acquired_band_converges_with_simulation_resolution() {
+        // Spec 4.1.6: adequacy is convergence of the ACQUIRED coefficients, not smoothness of the
+        // object. A sharp edge is deliberately not band-limited; that is not a defect.
+        let (nx, ny) = (16usize, 16usize);
+        let acq = clean(nx, ny);
+        let k_at = |o: usize| -> Vec<(f64, f64)> {
+            let (snx, sny) = (nx * o, ny * o);
+            let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.37) * o as f64);
+            let fmap = vec![0.0f32; snx * sny];
+            let comps: [&[f32]; 1] = [&img];
+            simulate_slice_kspace(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                },
+                &acq,
+            )
+        };
+        let rel = |a: &[(f64, f64)], b: &[(f64, f64)]| {
+            let num: f64 =
+                a.iter().zip(b).map(|(p, q)| (p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sum();
+            let den: f64 = b.iter().map(|q| q.0 * q.0 + q.1 * q.1).sum::<f64>().max(1e-30);
+            (num / den).sqrt()
+        };
+        let (k2, k4, k8) = (k_at(2), k_at(4), k_at(8));
+        let (e2, e4) = (rel(&k2, &k4), rel(&k4, &k8));
+        assert!(e4 < e2, "error must shrink with o: e(2->4)={e2:.4e}, e(4->8)={e4:.4e}");
+        // Report o_min for the production default (spec 4.1.10): the smallest o under tolerance.
+        let eps = 1e-3;
+        let o_min = if e2 < eps { 2 } else if e4 < eps { 4 } else { 8 };
+        println!("o_min at eps={eps}: {o_min}  (e2={e2:.3e}, e4={e4:.3e})");
+        assert!(e4 < 1e-2, "o=4 should be within 1% of o=8: {e4:.4e}");
     }
 }
