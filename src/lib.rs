@@ -45,6 +45,8 @@ pub mod mixture;
 pub mod microstructure;
 
 // --- acquisition stage ---
+/// Object phase model (spec 3.2).
+pub mod phase;
 pub mod readout;
 pub mod kspace;
 pub mod noise;
