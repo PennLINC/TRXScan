@@ -45,6 +45,24 @@ fresh reader and are **not** yours to fix:
    modified. This predates the work and is deliberately left alone.
    - **Never `git add -A` or `git add .`** — it would commit thousands of lines of line-ending
      churn into `PennLINC/TRXScan`. Add only the exact paths each task's commit step names.
+   - **Normalize any pre-existing file to LF before staging it.** Editing `src/kspace.rs`,
+     `src/lib.rs` or `src/bin/trxscan.rs` and then `git add`-ing it would commit the whole file as
+     churn — `kspace.rs` alone is ~760 lines. Before the commit step of any task that touches an
+     existing file, run:
+
+     ```bash
+     for f in <the files that task commits>; do
+       python3 - "$f" <<'EOF'
+     import io,sys
+     p=sys.argv[1]; b=io.open(p,'rb').read()
+     io.open(p,'wb').write(b.replace(b'\r\n', b'\n'))
+     EOF
+     done
+     ```
+
+     Then confirm with `git diff --numstat --cached` that the staged insert/delete counts reflect
+     only your real change. Files created by this plan (`analytic.rs`, `phase.rs`, `benchmark.rs`)
+     are LF already and need nothing.
 
 3. **New modules exist that this plan does not touch:** `src/sphere.rs`, `src/mixture.rs`,
    `src/microstructure.rs`, and `src/bin/trxscan_microstructure.rs`. They are independent of the
@@ -130,8 +148,12 @@ mod tests {
     fn far_from_the_edge_the_profile_is_flat() {
         let n = 128;
         let p = truncated_step_profile(n, 64.0 / n as f64);
-        assert!((p[n - 2] - 1.0).abs() < 0.01, "bright plateau {}", p[n - 2]);
-        assert!(p[1].abs() < 0.01, "dark plateau {}", p[1]);
+        // The step is periodic on [0,1), so it has TWO edges: the rising one at x0 = 0.5 and the
+        // falling wrap-around at x = 0 == 1. The flat plateaus are therefore at the quarter
+        // points, midway between them; p[1] and p[n-2] sit 1.5 voxels from the wrap edge and
+        // carry its +-1.19% first sidelobe.
+        assert!((p[3 * n / 4] - 1.0).abs() < 0.01, "bright plateau {}", p[3 * n / 4]);
+        assert!(p[n / 4].abs() < 0.01, "dark plateau {}", p[n / 4]);
     }
 }
 ```
@@ -189,12 +211,7 @@ pub fn truncated_step_profile(n: usize, x0: f64) -> Vec<f64> {
 }
 ```
 
-Add to `src/lib.rs`, immediately after the `pub mod mat;` line:
-
-```rust
-/// Analytic Fourier references used as test oracles (spec 4.1).
-pub mod analytic;
-```
+(The `src/lib.rs` declaration was already added in Step 1 — see the note there.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -656,6 +673,17 @@ git commit -m "feat(data): --oversample emits an integer-refined simulation grid
 
 - [ ] **Step 1: Write the failing test**
 
+First declare the module, or Step 2 cannot fail correctly: without `pub mod phase;` the new file is
+never compiled, and `cargo test --lib phase` silently matches unrelated test names and reports a
+false pass. Add to `src/lib.rs` after `pub mod signal;`:
+
+```rust
+/// Object phase model (spec 3.2).
+pub mod phase;
+```
+
+Then create `src/phase.rs` containing only:
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -869,12 +897,7 @@ impl PhaseModel {
 }
 ```
 
-Add to `src/lib.rs` after `pub mod signal;`:
-
-```rust
-/// Object phase model (spec 3.2).
-pub mod phase;
-```
+(The `src/lib.rs` declaration was already added in Step 1 — see the note there.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1043,6 +1066,17 @@ git commit -m "feat(kspace): apply pre-readout object phase before the acquisiti
 
 - [ ] **Step 1: Write the failing test**
 
+First declare the module, or Step 2 cannot fail correctly: without `pub mod benchmark;` the new file
+is never compiled and `cargo test --lib benchmark` reports a false pass. Add to `src/lib.rs` after
+`pub mod kspace;`:
+
+```rust
+/// Scoreable benchmark outputs (spec 3.5).
+pub mod benchmark;
+```
+
+Then create `src/benchmark.rs` containing only:
+
 ```rust
 #[cfg(test)]
 mod tests {
@@ -1168,12 +1202,7 @@ pub fn gibbs_benchmark_acquisition(base: &Acquisition) -> Acquisition {
 }
 ```
 
-Add to `src/lib.rs` after `pub mod kspace;`:
-
-```rust
-/// Scoreable benchmark outputs (spec 3.5).
-pub mod benchmark;
-```
+(The `src/lib.rs` declaration was already added in Step 1 — see the note there.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
