@@ -1076,6 +1076,116 @@ mod tests {
     }
 
     #[test]
+    fn noise_covariance_matches_the_sampling_mask() {
+        // Spec 4.1.7a, scoped to GRAPPA disabled and window None: for white noise on mask M, the
+        // reconstructed image noise autocovariance is the inverse DFT of M, up to scale.
+        let (nx, ny) = (16usize, 16usize);
+        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean(nx, ny) };
+        let mask = sampling_mask(nx, ny, &acq);
+        let empty = vec![0.0f32; nx * ny];
+        let fmap = vec![0.0f32; nx * ny];
+        let (trials, lags) = (240usize, 4usize);
+        let mut meas = vec![0.0f64; lags];
+        for t in 0..trials {
+            let comps: [&[f32]; 1] = [&empty];
+            let out = simulate_slice(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64,
+                },
+                &acq,
+            );
+            // Lag along the PHASE-ENCODE axis. Partial Fourier undersamples ky only, so a
+            // readout-direction lag cannot see it: the skipped lines contribute uniformly to
+            // every kx lag and cancel when normalizing by lag 0. Measuring along kx made this
+            // test pass even with the mask guard removed.
+            for (d, m) in meas.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for y in 0..ny - d {
+                    for x in 0..nx {
+                        acc += out[x + nx * y].0 as f64 * out[x + nx * (y + d)].0 as f64;
+                    }
+                }
+                *m += acc / (nx * (ny - d)) as f64;
+            }
+        }
+        for m in meas.iter_mut() {
+            *m /= trials as f64;
+        }
+        // Prediction: inverse DFT of the mask along ky.
+        let mut pred = vec![0.0f64; lags];
+        for (d, p) in pred.iter_mut().enumerate() {
+            let mut acc = 0.0;
+            for kyi in 0..ny {
+                for kxi in 0..nx {
+                    if mask[kxi + nx * kyi] {
+                        let ky = (kyi as f64 - (ny / 2) as f64) / ny as f64;
+                        acc += (TAU * ky * d as f64).cos();
+                    }
+                }
+            }
+            *p = acc;
+        }
+        for d in 1..lags {
+            let (a, b) = (meas[d] / meas[0], pred[d] / pred[0]);
+            assert!((a - b).abs() < 0.08, "lag {d}: measured {a:.3}, mask prediction {b:.3}");
+        }
+    }
+
+    #[test]
+    fn partial_fourier_ringing_is_asymmetric_about_the_edge() {
+        // Zero-filled PF (no homodyne/POCS) rings asymmetrically along PE, unlike the symmetric
+        // full-Fourier case. 6/8 is the shipping default, so this is the primary configuration.
+        let (nx, ny, o) = (32usize, 32usize, 8usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let edge = (ny as f64 / 2.0 + 0.5) * o as f64;
+        let mut img = vec![0.0f32; snx * sny];
+        for y in 0..sny {
+            let f = if (y as f64 + 1.0) <= edge {
+                0.0
+            } else if y as f64 >= edge {
+                1.0
+            } else {
+                y as f64 + 1.0 - edge
+            };
+            for x in 0..snx {
+                img[x + snx * y] = f as f32;
+            }
+        }
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let run = |pf: f64| {
+            simulate_slice(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                },
+                &Acquisition { partial_fourier: pf, ..clean(nx, ny) },
+            )
+        };
+        let col = nx / 2;
+        let asym = |v: &Vec<(f32, f32)>| {
+            let below: f64 = (1..6).map(|d| (v[col + nx * (ny / 2 - d)].0 as f64).powi(2)).sum();
+            let above: f64 = (1..6).map(|d| (v[col + nx * (ny / 2 + d)].0 as f64 - 1.0).powi(2)).sum();
+            (above / below.max(1e-12)).ln().abs()
+        };
+        let full = run(1.0);
+        for pf in [0.75, 0.875] {
+            let p = run(pf);
+            assert!(
+                asym(&p) > asym(&full),
+                "pf={pf} should ring more asymmetrically than full Fourier: {} vs {}",
+                asym(&p), asym(&full)
+            );
+        }
+        let e_full: f32 = full.iter().map(|v| v.0.abs()).sum();
+        let e_pf: f32 = run(0.75).iter().map(|v| v.0.abs()).sum();
+        assert!((e_pf / e_full - 1.0).abs() < 0.5, "PF energy {e_pf} vs full {e_full}");
+    }
+
+    #[test]
     fn global_phase_rotation_is_exact() {
         // Rotating the object by exp(i*alpha) must rotate the reconstructed image by exactly
         // exp(i*alpha) and leave its magnitude untouched. A gauge invariance no phase-histogram
