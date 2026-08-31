@@ -9,7 +9,7 @@ use trxscan::compartments::{
     generate_compartments_moving, generate_mixture, signal_from_mixture, CompartmentParams,
 };
 use trxscan::io;
-use trxscan::kspace::{simulate_acquisition, Acquisition};
+use trxscan::kspace::{KspaceWindow, simulate_acquisition, Acquisition};
 use trxscan::motion;
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
@@ -258,7 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eddy_tau: 70.0,
         n_spikes: 0,            // spikes are rare/aggressive; left off (available)
         spike_amplitude: 1.0,
-        zero_ringing: 6.0,      // mild Gibbs
+        window: KspaceWindow::None,  // unapodized; ringing is now intrinsic to the acquisition
         n_coils: cli.coils,
         accel: cli.accel,
         acs_lines: 24,

@@ -67,6 +67,47 @@ impl Rng {
     }
 }
 
+/// Scanner-side reconstruction apodization. Distinct transfer functions with distinct PSFs, so
+/// they are named rather than hidden behind one ambiguous scalar.
+///
+/// `None` is the default and is what the algorithm-validation fixture uses: Kellner/`mrdegibbs`
+/// assume an unapodized rectangular window. Note this is the default *window*; TRXScan's shipping
+/// acquisition default remains 6/8 partial Fourier, and the full-Fourier benchmark fixture sets
+/// `partial_fourier = 1.0` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KspaceWindow {
+    None,
+    Tukey { alpha: f64 },
+    Hann,
+    Fermi { radius: f64, width: f64 },
+}
+
+impl KspaceWindow {
+    /// Window value at normalized frequency `(kx, ky)`, each in `[-0.5, 0.5]`.
+    pub fn at(&self, kx: f64, ky: f64) -> f64 {
+        let r = 2.0 * (kx * kx + ky * ky).sqrt(); // 0 at centre, 1 at the band edge
+        match *self {
+            KspaceWindow::None => 1.0,
+            KspaceWindow::Hann => {
+                if r >= 1.0 { 0.0 } else { 0.5 * (1.0 + (std::f64::consts::PI * r).cos()) }
+            }
+            KspaceWindow::Tukey { alpha } => {
+                let a = alpha.clamp(0.0, 1.0);
+                if r <= 1.0 - a {
+                    1.0
+                } else if r >= 1.0 {
+                    0.0
+                } else {
+                    0.5 * (1.0 + (std::f64::consts::PI * (r - (1.0 - a)) / a.max(1e-12)).cos())
+                }
+            }
+            KspaceWindow::Fermi { radius, width } => {
+                1.0 / (1.0 + ((r - radius) / width.max(1e-12)).exp())
+            }
+        }
+    }
+}
+
 /// Acquisition parameters for the k-space stage.
 #[derive(Debug, Clone)]
 pub struct Acquisition {
@@ -85,7 +126,7 @@ pub struct Acquisition {
     pub eddy_tau: f64,        // eddy-current decay time (ms)
     pub n_spikes: usize,      // random k-space spikes per slice (0 = off) → herringbone
     pub spike_amplitude: f64, // spike magnitude as a fraction of the peak k-space sample
-    pub zero_ringing: f64,    // Gibbs: % of k-space half-extent to zero at the edges (0 = off)
+    pub window: KspaceWindow, // reconstruction apodization; None = unapodized rectangular
     pub n_coils: usize,       // receiver coils (1 = uniform single coil); ring-arranged sensitivities
     pub accel: usize,         // GRAPPA acceleration R (1 = fully sampled); undersamples PE lines
     pub acs_lines: usize,     // GRAPPA autocalibration lines (fully-sampled central PE band)
@@ -126,7 +167,7 @@ impl Default for Acquisition {
             eddy_tau: 70.0,
             n_spikes: 0,
             spike_amplitude: 1.0,
-            zero_ringing: 0.0,
+            window: KspaceWindow::None,
             n_coils: 1,
             accel: 1,
             acs_lines: 24,
@@ -284,9 +325,8 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     let at = |x: usize, y: usize| x + snx * y; // SIM-grid image index
     let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
 
-    let accel = acq.accel.max(1);
-    let acs_half = (acq.acs_lines / 2) as i64;
-    // acquired PE line? every R-th line (phase-aligned to k-space centre) plus the central ACS band.
+    // Which samples are acquired (partial Fourier + GRAPPA undersampling). Single source of
+    // truth, shared with the noise below so signal and noise cannot disagree.
     let mask = sampling_mask(nx, ny, acq);
     // ---- forward: build k-space, factored as  Σ_x e^{..kx x}[ Σ_y mod(x,y) e^{..ky y} ] ----
     // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
@@ -366,19 +406,6 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         }
     }
 
-    // Gibbs ringing: zero the outer high-frequency k-space lines (truncation → ringing at edges).
-    // Mirrors itkKspaceImageFilter.cpp:334 (an alternative to acquiring a smaller matrix).
-    if acq.zero_ringing > 0.0 {
-        let rx = ((nx as f64 / 2.0) * acq.zero_ringing / 100.0).ceil() as usize;
-        let ry = ((ny as f64 / 2.0) * acq.zero_ringing / 100.0).ceil() as usize;
-        for ky in 0..ny {
-            for kx in 0..nx {
-                if kx < rx || ky < ry || kx + rx >= nx || ky + ry >= ny {
-                    kspace[kat(kx, ky)] = C::ZERO;
-                }
-            }
-        }
-    }
 
     // Spikes: overwrite random k-space points with a fraction of the peak sample → herringbone
     // ripple in the image (itkKspaceImageFilter.cpp:502).
@@ -484,6 +511,28 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
     // GRAPPA: fill the un-acquired PE lines with a kernel calibrated on the ACS band across coils.
     if accel > 1 {
         grappa_reconstruct(&mut coil_kspace, nx, ny, ys, accel, acq.acs_lines);
+    }
+
+    // Reconstruction window: after GRAPPA, before the inverse transform, so it acts on
+    // originally-acquired and GRAPPA-synthesized lines alike -- and on the noise those lines
+    // already carry: K_filtered = W(k) * [K_signal(k) + n(k)].
+    //
+    // The position matters. Replacing the old zero_ringing block in situ would have kept the
+    // order signal -> band limitation -> noise, recreating the very defect this work removes:
+    // filtered signal combined with unfiltered noise (section 1, finding 2.5).
+    if acq.window != KspaceWindow::None {
+        for ks in coil_kspace.iter_mut() {
+            for kyi in 0..ny {
+                for kxi in 0..nx {
+                    let kx = (kxi as f64 - xs as f64) / nx as f64;
+                    let ky = (kyi as f64 - ys as f64) / ny as f64;
+                    let w = acq.window.at(kx, ky);
+                    let k = &mut ks[kxi + nx * kyi];
+                    k.re *= w;
+                    k.im *= w;
+                }
+            }
+        }
     }
 
     // inverse each coil, then phase-preserving Roemer combine with the known sensitivities:
@@ -942,18 +991,6 @@ mod tests {
         assert!(corner(&b) > corner(&a) + 0.1, "spikes should ripple into background: {} vs {}", corner(&a), corner(&b));
     }
 
-    #[test]
-    fn gibbs_ringing_changes_the_image() {
-        let (nx, ny) = (24, 24);
-        let img = phantom(nx, ny);
-        let fmap = vec![0.0f32; nx * ny];
-        let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
-        let ring = Acquisition { zero_ringing: 25.0, ..base.clone() };
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &ring, [0.0, 0.0, 0.0], 0));
-        let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
-        assert!(diff > 1e-3, "Gibbs zeroing should change the image, diff {diff}");
-    }
 
     #[test]
     fn multicoil_rss_recovers_the_brain() {
@@ -1213,6 +1250,53 @@ mod tests {
         let residual = (mi / mr) as f64;
         assert!(residual < 0.05, "asymmetry residual should stay small: {residual}");
         assert!(residual > 1e-4, "a real object should still show the asymmetry: {residual}");
+    }
+
+    #[test]
+    fn window_filters_signal_and_noise_together() {
+        // The original defect (finding 2.5) was band-limited signal with unfiltered noise.
+        // A reconstruction window must multiply both, so noise-only data must be suppressed too.
+        let (nx, ny) = (32usize, 32usize);
+        let empty = vec![0.0f32; nx * ny];
+        let fmap = vec![0.0f32; nx * ny];
+        let sd = |w: KspaceWindow| -> f64 {
+            let comps: [&[f32]; 1] = [&empty];
+            let out = simulate_slice(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+                },
+                &Acquisition { noise_variance: 1.0, window: w, ..clean(nx, ny) },
+            );
+            (out.iter().map(|p| (p.0 as f64).powi(2)).sum::<f64>() / (nx * ny) as f64).sqrt()
+        };
+        let unwindowed = sd(KspaceWindow::None);
+        let hann = sd(KspaceWindow::Hann);
+        assert!(hann < 0.8 * unwindowed, "a window must attenuate noise too: {hann:.3} vs {unwindowed:.3}");
+    }
+
+    #[test]
+    fn window_reduces_ringing_below_the_unapodized_case() {
+        let (nx, ny, o) = (32usize, 32usize, 8usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let peak = |w: KspaceWindow| {
+            let out = simulate_slice(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                },
+                &Acquisition { window: w, ..clean(nx, ny) },
+            );
+            (nx / 2 + 1..nx).map(|x| out[x + nx * (ny / 2)].0 as f64).fold(f64::MIN, f64::max)
+        };
+        let (plain, hann) = (peak(KspaceWindow::None), peak(KspaceWindow::Hann));
+        assert!(hann < plain, "apodization must reduce overshoot: {hann:.4} vs {plain:.4}");
+        assert!(plain > 1.05, "unapodized case should show real Gibbs overshoot: {plain:.4}");
     }
 
     #[test]
