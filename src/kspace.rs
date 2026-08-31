@@ -266,6 +266,11 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
     let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
     // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
+    // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
+    // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
+    // cover exactly this range. It gives a real object a small deterministic imaginary component,
+    // which is NOT object phase; see `phase.rs` for that. Pinned by
+    // `even_matrix_window_asymmetry_is_intentional`.
     let (xs, ys, zs) = (nx / 2, ny / 2, nz / 2);
     let (sxs, sys) = (snx / 2, sny / 2);
     let (ox, oy) = (snx / nx, sny / ny); // in-plane oversampling factors
@@ -1183,6 +1188,31 @@ mod tests {
         let e_full: f32 = full.iter().map(|v| v.0.abs()).sum();
         let e_pf: f32 = run(0.75).iter().map(|v| v.0.abs()).sum();
         assert!((e_pf / e_full - 1.0).abs() < 0.5, "PF energy {e_pf} vs full {e_full}");
+    }
+
+    #[test]
+    fn even_matrix_window_asymmetry_is_intentional() {
+        // The acquired band is [-n/2, n/2-1]: asymmetric about k=0 by one sample, exactly as real
+        // even-matrix Cartesian acquisitions are. Retained deliberately (spec 3.4), so pin it.
+        let n = 32i64;
+        let (lo, hi) = (-(n / 2), n / 2 - 1);
+        assert_eq!((lo, hi), (-16, 15));
+        assert_eq!((hi - lo + 1) as usize, n as usize, "the band must hold exactly n samples");
+        assert_eq!(lo.abs() - hi.abs(), 1, "one extra negative-frequency sample, by convention");
+
+        // Consequence: a real object acquires a small imaginary component. It is deterministic and
+        // is NOT realistic object phase -- that is what `phase.rs` supplies.
+        let (nx, ny, o) = (16usize, 16usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let out = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &clean(nx, ny));
+        let mr = out.iter().map(|p| p.0.abs()).fold(0.0f32, f32::max);
+        let mi = out.iter().map(|p| p.1.abs()).fold(0.0f32, f32::max);
+        let residual = (mi / mr) as f64;
+        assert!(residual < 0.05, "asymmetry residual should stay small: {residual}");
+        assert!(residual > 1e-4, "a real object should still show the asymmetry: {residual}");
     }
 
     #[test]
