@@ -134,6 +134,14 @@ impl Default for Acquisition {
     }
 }
 
+impl Acquisition {
+    /// Defaults for a given acquired matrix. `Default::default()` is retained for callers that
+    /// do not care about the matrix.
+    pub fn default_for(_nx: usize, _ny: usize) -> Self {
+        Acquisition::default()
+    }
+}
+
 /// Per-PE-line readout times (ms): `t` from max echo, `tRf` from RF, `tRead` from the last
 /// diffusion gradient (drives eddy-current decay).
 fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
@@ -151,20 +159,65 @@ fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (t, trf, tread)
 }
 
-/// Simulate one slice: compartment images (each `nx*ny`, layout `x + nx*y`) → magnitude image.
-/// `t2` is the per-compartment T2 (ms); `fmap` is the off-resonance field (Hz), same layout.
-pub fn simulate_slice(
-    compartments: &[&[f32]],
-    t2: &[f32],
-    fmap: &[f32],
-    nx: usize,
-    ny: usize,
-    z: usize,
-    nz: usize,
-    acq: &Acquisition,
-    gradient: [f64; 3],
-    slice_seed: u64,
-) -> Vec<(f32, f32)> {
+/// Everything one slice's forward model needs. The simulation grid (`sim`) and the acquired
+/// matrix (`acq_matrix`) are distinct: the object lives on the finer grid, and only the central
+/// `acq_matrix` block of its k-space is evaluated (spec 3.1).
+pub struct SliceInput<'a> {
+    /// Per-compartment images on the SIM grid, layout `x + snx*y`.
+    pub compartments: &'a [&'a [f32]],
+    pub t2: &'a [f32],
+    /// Off-resonance field (Hz) on the SIM grid.
+    pub fmap: &'a [f32],
+    /// Pre-readout object phase (radians) on the SIM grid. Ignored until Task 6.
+    pub phase0: Option<&'a [f64]>,
+    /// `[snx, sny]` — simulation grid, in-plane.
+    pub sim: [usize; 2],
+    /// `[nx, ny]` — acquired matrix.
+    pub acq_matrix: [usize; 2],
+    pub z: usize,
+    pub nz: usize,
+    /// Unit diffusion-gradient direction. Kept separate from `bval` so the phase model can form
+    /// an effective q-vector without recovering it from a scaled product (spec 3.2).
+    pub bvec: [f64; 3],
+    pub bval: f64,
+    pub slice_seed: u64,
+}
+
+/// Step edge at continuous position `edge` (sim-voxel units) with exact fractional occupancy in
+/// the boundary voxel. This is the same partial-volume representation the path-length rasterizer
+/// produces for real anatomy, so it is a production code path, not a test-only fixture.
+pub fn step_hires(snx: usize, sny: usize, edge: f64) -> Vec<f32> {
+    let mut v = vec![0.0f32; snx * sny];
+    for x in 0..snx {
+        let (lo, hi) = (x as f64, x as f64 + 1.0);
+        let frac = if hi <= edge {
+            0.0
+        } else if lo >= edge {
+            1.0
+        } else {
+            hi - edge
+        };
+        for y in 0..sny {
+            v[x + snx * y] = frac as f32;
+        }
+    }
+    v
+}
+
+/// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
+/// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms); `fmap` is
+/// the off-resonance field (Hz), same sim-grid layout. Only the central `nx*ny` block of the sim
+/// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
+/// transform rather than by discarding a computed k-space (spec 3.1).
+pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
+    let [snx, sny] = inp.sim;
+    let [nx, ny] = inp.acq_matrix;
+    assert!(
+        snx % nx == 0 && sny % ny == 0,
+        "sim grid must be an integer multiple of the acquired matrix"
+    );
+    let (z, nz) = (inp.z, inp.nz);
+    let (compartments, t2, fmap) = (inp.compartments, inp.t2, inp.fmap);
     let epi = SingleShotEpi {
         kx_max: nx,
         ky_max: ny,
@@ -173,11 +226,22 @@ pub fn simulate_slice(
         reverse_phase: acq.reverse_phase,
     };
     let (t_ms, trf_ms, tread_ms) = line_times(&epi);
+    let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
     // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
-    let do_eddy = acq.eddy_strength != 0.0
-        && (gradient[0].abs() + gradient[1].abs() + gradient[2].abs()) > 1e-9;
+    let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
+    // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
     let (xs, ys, zs) = (nx / 2, ny / 2, nz / 2);
-    let at = |x: usize, y: usize| x + nx * y;
+    let (sxs, sys) = (snx / 2, sny / 2);
+    let (ox, oy) = (snx / nx, sny / ny); // in-plane oversampling factors
+    // Half-cell alignment. Sim cell `x` covers [x, x+1) in sim units, so its centre is at x+0.5;
+    // acquired cell `X` covers o cells and is centred at o*X + o/2. Aligning sample index `x` with
+    // `o*X` — as a bare index substitution does — therefore misregisters the object against the
+    // reconstruction grid by (o-1)/2 sim cells, i.e. (o-1)/(2o) of an ACQUIRED voxel: 0.44 voxels
+    // at o=8. Since this whole model turns on sub-voxel edge position, that shift is fatal and the
+    // acquired k-space is measured from the acquired grid's centre instead. Exactly zero at o=1.
+    let (xoff, yoff) = ((ox as f64 - 1.0) / 2.0, (oy as f64 - 1.0) / 2.0);
+    let at = |x: usize, y: usize| x + snx * y; // SIM-grid image index
+    let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
 
     // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
     let ncoils = acq.n_coils.max(1);
@@ -193,7 +257,7 @@ pub fn simulate_slice(
     // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
     // per ky, but that keeps the whole build at O(N³).
     let mut kspace = vec![C::ZERO; nx * ny];
-    let n_inv = 1.0 / (nx * ny) as f64;
+    let n_inv = 1.0 / (snx * sny) as f64;
     for kyi in 0..ny {
         // partial Fourier: don't acquire the "later" PE lines (low-ky, or high-ky when reversed);
         // those k-space rows stay zero. Mirrors itkKspaceImageFilter.cpp:322.
@@ -213,16 +277,18 @@ pub fn simulate_slice(
         }
         let t = t_ms[kyi] / 1000.0; // seconds
         let trf = trf_ms[kyi];
-        let ky_norm = (kyi as f64 - ys as f64) / ny as f64;
+        // Divide by the SIM extent: the loop still runs over the ny ACQUIRED lines, but each sits
+        // at absolute sim index sys - ys + kyi, whose normalized frequency is (kyi - ys)/sny.
+        let ky_norm = (kyi as f64 - ys as f64) / sny as f64;
         // Nyquist (N/2) ghost: alternating readout-line kx offset (gradient-delay mismatch).
         let ghost_shift = if kyi % 2 == 1 { -acq.ghost_offset } else { acq.ghost_offset };
         // eddy-current decay for this PE line: exp(-tRead/τ)·t (itkKspaceImageFilter.cpp:354)
         let eddy_decay = if do_eddy { (-tread_ms[kyi] / acq.eddy_tau).exp() * t } else { 0.0 };
 
         // modulated image for this PE line
-        let mut modimg = vec![C::ZERO; nx * ny];
-        for y in 0..ny {
-            for x in 0..nx {
+        let mut modimg = vec![C::ZERO; snx * sny];
+        for y in 0..sny {
+            for x in 0..snx {
                 let mut f_real = 0.0f64;
                 for (c, comp) in compartments.iter().enumerate() {
                     let mut v = comp[at(x, y)] as f64;
@@ -231,13 +297,20 @@ pub fn simulate_slice(
                     }
                     f_real += v;
                 }
-                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, x, y, nx, ny);
+                // sensitivity is evaluated on the sim grid; the profile is scale-invariant, so
+                // the same physical field is sampled at any oversampling factor
+                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, x, y, snx, sny);
                 let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
                 if do_eddy {
                     // gradient-dependent field growing through the readout: linear (g·pos) plus a
                     // quadratic (g·pos²) term — the polynomial forms eddy/TORTOISE fit.
-                    let (xc, yc, zc) =
-                        (x as f64 - xs as f64, y as f64 - ys as f64, z as f64 - zs as f64);
+                    // centre on the sim grid, then express in ACQUIRED voxel units so that
+                    // eddy_strength/eddy_quad keep their meaning independent of oversampling
+                    let (xc, yc, zc) = (
+                        (x as f64 - sxs as f64 - xoff) / ox as f64,
+                        (y as f64 - sys as f64 - yoff) / oy as f64,
+                        z as f64 - zs as f64,
+                    );
                     let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
                     let quad =
                         gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
@@ -246,22 +319,23 @@ pub fn simulate_slice(
                 modimg[at(x, y)] = C::cis(TAU * phi).scale(f_real);
             }
         }
-        // inner y-sum → g(x), then x-DFT → kspace[:,ky]
-        let mut g = vec![C::ZERO; nx];
-        for x in 0..nx {
+        // inner y-sum over the SIM grid → g(x), then an x-DFT evaluated only at acquired kx
+        let mut g = vec![C::ZERO; snx];
+        for x in 0..snx {
             let mut acc = C::ZERO;
-            for y in 0..ny {
-                acc = acc.add(modimg[at(x, y)].mul(C::cis(TAU * ky_norm * (y as f64 - ys as f64))));
+            for y in 0..sny {
+                let ph = C::cis(TAU * ky_norm * (y as f64 - sys as f64 - yoff));
+                acc = acc.add(modimg[at(x, y)].mul(ph));
             }
             g[x] = acc;
         }
         for kxi in 0..nx {
-            let kx_norm = (kxi as f64 - xs as f64 + ghost_shift) / nx as f64;
+            let kx_norm = (kxi as f64 - xs as f64 + ghost_shift) / snx as f64;
             let mut acc = C::ZERO;
-            for x in 0..nx {
-                acc = acc.add(g[x].mul(C::cis(TAU * kx_norm * (x as f64 - xs as f64))));
+            for x in 0..snx {
+                acc = acc.add(g[x].mul(C::cis(TAU * kx_norm * (x as f64 - sxs as f64 - xoff))));
             }
-            kspace[at(kxi, kyi)] = acc.scale(n_inv);
+            kspace[kat(kxi, kyi)] = acc.scale(n_inv);
         }
     }
 
@@ -273,7 +347,7 @@ pub fn simulate_slice(
         for ky in 0..ny {
             for kx in 0..nx {
                 if kx < rx || ky < ry || kx + rx >= nx || ky + ry >= ny {
-                    kspace[at(kx, ky)] = C::ZERO;
+                    kspace[kat(kx, ky)] = C::ZERO;
                 }
             }
         }
@@ -291,17 +365,17 @@ pub fn simulate_slice(
             }
         }
         let spike = peak.scale(acq.spike_amplitude);
-        let mut rng = Rng(slice_seed ^ 0xA5A5_1234_5678_9ABC);
+        let mut rng = Rng(inp.slice_seed ^ 0xA5A5_1234_5678_9ABC);
         for _ in 0..acq.n_spikes {
             let kx = (rng.next_u64() as usize) % nx;
             let ky = (rng.next_u64() as usize) % ny;
-            kspace[at(kx, ky)] = spike;
+            kspace[kat(kx, ky)] = spike;
         }
     }
 
     // complex k-space noise → Rician magnitude in image; image-space SD ≈ sqrt(noise_variance).
     if acq.noise_variance > 0.0 {
-        let mut rng = Rng((slice_seed ^ (coil as u64).wrapping_mul(0x9E37_79B9)) | 1);
+        let mut rng = Rng((inp.slice_seed ^ (coil as u64).wrapping_mul(0x9E37_79B9)) | 1);
         let sigma = (acq.noise_variance / (nx * ny) as f64).sqrt();
         for k in kspace.iter_mut() {
             k.re += rng.gauss() * sigma;
@@ -326,7 +400,7 @@ pub fn simulate_slice(
         for y in 0..ny {
             for x in 0..nx {
                 let s = coil_sensitivity(coil, ncoils, x, y, nx, ny);
-                let i = at(x, y);
+                let i = kat(x, y);
                 wsum[i] = wsum[i].add(img[i].scale(s));
                 ssum[i] += s * s;
             }
@@ -508,6 +582,12 @@ pub fn simulate_acquisition(
         let (mut mag, mut phase) = (vec![0.0f32; nvox], vec![0.0f32; nvox]);
         let mut cslices = vec![vec![0.0f32; nx * ny]; ncomp];
         let mut fslice = vec![0.0f32; nx * ny];
+        // split the scaled gradient into a unit direction and a magnitude; the forward model
+        // recombines them, so this preserves the previous behaviour exactly
+        let gr = gradients[g];
+        let bval = (gr[0] * gr[0] + gr[1] * gr[1] + gr[2] * gr[2]).sqrt();
+        let bvec =
+            if bval > 1e-12 { [gr[0] / bval, gr[1] / bval, gr[2] / bval] } else { [0.0; 3] };
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
@@ -521,7 +601,21 @@ pub fn simulate_acquisition(
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
             let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
                 .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let out = simulate_slice(&refs, t2, &fslice, nx, ny, z, nz, acq, gradients[g], seed);
+            let inp = SliceInput {
+                compartments: &refs,
+                t2,
+                fmap: &fslice,
+                phase0: None,
+                // v1 acquisition path: the object is already on the acquired matrix (o = 1).
+                sim: [nx, ny],
+                acq_matrix: [nx, ny],
+                z,
+                nz,
+                bvec,
+                bval,
+                slice_seed: seed,
+            };
+            let out = simulate_slice(&inp, acq);
             for y in 0..ny {
                 for x in 0..nx {
                     let (re, im) = out[x + nx * y];
@@ -560,6 +654,46 @@ mod tests {
         v.iter().map(|&(r, i)| (r * r + i * i).sqrt()).collect()
     }
 
+    /// The pre-existing single-compartment call shape, on a `SliceInput` whose simulation grid
+    /// equals the acquired matrix (`o = 1`, `phase0: None`) — i.e. the old behaviour exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn slice1(
+        img: &[f32],
+        t2: &[f32],
+        fmap: &[f32],
+        nx: usize,
+        ny: usize,
+        z: usize,
+        nz: usize,
+        acq: &Acquisition,
+        gradient: [f64; 3],
+        slice_seed: u64,
+    ) -> Vec<(f32, f32)> {
+        let bval = (gradient[0].powi(2) + gradient[1].powi(2) + gradient[2].powi(2)).sqrt();
+        let bvec = if bval > 1e-12 {
+            [gradient[0] / bval, gradient[1] / bval, gradient[2] / bval]
+        } else {
+            [0.0; 3]
+        };
+        let comps: [&[f32]; 1] = [img];
+        simulate_slice(
+            &SliceInput {
+                compartments: &comps,
+                t2,
+                fmap,
+                phase0: None,
+                sim: [nx, ny],
+                acq_matrix: [nx, ny],
+                z,
+                nz,
+                bvec,
+                bval,
+                slice_seed,
+            },
+            acq,
+        )
+    }
+
     fn phantom(nx: usize, ny: usize) -> Vec<f32> {
         // a bright square in the middle
         let mut v = vec![0.0f32; nx * ny];
@@ -582,7 +716,7 @@ mod tests {
             do_relaxation: false,
             ..Default::default()
         };
-        let out = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         let err: f32 = img.iter().zip(&out).map(|(a, b)| (a - b).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(err < 1e-4, "roundtrip mean abs err {err}");
     }
@@ -603,7 +737,7 @@ mod tests {
             reverse_phase: false,
             ..Default::default()
         };
-        let out = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         // centroid of the bright region should move in y vs the undistorted image
         let cy = |v: &[f32]| {
             let (mut sw, mut sy) = (0.0f64, 0.0f64);
@@ -617,12 +751,12 @@ mod tests {
             sy / sw.max(1e-9)
         };
         let acq0 = Acquisition { do_distortions: false, ..acq.clone() };
-        let base = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &acq0, [0.0, 0.0, 0.0], 0));
+        let base = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq0, [0.0, 0.0, 0.0], 0));
         let shift = cy(&out) - cy(&base);
         assert!(shift.abs() > 1.5, "expected a clear PE shift (~4px), got {shift}");
         // reverse phase-encode flips the distortion direction
         let acq_rev = Acquisition { reverse_phase: true, ..acq.clone() };
-        let rev = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &acq_rev, [0.0, 0.0, 0.0], 0));
+        let rev = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq_rev, [0.0, 0.0, 0.0], 0));
         let shift_rev = cy(&rev) - cy(&base);
         assert!(shift * shift_rev < 0.0, "AP/PA should distort oppositely: {shift} vs {shift_rev}");
     }
@@ -634,8 +768,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let full = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let pf = Acquisition { partial_fourier: 0.6, ..full.clone() };
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
-        let b = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &pf, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &pf, [0.0, 0.0, 0.0], 0));
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(diff > 1e-3, "partial Fourier should alter the image, diff {diff}");
         // most of the signal energy is still there (PF keeps the central k-space)
@@ -656,8 +790,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let ghost = Acquisition { ghost_offset: 0.5, ..base.clone() };
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &ghost, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &ghost, [0.0, 0.0, 0.0], 0));
         // background region ~half-FOV away in the PE(y) direction from the source
         let bg = |v: &[f32]| {
             let mut s = 0.0f32;
@@ -680,14 +814,14 @@ mod tests {
         let eddy = Acquisition { eddy_strength: 5.0, ..base.clone() };
         // DWI volume (gradient along x): eddy shears the image
         let grad = [1.0, 0.0, 0.0];
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &base, grad, 0));
-        let b = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &eddy, grad, 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, grad, 0));
+        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &eddy, grad, 0));
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(diff > 1e-3, "eddy should shear the DWI, diff {diff}");
         // b0 (zero gradient): eddy must have no effect
         let z0 = [0.0, 0.0, 0.0];
-        let a0 = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &base, z0, 0));
-        let b0 = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &eddy, z0, 0));
+        let a0 = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, z0, 0));
+        let b0 = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &eddy, z0, 0));
         let diff0: f32 = a0.iter().zip(&b0).map(|(x, y)| (x - y).abs()).sum();
         assert!(diff0 < 1e-6, "eddy must not touch b0, diff {diff0}");
     }
@@ -699,8 +833,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let spiky = Acquisition { n_spikes: 3, spike_amplitude: 1.0, ..base.clone() };
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &spiky, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &spiky, [0.0, 0.0, 0.0], 0));
         let corner = |v: &[f32]| {
             let mut s = 0.0f32;
             for y in 0..3 {
@@ -720,8 +854,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let ring = Acquisition { zero_ringing: 25.0, ..base.clone() };
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &ring, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &ring, [0.0, 0.0, 0.0], 0));
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(diff > 1e-3, "Gibbs zeroing should change the image, diff {diff}");
     }
@@ -732,7 +866,7 @@ mod tests {
         let img = phantom(nx, ny);
         let fmap = vec![0.0f32; nx * ny];
         let acq = Acquisition { n_coils: 4, signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
-        let out = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         let center = out[12 + nx * 12];
         let corner = out[1 + nx * 1];
         assert!(center > 0.1 && center > corner, "RSS should recover the brain: center {center} corner {corner}");
@@ -745,12 +879,85 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let full = Acquisition { n_coils: 8, signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let accel = Acquisition { accel: 2, acs_lines: 16, ..full.clone() };
-        let a = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
-        let g = mag(&simulate_slice(&[&img], &[100.0], &fmap, nx, ny, 0, 1, &accel, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
+        let g = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &accel, [0.0, 0.0, 0.0], 0));
         // noise-free: GRAPPA should recover the fully-sampled image closely (aliasing unfolded)
         let num: f32 = a.iter().zip(&g).map(|(x, y)| (x - y).abs()).sum();
         let den: f32 = a.iter().sum::<f32>().max(1e-6);
         let rel = num / den;
         assert!(rel < 0.15, "GRAPPA should reconstruct the image, rel err {rel}");
+    }
+    use crate::analytic::truncated_step_profile;
+
+    /// Acquisition with every artifact off: pure finite-Fourier acquisition.
+    fn clean(nx: usize, ny: usize) -> Acquisition {
+        Acquisition {
+            signal_scale: 1.0,
+            do_distortions: false,
+            do_relaxation: false,
+            noise_variance: 0.0,
+            partial_fourier: 1.0,
+            ghost_offset: 0.0,
+            eddy_strength: 0.0,
+            n_coils: 1,
+            accel: 1,
+            ..Acquisition::default_for(nx, ny)
+        }
+    }
+
+    #[test]
+    fn crop_reproduces_the_analytic_profile_across_subvoxel_offsets() {
+        let (nx, ny, o) = (32usize, 32usize, 8usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let fmap = vec![0.0f32; snx * sny];
+        let acq = clean(nx, ny);
+
+        for i in 0..16 {
+            let delta = i as f64 / 16.0;
+            // Edge at (nx/2 + delta) acquired voxels, expressed in sim-voxel units.
+            let edge = (nx as f64 / 2.0 + delta) * o as f64;
+            let img = step_hires(snx, sny, edge);
+            let comps: [&[f32]; 1] = [&img];
+            let inp = SliceInput {
+                compartments: &comps,
+                t2: &[100.0],
+                fmap: &fmap,
+                phase0: None,
+                sim: [snx, sny],
+                acq_matrix: [nx, ny],
+                z: 0,
+                nz: 1,
+                bvec: [0.0, 0.0, 0.0],
+                bval: 0.0,
+                slice_seed: 0,
+            };
+            let out = simulate_slice(&inp, &acq);
+
+            let expect = truncated_step_profile(nx, (nx as f64 / 2.0 + delta) / nx as f64);
+            let row = ny / 2;
+            let worst = (0..nx)
+                .map(|x| (out[x + nx * row].0 as f64 - expect[x]).abs())
+                .fold(0.0f64, f64::max);
+            assert!(worst < 5e-3, "offset {delta}: max profile deviation {worst:.4e}");
+        }
+    }
+
+    #[test]
+    fn ringing_is_intrinsic_without_any_ringing_parameter() {
+        // A sub-voxel-positioned edge must now ring: the old exact-DFT round-trip is gone.
+        let (nx, ny, o) = (32usize, 32usize, 8usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let fmap = vec![0.0f32; snx * sny];
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let comps: [&[f32]; 1] = [&img];
+        let inp = SliceInput {
+            compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+            sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+        };
+        let out = simulate_slice(&inp, &clean(nx, ny));
+        let row = ny / 2;
+        let peak = (nx / 2 + 1..nx).map(|x| out[x + nx * row].0 as f64).fold(f64::MIN, f64::max);
+        assert!(peak > 1.05, "expected intrinsic overshoot, got peak {peak:.4}");
     }
 }
