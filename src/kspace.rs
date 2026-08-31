@@ -208,6 +208,43 @@ pub fn step_hires(snx: usize, sny: usize, edge: f64) -> Vec<f32> {
 /// Build the acquired k-space for one coil, complete with the ringing mask, spikes and thermal
 /// noise, but before GRAPPA, reconstruction and coil combination. Shared by [`simulate_slice`] and
 /// [`simulate_slice_kspace`] so tests can inspect the coefficients before reconstruction.
+/// Which k-space samples are actually acquired: partial Fourier plus GRAPPA undersampling.
+/// Layout `kx + nx*ky`.
+///
+/// This is the single source of truth for both the forward build and the noise, so signal and
+/// noise can never disagree about what was sampled. The original defect (section 1, finding 2.5)
+/// was exactly that disagreement: noise was added after the line skip, populating k-space that
+/// was never acquired.
+pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
+    let ys = ny / 2;
+    let accel = acq.accel.max(1);
+    let acs_half = (acq.acs_lines / 2) as i64;
+    let mut m = vec![false; nx * ny];
+    for kyi in 0..ny {
+        if acq.partial_fourier < 1.0 {
+            let skip = if acq.reverse_phase {
+                kyi as f64 > (ny as f64 * acq.partial_fourier).ceil()
+            } else {
+                (kyi as f64) < (ny as f64 * (1.0 - acq.partial_fourier)).floor()
+                    && (kyi > 0 || ny % 2 == 1)
+            };
+            if skip {
+                continue;
+            }
+        }
+        let acquired = accel <= 1
+            || (kyi as i64 - ys as i64).abs() <= acs_half
+            || kyi % accel == ys % accel;
+        if !acquired {
+            continue;
+        }
+        for kxi in 0..nx {
+            m[kxi + nx * kyi] = true;
+        }
+    }
+    m
+}
+
 fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
@@ -245,30 +282,17 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     let accel = acq.accel.max(1);
     let acs_half = (acq.acs_lines / 2) as i64;
     // acquired PE line? every R-th line (phase-aligned to k-space centre) plus the central ACS band.
-    let acquired = |ky: usize| -> bool {
-        accel <= 1 || (ky as i64 - ys as i64).abs() <= acs_half || ky % accel == ys % accel
-    };
+    let mask = sampling_mask(nx, ny, acq);
     // ---- forward: build k-space, factored as  Σ_x e^{..kx x}[ Σ_y mod(x,y) e^{..ky y} ] ----
     // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
     // per ky, but that keeps the whole build at O(N³).
     let mut kspace = vec![C::ZERO; nx * ny];
     let n_inv = 1.0 / (snx * sny) as f64;
     for kyi in 0..ny {
-        // partial Fourier: don't acquire the "later" PE lines (low-ky, or high-ky when reversed);
-        // those k-space rows stay zero. Mirrors itkKspaceImageFilter.cpp:322.
-        if acq.partial_fourier < 1.0 {
-            let skip = if acq.reverse_phase {
-                kyi as f64 > (ny as f64 * acq.partial_fourier).ceil()
-            } else {
-                (kyi as f64) < (ny as f64 * (1.0 - acq.partial_fourier)).floor()
-                    && (kyi > 0 || ny % 2 == 1)
-            };
-            if skip {
-                continue;
-            }
-        }
-        if !acquired(kyi) {
-            continue; // undersampled PE line — GRAPPA fills it from the ACS-calibrated kernel
+        // Not acquired (partial Fourier, or GRAPPA undersampling): this k-space row stays
+        // zero and, critically, receives no noise either.
+        if !mask[nx * kyi] {
+            continue;
         }
         let t = t_ms[kyi] / 1000.0; // seconds
         let trf = trf_ms[kyi];
@@ -371,13 +395,23 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         }
     }
 
-    // complex k-space noise → Rician magnitude in image; image-space SD ≈ sqrt(noise_variance).
+    // Complex k-space noise, on ACQUIRED samples only.
+    //
+    // `noise_variance` is the PER-COMPONENT variance of the reconstructed complex image under
+    // full sampling, single-coil, pre-combination: Var(Re n) = Var(Im n) = noise_variance, so
+    // E[|n|^2] = 2*noise_variance. The per-sample variance follows from the reconstruction
+    // normalization, which uses the ACQUIRED matrix, never the simulation grid.
+    //
+    // Masking alone produces the sqrt(f) scaling; there is deliberately NO additional
+    // sampled-fraction factor, which would double-count it and give SD proportional to f.
     if acq.noise_variance > 0.0 {
         let mut rng = Rng((inp.slice_seed ^ (coil as u64).wrapping_mul(0x9E37_79B9)) | 1);
         let sigma = (acq.noise_variance / (nx * ny) as f64).sqrt();
-        for k in kspace.iter_mut() {
-            k.re += rng.gauss() * sigma;
-            k.im += rng.gauss() * sigma;
+        for (i, k) in kspace.iter_mut().enumerate() {
+            if mask[i] {
+                k.re += rng.gauss() * sigma;
+                k.im += rng.gauss() * sigma;
+            }
         }
     }
 
@@ -972,6 +1006,72 @@ mod tests {
             compartments: comps, t2: &[100.0], fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
             bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+        }
+    }
+
+    #[test]
+    fn noise_lands_only_on_acquired_samples() {
+        // The original defect (finding 2.5): noise populated k-space that was never acquired,
+        // so the signal was band-limited while the noise stayed white to the full Nyquist.
+        let (nx, ny) = (24usize, 24usize);
+        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean(nx, ny) };
+        let mask = sampling_mask(nx, ny, &acq);
+        assert!(mask.iter().any(|b| !b), "pf=0.75 must leave some samples unacquired");
+        let empty = vec![0.0f32; nx * ny];
+        let fmap = vec![0.0f32; nx * ny];
+        let comps: [&[f32]; 1] = [&empty];
+        let k = simulate_slice_kspace(
+            &SliceInput {
+                compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9,
+            },
+            &acq,
+        );
+        for i in 0..nx * ny {
+            if !mask[i] {
+                assert_eq!((k[i].0, k[i].1), (0.0, 0.0), "unacquired sample {i} carries noise");
+            }
+        }
+    }
+
+    #[test]
+    fn noise_sd_scales_as_sqrt_sampled_fraction() {
+        // Scoped: GRAPPA disabled, no window, identical per-sample thermal variance (spec 4.1.8).
+        // `noise_variance` is the PER-COMPONENT variance of the reconstructed image at full
+        // sampling, so the full-sampling SD is sqrt(noise_variance) = 1.0 here.
+        let (nx, ny) = (32usize, 32usize);
+        let sd_at = |pf: f64| -> f64 {
+            let acq = Acquisition { partial_fourier: pf, noise_variance: 1.0, ..clean(nx, ny) };
+            let empty = vec![0.0f32; nx * ny];
+            let fmap = vec![0.0f32; nx * ny];
+            let comps: [&[f32]; 1] = [&empty];
+            let out = simulate_slice(
+                &SliceInput {
+                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3,
+                },
+                &acq,
+            );
+            let v: f64 = out.iter().map(|p| (p.0 as f64).powi(2)).sum::<f64>() / (nx * ny) as f64;
+            v.sqrt()
+        };
+        let full = sd_at(1.0);
+        assert!((full - 1.0).abs() < 0.15, "full-sampling per-component SD {full:.3}, expected ~1.0");
+        let frac = |pf: f64| {
+            let acq = Acquisition { partial_fourier: pf, ..clean(nx, ny) };
+            let m = sampling_mask(nx, ny, &acq);
+            m.iter().filter(|b| **b).count() as f64 / (nx * ny) as f64
+        };
+        for pf in [0.75, 0.5] {
+            let (sd, f) = (sd_at(pf), frac(pf));
+            let ratio = sd / full;
+            assert!(
+                (ratio - f.sqrt()).abs() < 0.1,
+                "pf={pf}: SD ratio {ratio:.3}, expected sqrt(sampled fraction {f:.3}) = {:.3}",
+                f.sqrt()
+            );
         }
     }
 
