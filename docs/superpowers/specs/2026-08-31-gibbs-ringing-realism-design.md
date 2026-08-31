@@ -88,9 +88,9 @@ partial-Fourier line skip (`kspace.rs:302-309`), populating samples that were ne
 Introduce a **simulation grid** distinct from the **acquisition matrix**.
 
 - Simulation grid: `Grid { dims: [o*nx, o*ny, nz] }` with the in-plane columns of `voxel_to_world`
-  divided by `o`. Candidate starting value `o = 2`; the **production default is `o_min`, selected by
-  the convergence criterion in 4.1.10**, not assumed. Cost and memory figures below use `o = 2` as a
-  concrete example. In-plane only: the slice direction is not Fourier-encoded in 2D
+  divided by `o`. **The production default is `o = 4`**, set by the convergence study (4.1.10) and
+  the cost/accuracy tradeoff below, not assumed. Cost and memory figures below use `o = 2` only
+  because it is the smallest non-trivial case; see the measured table for the real figures. In-plane only: the slice direction is not Fourier-encoded in 2D
   EPI, so there is nothing to truncate along z and oversampling it would only cost.
 - Acquisition matrix: `(nx, ny)` — same FOV, same voxel size, what is written out.
 
@@ -135,7 +135,23 @@ not of the object, so `line_times` and the eddy/distortion timing are untouched.
 
 Computing the full `o*nx x o*ny` k-space and cropping afterwards would be `24 N^3` at `o=2` (8x), so
 cropping during the transform saves 2.4x against the naive route. The net cost against today is
-**~3.3x**, scaling as `(2o^2 + o)/3`.
+`(2o^2 + o)/3`.
+
+**Measured cost and accuracy (phase 1).** The convergence study rejected the `o = 2` example this
+section originally used. Acquired-band relative error: e(2->4) = 8.5e-3, e(4->8) = 4.0e-3,
+e(8->16) = 4.0e-4. Image-domain profile deviation against the analytic oracle, judged against the
+~8.95% Gibbs overshoot the benchmark exists to measure:
+
+| `o` | cost vs today | profile error | as a fraction of the artifact |
+|---|---|---|---|
+| 2 | 3.3x | ~1.4e-2 | 15.6% - too coarse to benchmark against |
+| **4 (default)** | **12x** | **~4e-3** | **4.5%** |
+| 8 | 45x | 1.8e-3 | 2.0% |
+
+`o = 4` is the default: the residual sits well below the effect being measured, and 45x on a stage
+that is still O(N^3) direct sums would in practice require the phase-10 FFT path first. A strict
+1e-3 acquired-band tolerance would select `o = 8`; that tolerance was never justified against the
+artifact amplitude, and this table replaces it. Revisit once the FFT path lands.
 
 **Input path.** `data/trxscan_truth_data/sub-0001a/anat/` holds 1 mm isotropic WM/GM/CSF probsegs
 and fieldmap on a 193x229x193 ACPC grid, and `scripts/prepare_acquisition_grid.py` already

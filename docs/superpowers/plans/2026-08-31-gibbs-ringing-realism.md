@@ -37,6 +37,7 @@ fresh reader and are **not** yours to fix:
    **48 passed, 1 failed**.
    - Do not fix it, do not delete it, do not run the fixture generator.
    - Where a step says "Run: `cargo test`", the pass criterion is *no new failures beyond that one*.
+     Check the failure count, not the pass count.
    - Prefer the scoped form while iterating: `cargo test --lib analytic`, `--lib kspace`,
      `--lib phase`, `--lib benchmark`.
 
@@ -475,6 +476,11 @@ git commit -m "feat(kspace): crop to the acquired band during the forward transf
 **Files:**
 - Modify: `src/kspace.rs`
 - Test: `src/kspace.rs`
+
+**Decided (phase 1 outcome):** the production oversampling default is **`o = 4`**. Measured
+acquired-band errors were e(2->4)=8.5e-3, e(4->8)=4.0e-3, e(8->16)=4.0e-4; a strict 1e-3 tolerance
+would pick o=8 at ~45x cost, but that tolerance was never justified against the ~9% artifact being
+measured. At o=4 the residual is 4.5% of the artifact for 12x cost. See spec 3.1.
 
 **Note from Task 2:** the forward transform now carries a half-cell registration offset
 (`xoff = (ox-1)/2`, `yoff = (oy-1)/2`) and a separate `kat` k-space indexer. A pre-fix numerical
