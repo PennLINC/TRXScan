@@ -148,10 +148,17 @@ e(8->16) = 4.0e-4. Image-domain profile deviation against the analytic oracle, j
 | **4 (default)** | **12x** | **~4e-3** | **4.5%** |
 | 8 | 45x | 1.8e-3 | 2.0% |
 
-`o = 4` is the default: the residual sits well below the effect being measured, and 45x on a stage
-that is still O(N^3) direct sums would in practice require the phase-10 FFT path first. A strict
-1e-3 acquired-band tolerance would select `o = 8`; that tolerance was never justified against the
-artifact amplitude, and this table replaces it. Revisit once the FFT path lands.
+`o = 4` is the default **on accuracy grounds**: the residual sits well below the effect being
+measured. A strict 1e-3 acquired-band tolerance would select `o = 8`; that tolerance was never
+justified against the artifact amplitude, and the table above replaces it.
+
+**Measured wall time (release, 108x152 in-plane, single-threaded):** 124 ms/slice at `o = 1`,
+252 ms at `o = 2`, 750 ms at `o = 4`. For a 104-slice, 75-volume acquisition that is 0.3 h, 0.5 h
+and **1.6 h** respectively, and the stage is already parallel over volumes under the `par` feature.
+An earlier draft claimed `o = 8` "would in practice require the phase-10 FFT path first"; the
+measurement does not support that -- `o = 8` extrapolates to ~13.6 h single-threaded, roughly 1.7 h
+on 8 cores, which is tolerable. The FFT path is therefore a convenience, not a prerequisite, and
+phase 10 is deprioritized accordingly. `o = 4` stands on its accuracy justification alone.
 
 **Input path.** `data/trxscan_truth_data/sub-0001a/anat/` holds 1 mm isotropic WM/GM/CSF probsegs
 and fieldmap on a 193x229x193 ACPC grid, and `scripts/prepare_acquisition_grid.py` already
