@@ -578,7 +578,27 @@ git commit -m "feat(kspace): expose acquired k-space; add convergence test for o
 ### Task 4: `--oversample` in the acquisition-grid prep script
 
 **Files:**
-- Modify: `data/trxscan_truth_data/scripts/prepare_acquisition_grid.py`
+- Modify: `scripts/prepare_acquisition_grid.py` (in the TRXScan repo)
+
+**Corrected after execution.** This task originally pointed at
+`data/trxscan_truth_data/scripts/prepare_acquisition_grid.py`. That path is a **sibling of the
+TRXScan repo, not inside it**, and is not a git repo at all, so the commit step was impossible. The
+scripts are now versioned at `TRXScan/scripts/`; the untracked data bundle keeps its own copy,
+which its `README.md` and `PROVENANCE.md` both reference by that path.
+
+**The plan's variable names were invented.** `outputs`, `acq_shape`, `acq_affine` do not exist. The
+real names are `probs` (1 mm `nib.load` handles), `shape`, `affine`, `fmap_src`. This matters
+beyond cosmetics: `w, g, c` at line 68 are **re-loaded from the already-downsampled output**, so
+reconstructing an `outputs` dict from the obvious in-scope variables produces exactly the
+mathematically-null upsample spec 3.1 warns against. Resample from `probs[t]` and `fmap_src`.
+
+**Python environment: `linc311`** (nibabel 5.3.2, scipy 1.16.3, numpy 1.26.3, pytest 9.1.1). Run
+Python via `micromamba run -n linc311 ...`.
+
+**Known gap, not yet addressed:** `--oversample N --myelin` writes a sim directory with no
+`myelin.nii.gz`. The fix is not a plain resample: `distance_transform_edt` needs
+`sampling=(VOX/n, VOX/n, VOX)` on the anisotropic sim grid. Out of scope for phases 0-7; pick it up
+when the myelin preset is next touched.
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
