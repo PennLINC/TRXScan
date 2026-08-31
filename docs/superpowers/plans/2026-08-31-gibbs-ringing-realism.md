@@ -476,6 +476,12 @@ git commit -m "feat(kspace): crop to the acquired band during the forward transf
 - Modify: `src/kspace.rs`
 - Test: `src/kspace.rs`
 
+**Note from Task 2:** the forward transform now carries a half-cell registration offset
+(`xoff = (ox-1)/2`, `yoff = (oy-1)/2`) and a separate `kat` k-space indexer. A pre-fix numerical
+check put the `o = 2` profile deviation at ~1.4e-2 against ~8.3e-4 at `o = 8`, so **`o = 2` may not
+clear a 1e-3 tolerance**. Report the measured `o_min` rather than assuming 2 is adequate; this is
+exactly the question spec 4.1.10 makes an output.
+
 **Interfaces:**
 - Consumes: `SliceInput`, `simulate_slice` from Task 2.
 - Produces: `pub fn simulate_slice_kspace(inp: &SliceInput, acq: &Acquisition) -> Vec<(f64, f64)>` — the acquired `nx*ny` k-space, layout `kx + nx*ky`, before the inverse transform.
