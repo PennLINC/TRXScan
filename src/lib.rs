@@ -49,6 +49,8 @@ pub mod microstructure;
 pub mod phase;
 pub mod readout;
 pub mod kspace;
+/// Scoreable benchmark outputs (spec 3.5).
+pub mod benchmark;
 pub mod noise;
 
 // --- cross-cutting ---
