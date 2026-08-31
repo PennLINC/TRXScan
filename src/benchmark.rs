@@ -3,7 +3,8 @@
 //! Evaluating an unringing method needs an artifact-free target *and* a configuration in which the
 //! score means what it claims. This module provides both.
 
-use crate::kspace::Acquisition;
+use crate::kspace::{phase_slice, simulate_slice, Acquisition, SliceInput};
+use crate::phase::{PhaseModel, ShotPhase};
 
 /// Reduce a simulation-grid complex field onto the acquisition grid by the **complex block mean**
 /// over each `o x o` cell.
@@ -33,6 +34,74 @@ pub fn block_mean_complex(hires: &[(f64, f64)], snx: usize, sny: usize, o: usize
         d.1 *= inv;
     }
     out
+}
+
+/// Produce the four co-registered benchmark images for one slice.
+///
+/// Two properties are the whole point of this function:
+///
+/// - `object_nominal` is the block mean of the SAME `object_hires` array that produced the
+///   acquired images. Regenerating it independently would give a different random draw and would
+///   also lose intravoxel dephasing, since a single coarse phase per voxel carries none.
+/// - `acquired_clean` and `acquired_noisy` share one object and phase realization, so their
+///   difference is noise alone. That is what lets residual Gibbs, noise amplification, and the
+///   interaction between denoising and unringing be separated.
+#[allow(clippy::too_many_arguments)]
+pub fn produce_slice(
+    comps: &[&[f32]],
+    t2: &[f32],
+    fmap: &[f32],
+    model: &PhaseModel,
+    shot: &ShotPhase,
+    sim: [usize; 2],
+    acq_matrix: [usize; 2],
+    z: usize,
+    nz: usize,
+    acq: &Acquisition,
+    bvec: [f64; 3],
+    bval: f64,
+    seed: u64,
+) -> BenchmarkSlice {
+    let [snx, sny] = sim;
+    let [nx, ny] = acq_matrix;
+    assert!(snx % nx == 0 && sny % ny == 0, "sim grid must be an integer multiple");
+    let o = snx / nx;
+    assert_eq!(o, sny / ny, "oversampling must match on both axes");
+
+    let phi = phase_slice(model, shot, snx, sny, o, z, nz);
+
+    // The complex object exactly as the acquisition sees it.
+    let object_hires: Vec<(f64, f64)> = (0..snx * sny)
+        .map(|i| {
+            let amp: f64 = comps.iter().map(|c| c[i] as f64).sum::<f64>() * acq.signal_scale;
+            let (s, c) = phi[i].sin_cos();
+            (amp * c, amp * s)
+        })
+        .collect();
+    let object_nominal = block_mean_complex(&object_hires, snx, sny, o);
+
+    let mk = |noise: f64| -> Vec<(f32, f32)> {
+        simulate_slice(
+            &SliceInput {
+                compartments: comps,
+                t2,
+                fmap,
+                phase0: Some(&phi),
+                sim,
+                acq_matrix,
+                z,
+                nz,
+                bvec,
+                bval,
+                slice_seed: seed,
+            },
+            &Acquisition { noise_variance: noise, ..acq.clone() },
+        )
+    };
+    let acquired_clean = mk(0.0);
+    let acquired_noisy = mk(acq.noise_variance);
+
+    BenchmarkSlice { object_hires, object_nominal, acquired_clean, acquired_noisy }
 }
 
 /// The four co-registered images one benchmark slice produces.
@@ -76,6 +145,63 @@ pub fn gibbs_benchmark_acquisition(base: &Acquisition) -> Acquisition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_derives_nominal_from_the_same_realization() {
+        use crate::kspace::step_hires;
+        use crate::phase::{DiffusionPhase, PhaseModel};
+        let (nx, ny, o) = (16usize, 16usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let model = PhaseModel { global: 0.3, ..PhaseModel::none() };
+        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+            .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
+        let acq = gibbs_benchmark_acquisition(&Acquisition {
+            signal_scale: 1.0, noise_variance: 1.0, ..Acquisition::default()
+        });
+        let b = produce_slice(&comps, &[100.0], &fmap, &model, &shot,
+                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 7);
+        assert_eq!(b.object_hires.len(), snx * sny);
+        assert_eq!(b.object_nominal.len(), nx * ny);
+        assert_eq!(b.acquired_clean.len(), nx * ny);
+        assert_eq!(b.acquired_noisy.len(), nx * ny);
+        // object_nominal must be exactly the block mean of THIS object_hires, not a re-run.
+        let expect = block_mean_complex(&b.object_hires, snx, sny, o);
+        for i in 0..nx * ny {
+            assert!((b.object_nominal[i].0 - expect[i].0).abs() < 1e-12);
+            assert!((b.object_nominal[i].1 - expect[i].1).abs() < 1e-12);
+        }
+        let m = b.object_hires.iter().map(|z| z.1.abs()).fold(0.0f64, f64::max);
+        assert!(m > 0.1, "global phase 0.3 rad should give a real imaginary part, got {m}");
+    }
+
+    #[test]
+    fn clean_and_noisy_share_one_realization() {
+        use crate::kspace::step_hires;
+        use crate::phase::{DiffusionPhase, PhaseModel};
+        let (nx, ny, o) = (16usize, 16usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny];
+        let comps: [&[f32]; 1] = [&img];
+        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+            .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
+        let acq = gibbs_benchmark_acquisition(&Acquisition {
+            signal_scale: 1.0, noise_variance: 4.0, ..Acquisition::default()
+        });
+        let b = produce_slice(&comps, &[100.0], &fmap, &PhaseModel::none(), &shot,
+                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 11);
+        let d: f64 = (0..nx * ny)
+            .map(|i| (b.acquired_noisy[i].0 - b.acquired_clean[i].0) as f64)
+            .map(|v| v * v)
+            .sum::<f64>()
+            / (nx * ny) as f64;
+        assert!(d.sqrt() > 0.5, "noisy and clean should differ by the noise: {}", d.sqrt());
+        let e: f64 = b.acquired_clean.iter().map(|p| (p.0 as f64).powi(2)).sum();
+        assert!(e > 1.0, "clean image should carry the object, got energy {e}");
+    }
 
     #[test]
     fn block_mean_preserves_scale() {
