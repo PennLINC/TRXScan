@@ -25,6 +25,34 @@
 - **Integer oversampling ratio** `o = snx/nx = sny/ny`, enforced by assertion. This is an implementation restriction for voxel-subdivision clarity and parity safety, not a Fourier requirement (spec 3.1).
 - Commit after every task. Run `cargo test` before each commit.
 
+## Working Tree State (read before Task 1)
+
+This branch was merged with `main` after the spec was written. Three things will look wrong to a
+fresh reader and are **not** yours to fix:
+
+1. **One test already fails, for an environment reason.**
+   `microstructure::tests::matches_dipy_closed_forms_on_fixtures` panics with
+   `run tools/gen_force_fixtures.py first: No such file or directory`. It arrived from `main`
+   (commit `668dfea`) and needs a fixture-generation script that has not been run here. Baseline is
+   **48 passed, 1 failed**.
+   - Do not fix it, do not delete it, do not run the fixture generator.
+   - Where a step says "Run: `cargo test`", the pass criterion is *no new failures beyond that one*.
+   - Prefer the scoped form while iterating: `cargo test --lib analytic`, `--lib kspace`,
+     `--lib phase`, `--lib benchmark`.
+
+2. **Every tracked file shows as modified, with no content change.** The working tree is CRLF, the
+   committed blobs are LF, and `core.autocrlf=false`, so `git status` reports all 24 files as
+   modified. This predates the work and is deliberately left alone.
+   - **Never `git add -A` or `git add .`** — it would commit thousands of lines of line-ending
+     churn into `PennLINC/TRXScan`. Add only the exact paths each task's commit step names.
+
+3. **New modules exist that this plan does not touch:** `src/sphere.rs`, `src/mixture.rs`,
+   `src/microstructure.rs`, and `src/bin/trxscan_microstructure.rs`. They are independent of the
+   k-space forward model. The only file outside `src/kspace.rs` that reads `zero_ringing` is
+   `src/bin/trxscan.rs:261`, so Task 12's removal has exactly one call site to update.
+
+All `file:line` citations in this plan and in the spec were re-verified against the merged tree.
+
 ---
 
 ## File Structure
@@ -1412,7 +1440,7 @@ git commit -m "test(kspace): noise autocovariance matches the inverse DFT of the
 - Consumes: `step_hires`, `SliceInput`, `simulate_slice` (Task 2).
 - Produces: no new public API; tests only.
 
-6/8 is the shipping default (`src/bin/trxscan.rs:117`), so this is the primary configuration, not an edge case.
+6/8 is the shipping default (`src/bin/trxscan.rs:254`), so this is the primary configuration, not an edge case.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1701,7 +1729,7 @@ Apply the window in `simulate_slice`, **after** GRAPPA and before `inverse_2d`:
     }
 ```
 
-Update `src/bin/trxscan.rs:122`, replacing `zero_ringing: 6.0,` with `window: KspaceWindow::None,` and adding `KspaceWindow` to the `use trxscan::kspace::{...}` import. Delete the now-obsolete `gibbs_ringing_changes_the_image` test.
+Update `src/bin/trxscan.rs:261`, replacing `zero_ringing: 6.0,` with `window: KspaceWindow::None,` and adding `KspaceWindow` to the `use trxscan::kspace::{...}` import. Delete the now-obsolete `gibbs_ringing_changes_the_image` test.
 
 - [ ] **Step 4: Run test to verify it passes**
 

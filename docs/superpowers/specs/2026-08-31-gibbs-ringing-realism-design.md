@@ -53,9 +53,9 @@ resolution loss, and entirely absent from the imaginary channel. Measured on 64x
 
 Root causes: (a) the object is defined on the reconstruction grid, so the forward/inverse DFT pair
 is an exact identity and no ringing can arise; (b) the compartment signal is real and non-negative
-(`kspace.rs:230-232`) and the only phase terms are ky-dependent (`kspace.rs:236-244`), so they warp
+(`kspace.rs:232-234`) and the only phase terms are ky-dependent (`kspace.rs:238-246`), so they warp
 geometry rather than imprint image phase; (c) noise is added after truncation and after the
-partial-Fourier line skip (`kspace.rs:300-307`), populating samples that were never acquired.
+partial-Fourier line skip (`kspace.rs:302-309`), populating samples that were never acquired.
 
 ## 2. Goals and non-goals
 
@@ -104,7 +104,7 @@ therefore exactly acquisition at the nominal matrix over the nominal FOV.
 and the `nx` acquired readout points, and only the normalizers change:
 
 ```rust
-// kspace.rs:206, 254 today
+// kspace.rs:216, 254 today
 let ky_norm = (kyi as f64 - ys as f64) / ny as f64;
 let kx_norm = (kxi as f64 - xs as f64 + ghost_shift) / nx as f64;
 // R1: divide by the SIM extent; the loop bounds are unchanged
@@ -176,7 +176,7 @@ finer source.
   **This is a benchmark *fixture*, not the CLI default.** Two different defaults were previously
   conflated. To be precise: `KspaceWindow::None` is the default **window**; TRXScan's shipping
   acquisition default remains 6/8 partial Fourier (`partial_fourier: 0.75`,
-  `src/bin/trxscan.rs:117`); and the full-Fourier benchmark fixture explicitly sets
+  `src/bin/trxscan.rs:254`); and the full-Fourier benchmark fixture explicitly sets
   `partial_fourier = 1.0`. There is no reason to change the shipping PF default to obtain a clean
   full-Fourier benchmark.
 - **Scanner-realism mode (opt-in):** a named reconstruction window with explicit parameters,
@@ -214,8 +214,8 @@ Consequence for the noise tests: with a window active the image noise autocovari
 (see those tests).
 
 The struct field `zero_ringing: f64` is replaced by `window: KspaceWindow`, defaulting to `None`.
-There is no compatibility surface to preserve: the value is hardcoded at `src/bin/trxscan.rs:122`
-and is not a CLI argument (usage string, `src/bin/trxscan.rs:50`).
+There is no compatibility surface to preserve: the value is hardcoded at `src/bin/trxscan.rs:261`
+and is not a CLI argument (usage string, `src/bin/trxscan.rs:186`).
 
 Window strength is **not** calibrated from real tissue-edge ringing amplitude — that measurement is
 confounded by edge orientation, partial volume, reconstruction filtering and sub-voxel position. If
@@ -224,15 +224,15 @@ it is calibrated at all, the input must be a phantom or a raw full-Fourier k-spa
 ### 3.2 Object phase (R2), new `src/phase.rs`
 
 A `PhaseModel` produces a per-slice `phi0: Vec<f64>` on the **simulation** grid, applied at
-`kspace.rs:244`:
+`kspace.rs:246`:
 
 ```rust
 modimg[at(x, y)] = C::cis(TAU * phi + phi0[at(x, y)]).scale(f_real);
 ```
 
 **Removed: `2*PI * fmap * TE`.** TRXScan simulates spin-echo EPI DWI, confirmed by the T2'
-term `exp(-|t| / t_inhom)` centred on the echo (`kspace.rs:229`) and
-`time_from_rf = t_echo + time_from_max_echo` (`readout.rs:63`). Static off-resonance is *refocused*
+term `exp(-|t| / t_inhom)` centred on the echo (`kspace.rs:230`) and
+`time_from_rf = t_echo + time_from_max_echo` (`readout.rs:64`). Static off-resonance is *refocused*
 at the spin echo; it survives only as readout-time-dependent phase, which the existing
 `phi = fmap * t(ky)` term already models as distortion. Adding `2*PI*fmap*TE` would double-count B0
 and impose gradient-echo phase on a spin-echo sequence. The fieldmap contributes to distortion only.
@@ -266,13 +266,13 @@ Three terms, all independent of the fieldmap:
    (4.2).
 
    Deliberately **not** modelled as per-coil phase. `coil_sensitivity` returns `f64` and the Roemer
-   combine treats sensitivities as real (`kspace.rs:96`, `kspace.rs:315-330`). Giving coils complex
+   combine treats sensitivities as real (`kspace.rs:97`, `kspace.rs:320-335`). Giving coils complex
    sensitivities is a change to the coil and GRAPPA model, not to the phase model, and is not needed
    for a Gibbs benchmark. Recorded as a deferred follow-up in section 6; until then this term is
    named for what it is — a *pre-readout object phase*, not a coil phase.
 3. **Diffusion-encoding phase**: a low-order random phase (constant + linear in x and y) drawn per
    volume and per slice-group, identically zero at b = 0 — gated exactly as the eddy term at
-   `kspace.rs:176-177`. Motion during the diffusion gradients is the established source of
+   `kspace.rs:177-178`. Motion during the diffusion gradients is the established source of
    substantial shot-to-shot DWI phase.
 
    **Modelled from the q-vector directly, not from `b` alone.** Draw a small random translation
@@ -290,7 +290,7 @@ Three terms, all independent of the fieldmap:
    keeps the units interpretable; if TRXScan later gains waveform parameters this becomes a physical
    q-vector without changing the phase-model interface.
 
-   **Interface.** `gradients[g]` as currently built is `bvec * bval` (`src/bin/trxscan.rs:128-133`),
+   **Interface.** `gradients[g]` as currently built is `bvec * bval` (`src/bin/trxscan.rs:268-273`),
    which is *not* the q-vector. The phase model therefore takes **`bval` and the unit `bvec`
    separately** rather than recovering them as `b = ||g||`, `ghat = g/||g||` — the separate interface
    makes the dimensional semantics explicit and avoids the degenerate `b = 0` case, where
@@ -336,8 +336,8 @@ normalization: `sigma^2 = noise_variance / (nx*ny)`.
 
 **Multi-coil semantics: `noise_variance` is the single-coil, pre-combination image variance.** The
 final combined variance then emerges from the coil model rather than being imposed. This matches the
-existing code: `kspace.rs:303-307` uses the same `sigma` for every coil, and the Roemer combine
-(`kspace.rs:315-330`) forms `sum_c img_c * s_c / sum_c s_c^2`, so for independent per-coil noise of
+existing code: `kspace.rs:305-309` uses the same `sigma` for every coil, and the Roemer combine
+(`kspace.rs:320-335`) forms `sum_c img_c * s_c / sum_c s_c^2`, so for independent per-coil noise of
 per-component variance `V` the combined variance is
 
 ```text
@@ -351,7 +351,7 @@ or uniform coil (3.5.3).
 
 The factor of two is stated explicitly because it propagates into every SNR figure and calibration
 constant. This component convention is chosen over `noise_variance = E[|n|^2]` because it is what
-the code already implements — `kspace.rs:303-307` draws `sigma` independently into `re` and `im`,
+the code already implements — `kspace.rs:305-309` draws `sigma` independently into `re` and `im`,
 giving per-component image variance `noise_variance` — so the CLI's `noise` argument keeps its
 current meaning. The measured full-sampling figure of 1.0243 in section 1 is a *per-component* SD,
 consistent with this definition.
@@ -363,7 +363,7 @@ because it preserves the existing meaning of the CLI's `noise` argument (arg 11,
 the more directly interpretable knob. Every other scaling is derived, never asserted.
 
 Build a per-slice `sampled: Vec<bool>` of length `nx*ny` from the partial-Fourier line skip and the
-GRAPPA undersampling pattern (the two `continue` branches at `kspace.rs:196-210`), then add noise
+GRAPPA undersampling pattern (the two `continue` branches at `kspace.rs:198-212`), then add noise
 **only** where `sampled[i]`.
 
 Revision 1 additionally scaled the variance by the sampled fraction. That was a double-count. With
@@ -612,7 +612,7 @@ phase 0 and used as the oracle for everything below.
 9. **`partial_fourier_ringing`.** Dedicated 6/8 and 7/8 tests. PF changes the ringing structure —
     RPG (Lee et al., MRM 2021) exists precisely because PF ringing arises from two intervals and needs
     the sub-voxel shift applied twice. This is not an edge case here: `partial_fourier: 0.75` is the
-    CLI default (`src/bin/trxscan.rs:117`), i.e. **the shipping configuration is 6/8 PF**, so a
+    CLI default (`src/bin/trxscan.rs:254`), i.e. **the shipping configuration is 6/8 PF**, so a
     full-Fourier-only suite would validate a configuration nobody runs. Assert the asymmetric PF PSF
     against an analytic reference and its interaction with complex phase.
 10. **`oversampling_converges`.** Revision 3 asserted that "the `o=4` profile sits within tolerance
@@ -677,7 +677,7 @@ available. **Both are valid for every measurement in this section** — they dif
 reconstruction class.
 
 - **NIBS local dataset, HBCD protocol.** Matches the simulator's shipping configuration directly:
-  6/8 partial Fourier (`partial_fourier: 0.75`, `src/bin/trxscan.rs:117`), multiband, GRAPPA. Use it
+  6/8 partial Fourier (`partial_fourier: 0.75`, `src/bin/trxscan.rs:254`), multiband, GRAPPA. Use it
   for **behavioural comparison** of sampling-mask-dependent quantities — PF ringing structure
   (4.1.9) and noise plausibility.
 
@@ -785,9 +785,9 @@ more elaborate simulator.
   anatomy.
 
   This splits cleanly by compartment. **Fibers are safe**: streamlines are transformed in *world
-  space* and re-rasterized from continuous geometry each pose (`compartments.rs:285-291`), so the
+  space* and re-rasterized from continuous geometry each pose (`compartments.rs:621-628`), so the
   fiber compartment is exact at any rotation. **Tissue is not**: it goes through
-  `resample_by_pose` (`compartments.rs:294-299`), discrete volume interpolation on the grid.
+  `resample_by_pose` (`compartments.rs:630-635`), discrete volume interpolation on the grid.
 
   Therefore: validate the Gibbs benchmark with motion disabled (phases 1-4); document that in-plane
   oversampling is sufficient for the stationary acquisition; add an offline rotation test in phase 9
@@ -799,7 +799,7 @@ more elaborate simulator.
   phase channel is *structurally* correct (controlled spatial structure, volume-dependent diffusion
   phase) but not *quantitatively* calibrated, and must be described that way.
 - **Deferred: complex coil sensitivities.** `coil_sensitivity -> f64` with a real Roemer combine
-  (`kspace.rs:96`, `kspace.rs:315-330`). Real per-coil phase would make the multi-coil and GRAPPA
+  (`kspace.rs:97`, `kspace.rs:320-335`). Real per-coil phase would make the multi-coil and GRAPPA
   simulation more faithful, but it is a coil-model change, not a phase-model change, and is out of
   scope here. Until it lands, 3.2 term 2 must be described as *pre-readout object phase* and never as
   coil phase.
@@ -838,12 +838,12 @@ choices; this table is rewritten wholesale whenever the body changes rather than
 | Global phase | Not calibrated | A gauge choice and test control, not an empirical quantity |
 | Band-limit requirements | **None, on either grid** | Adequacy is established by acquired-band coefficient convergence (4.1.7) |
 | Coil phase | Deferred; term named background/reconstruction phase | Coils are real-valued today; complex sensitivities are a coil-model change |
-| Noise variance | **Per-component** image variance at full sampling; `E[\|n\|^2] = 2*noise_variance` | Matches `kspace.rs:303-307`, so the CLI `noise` argument keeps its meaning |
+| Noise variance | **Per-component** image variance at full sampling; `E[\|n\|^2] = 2*noise_variance` | Matches `kspace.rs:305-309`, so the CLI `noise` argument keeps its meaning |
 | Noise covariance test | Analytic pre-GRAPPA; operator/Monte-Carlo with GRAPPA | The IDFT-of-mask identity does not survive GRAPPA or coil combine |
 | Overshoot test | Sub-voxel edge family vs. analytic profile, three tiers | A correct implementation spans +0.29%..+8.93% by offset alone |
 | Sign-alternation test | Kept, renamed to encode its scope | Exact for a 1D axis-aligned step under a rectangular window only |
 | Phase histogram test | **Removed** | Gauge-dependent; a constant global phase is a valid complex image |
-| Partial Fourier | First-class, with 6/8 and 7/8 tests | 6/8 is the shipping default (`src/bin/trxscan.rs:117`) |
+| Partial Fourier | First-class, with 6/8 and 7/8 tests | 6/8 is the shipping default (`src/bin/trxscan.rs:254`) |
 | Nominal reference | `object-nominal` = block-reduction of the **same** `object-hires` array | Regenerating at `o=1` loses intravoxel dephasing and is a different realization (3.5.2) |
 | Reference naming | `object-hires` / `object-nominal` / `acquired` | "truth-nominal" implied an ideal Fourier result; it is box-integrated |
 | Benchmark configuration | Explicit Gibbs mode: distortion, eddy, ghosts, motion, T2* off | Otherwise `unringed - reference` is not a Gibbs error (3.5.3) |
@@ -865,7 +865,7 @@ numeric checks are reproduced in 4.1.1 and 3.3.
 
 | # | Point | Disposition |
 |---|---|---|
-| 1 | `2*PI*fmap*TE` inappropriate for spin echo | **Accepted.** Term removed (3.2). Spin-echo confirmed at `kspace.rs:229`, `readout.rs:63`. |
+| 1 | `2*PI*fmap*TE` inappropriate for spin echo | **Accepted.** Term removed (3.2). Spin-echo confirmed at `kspace.rs:230`, `readout.rs:64`. |
 | 2 | Coil phase should be per-coil | **Partially accepted.** Term renamed to background/reconstruction phase; complex coil sensitivities deferred as a coil-model change (3.2, section 6). |
 | 3 | Phase band-limit requirement is backwards | **Accepted.** Inverted to a simulation-grid sampling-adequacy condition (3.2). |
 | 4 | Noise scaling double-counts | **Accepted.** Verified analytically; variance convention fixed, mask is the only mechanism (3.3). |
@@ -900,7 +900,7 @@ accepted.
 | — | Rename the sign-alternation test to encode scope | **Accepted** (4.1.2). |
 | — | Problem table still asserts "Im/Re order 1", "full range, wrapped" | **Accepted.** Replaced with requirement-framed rows (section 1). |
 | — | Add an offline acceptance suite over real unringing methods | **Accepted.** New phase 9 and section 5.2. |
-| — | 3D rotation vs. in-plane-only oversampling | **Accepted and sharpened.** Fibers are safe (world-space transform + re-rasterization, `compartments.rs:285-291`); only tissue degrades (`resample_by_pose`, `compartments.rs:294-299`), so the fix is targeted rather than a global z-oversample (section 6). |
+| — | 3D rotation vs. in-plane-only oversampling | **Accepted and sharpened.** Fibers are safe (world-space transform + re-rasterization, `compartments.rs:621-628`); only tissue degrades (`resample_by_pose`, `compartments.rs:630-635`), so the fix is targeted rather than a global z-oversample (section 6). |
 | — | Separate correctness from calibration | **Accepted.** Three-way split; calibration no longer supplies constants that correctness tests assert against (4.2). |
 
 ## 10. Disposition of the third review round
@@ -917,8 +917,8 @@ follow-on items, four of which are adopted now rather than deferred because they
 | 4 | Top-of-sim-band energy is a bad criterion | **Accepted.** A sharp boundary is intentionally not band-limited. Replaced by acquired-band convergence `\|K_o - K_2o\| / \|K_2o\|` (4.1.6). |
 | 5 | Test 11 presupposes `o=4` passes | **Accepted.** Now tolerance-driven: `o_min = min{o : error(o) < eps}` (4.1.10). |
 | 6 | Full-Fourier vs 6/8 PF default contradiction | **Accepted.** `KspaceWindow::None` is the default window; 6/8 PF remains the shipping acquisition default; full-Fourier is a benchmark fixture setting `partial_fourier = 1.0` (3.1). |
-| 7 | Complex variance ambiguous by a factor of 2 | **Accepted, with a different convention than suggested.** Pinned to the *component* convention — `Var(Re) = Var(Im) = noise_variance`, `E[\|n\|^2] = 2*noise_variance` — because `kspace.rs:303-307` draws `sigma` into each component independently. Adopting `noise_variance = E[\|n\|^2]` would have silently halved the CLI argument's meaning, contradicting the stated rationale for the image-space definition (3.3). |
-| 8 | q-vector-aware diffusion phase | **Accepted now, not deferred.** `gradients[g]` is already plumbed into `simulate_slice` (`src/bin/trxscan.rs:128-133`), so `phi = q . dx` costs nothing beyond the scalar form and subsumes it (3.2). |
+| 7 | Complex variance ambiguous by a factor of 2 | **Accepted, with a different convention than suggested.** Pinned to the *component* convention — `Var(Re) = Var(Im) = noise_variance`, `E[\|n\|^2] = 2*noise_variance` — because `kspace.rs:305-309` draws `sigma` into each component independently. Adopting `noise_variance = E[\|n\|^2]` would have silently halved the CLI argument's meaning, contradicting the stated rationale for the image-space definition (3.3). |
+| 8 | q-vector-aware diffusion phase | **Accepted now, not deferred.** `gradients[g]` is already plumbed into `simulate_slice` (`src/bin/trxscan.rs:268-273`), so `phi = q . dx` costs nothing beyond the scalar form and subsumes it (3.2). |
 | 9 | 3D-smooth background phase | **Accepted now.** One low-order 3D field, sliced; avoids artificial z discontinuities at no extra cost (3.2). |
 | 10 | SNR-aware fitting of the b-dependence | **Accepted.** Three permitted procedures, with the chosen one recorded alongside the constants (4.2). |
 | 11 | Reconstructed data cannot supply mask covariance constants | **Accepted.** NIBS demoted to behavioural comparison; the analytic covariance derives from the simulator's own reconstruction operator (4.2). |
@@ -953,7 +953,7 @@ reopened the architecture.
 | # | Point | Disposition |
 |---|---|---|
 | 1 | `sqrt(b)*bvec` is not the physical q-vector | **Accepted.** Renamed `q_eff` with `c_q` absorbing diffusion timing and angle convention. Verified there are no `delta`/`Delta`/waveform parameters in `signal.rs` or `compartments.rs`, so the effective form is the only honest one (3.2). |
-| 2 | `noise_variance` ambiguous once multiple coils are enabled | **Accepted, Option A.** Verified against the code: the same `sigma` is used for every coil (`kspace.rs:303-307`) and the Roemer combine gives `Var_combined = V / sum_c s_c^2` (`kspace.rs:315-330`), so today's argument already means single-coil pre-combination variance. Option A both preserves behaviour and keeps the model local (3.3). |
+| 2 | `noise_variance` ambiguous once multiple coils are enabled | **Accepted, Option A.** Verified against the code: the same `sigma` is used for every coil (`kspace.rs:305-309`) and the Roemer combine gives `Var_combined = V / sum_c s_c^2` (`kspace.rs:320-335`), so today's argument already means single-coil pre-combination variance. Option A both preserves behaviour and keeps the model local (3.3). |
 | 3 | Window position relative to GRAPPA left unchosen | **Accepted.** Settled as `... -> GRAPPA -> W(k) -> inverse DFT`, with pre-GRAPPA scanner filtering deferred to a separate explicit mode (3.1). |
 | 4 | "No closed form" for GRAPPA covariance is self-contradictory | **Accepted.** Fixed weights make the reconstruction linear, so `Sigma_out = A Sigma A^H` is exact; what fails is only the mask-only identity (4.1.7b). |
 | 5 | Stale "combined-image / reconstruction phase" wording survived | **Accepted.** Removed from 3.2 and from the section 6 deferral note; *pre-readout object phase* used throughout. |

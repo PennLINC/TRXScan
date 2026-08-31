@@ -21,7 +21,7 @@ isolated copy of the crate and driving `kspace::simulate_slice` directly (64x64,
 
 ## 1. What the implementation does
 
-`TRXScan/src/kspace.rs:266-278` — a hard boxcar zeroing of the outer `zero_ringing`% of k-space in
+`TRXScan/src/kspace.rs:268-280` — a hard boxcar zeroing of the outer `zero_ringing`% of k-space in
 both in-plane directions:
 
 ```rust
@@ -34,7 +34,7 @@ if acq.zero_ringing > 0.0 {
 
 Position in the chain: inside the per-coil loop, **after** the distortion/T2*/eddy-modulated
 forward DFT, **before** spikes, noise, GRAPPA and the inverse DFT. The CLI ships
-`zero_ringing: 6.0` (`src/bin/trxscan.rs:122`) and writes BIDS `part-mag` + `part-phase`
+`zero_ringing: 6.0` (`src/bin/trxscan.rs:261`) and writes BIDS `part-mag` + `part-phase`
 (`src/bin/trxscan.rs:143`). This mirrors Fiberfox's `itkKspaceImageFilter.cpp:334`.
 
 ### What is right
@@ -125,9 +125,9 @@ simulated data.
 
 ### 2.4 The complex-valued output is degenerate (the core issue)
 
-The compartment signal is assembled as a **real, non-negative** sum (`src/kspace.rs:230-232`), and
+The compartment signal is assembled as a **real, non-negative** sum (`src/kspace.rs:232-234`), and
 the only phase terms in the model — the fieldmap and the eddy-current polynomial — are applied as
-`phi = fmap * t(ky)` (`src/kspace.rs:236-244`), i.e. **ky-dependent**. A ky-dependent phase warps
+`phi = fmap * t(ky)` (`src/kspace.rs:238-246`), i.e. **ky-dependent**. A ky-dependent phase warps
 geometry along the phase-encode axis; it does not imprint a static image-domain phase. There is no
 object phase model anywhere in the pipeline.
 
@@ -168,7 +168,7 @@ homodyne or POCS reconstruction, so that is a reconstruction artifact, not objec
 ### 2.5 Noise is not band-limited to the truncated k-space
 
 Noise is added **after** the ringing zeroing and after the partial-Fourier line skipping
-(`src/kspace.rs:300-307`), so k-space samples that were never acquired are filled with pure noise.
+(`src/kspace.rs:302-309`), so k-space samples that were never acquired are filled with pure noise.
 
 Measured (noise-only object, `noise_variance: 1.0`):
 
@@ -196,7 +196,7 @@ is not driven by true sub-voxel edge placement the way it is in real acquisition
 
 ### 2.7 The existing test does not constrain any of this
 
-`gibbs_ringing_changes_the_image` (`src/kspace.rs:714-724`) asserts only that the mean absolute
+`gibbs_ringing_changes_the_image` (`src/kspace.rs:720-730`) asserts only that the mean absolute
 image difference exceeds 1e-3. It checks neither ripple period, nor overshoot amplitude, nor the
 complex channels — so every issue above passes the test suite.
 
@@ -222,7 +222,7 @@ sync.
 Three points that earlier revisions of this document got wrong, recorded so they are not
 reintroduced:
 
-- **No fieldmap-derived static phase.** TRXScan is spin-echo (`kspace.rs:229`, `readout.rs:63`);
+- **No fieldmap-derived static phase.** TRXScan is spin-echo (`kspace.rs:230`, `readout.rs:64`);
   static off-resonance is refocused at TE and survives only as the readout-time phase already
   modelled as distortion. A `2*pi*fmap*TE` term would double-count B0.
 - **No sampled-fraction variance factor.** Masking alone produces the `sqrt(f)` scaling; an
