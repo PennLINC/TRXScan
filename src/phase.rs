@@ -159,7 +159,13 @@ impl PhaseModel {
     /// across-volume estimate. Treat 0.27-0.66 as the honest spread around a theoretically fixed
     /// 0.5.
     ///
-    /// **Only the amplitude is calibrated:** `c_q * sigma_dx = 0.0425`, fitted with `p` held at
+    /// **`sigma_rot` is HEURISTIC, not calibrated.** Only the translation amplitude below is
+    /// fitted. Separating the two needs two different estimators -- a within-volume phase-gradient
+    /// statistic identifies the rotation term, an across-volume global-phase statistic identifies
+    /// the translation term -- and only the latter has been done. Treat `sigma_rot = 2e-3` as a
+    /// placeholder that produces plausible spatial-linear phase, not a measured quantity.
+    ///
+    /// **Only the translation amplitude is calibrated:** `c_q * sigma_dx = 0.0425`, fitted with `p` held at
     /// 0.5 (circular statistics, thermal floor modelled as `1/SNR` in quadrature). It reproduces
     /// the measured phase SD to under 1% -- 1.344 vs 1.348 rad at b=1000, 2.328 vs 2.311 at
     /// b=3000. An earlier version wrongly used the amplitude from a `p`-free fit, which
