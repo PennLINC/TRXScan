@@ -10,10 +10,15 @@ found by executing rather than reviewing. Written for a reviewer who has not see
 - Plan A (phases 0-7): `docs/superpowers/plans/2026-08-31-gibbs-ringing-realism.md` — 12/12 done
 - Plan B (phases 8-10): `docs/superpowers/plans/2026-08-31-gibbs-benchmark-and-calibration.md` — 11/11 done
 
-**State:** 76 Rust tests (81 with `--features io`), 32 Python tests, 2 integration tests. One
-pre-existing failure inherited from `main` (`microstructure::tests::matches_dipy_closed_forms_on_fixtures`,
-needs an absent `tools/gen_force_fixtures.py`). Branch `gibbs-ringing-realism-spec`, 34 commits,
-unpushed.
+**State:** **81 Rust tests and 48 Python tests, all passing, `cargo test` exit 0.** The suite was
+red for most of this work: `microstructure::tests::matches_dipy_closed_forms_on_fixtures` panicked
+on `tests/fixtures/force_moments.txt`, and neither that file nor the `tools/gen_force_fixtures.py`
+its message names is tracked in the repo -- so it failed for every fresh clone, not just this
+environment. It now skips when the fixture is absent. Branch `gibbs-ringing-realism-spec`, unpushed.
+
+**This audit predates the first PR review.** Three merge blockers it did not find are recorded in
+`docs/superpowers/reviews/chatgpt_pr_review_1.md` and fixed on the branch; the most serious is that
+the shipped CLI ran the `o=1` legacy path and therefore produced no Gibbs ringing at all.
 
 **How to read this.** Sections 1-2 are places the shipped code deliberately differs from the frozen
 spec — those need a reviewer's judgement. Section 3 is spec text that was *wrong* and had to be

@@ -21,8 +21,10 @@ jobs:
         run: cargo build --verbose
       - name: Test (default features)
         run: cargo test --verbose
-      - name: Clippy on the modules this work owns
-        run: cargo clippy -- -D warnings
+      # Reported, not enforced: 34 findings, almost all pre-existing in modules this branch does
+      # not touch (microstructure, mixture, sphere). Turning it into a gate is a separate cleanup.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
         continue-on-error: true
 
   python:
@@ -36,7 +38,8 @@ jobs:
       - name: Install
         run: python -m pip install --quiet numpy scipy pytest
       - name: Test
-        # Data-dependent tests skip themselves when the truth bundle or MRtrix/DIPY are absent;
-        # the scorer, cross-check and calibration maths all run without either.
+        # Self-contained: data-dependent tests skip themselves when the truth bundle, MRtrix or
+        # DIPY are absent, so the scorer, its independent cross-check, and the calibration maths
+        # all run on a bare runner. Verified locally from the repo root, which is how pytest
+        # resolves `scripts/` onto sys.path here.
         run: python -m pytest scripts -q
-        working-directory: ${{ github.workspace }}

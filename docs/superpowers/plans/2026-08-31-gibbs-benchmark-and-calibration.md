@@ -40,7 +40,13 @@
 
 Carried forward from the predecessor plan, still true:
 
-1. **`microstructure::tests::matches_dipy_closed_forms_on_fixtures` already fails** — it needs `tools/gen_force_fixtures.py`, which is absent. Baseline is **73 passed / 1 failed**. Check the FAILURE count, not the pass count. Do not fix it.
+1. **The suite is fully green (81 passed, 0 failed).** It was not during most of this
+   work: `microstructure::tests::matches_dipy_closed_forms_on_fixtures` panicked on a
+   missing fixture. Neither that fixture nor its generator is tracked in the repo, so it
+   failed for every fresh clone; it now skips when the fixture is absent. Any failure you
+   see is yours.
+
+
 2. **All pre-existing tracked files show as modified** (CRLF working tree vs LF blobs, `core.autocrlf=false`). **Never `git add -A` or `git add .`.** Normalize any pre-existing file to LF before staging it:
    ```bash
    python3 -c "import io,sys;p=sys.argv[1];b=io.open(p,'rb').read();io.open(p,'wb').write(b.replace(b'\r\n',b'\n'))" <file>
