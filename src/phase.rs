@@ -131,28 +131,40 @@ impl PhaseModel {
 
     /// A preset tuned to the HBCD-protocol NIBS data (spec 4.2).
     ///
-    /// Calibrated 2026-09-01 from NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices,
-    /// `scripts/calibration_nibs.json`. Two different standards, as spec 4.2 requires:
+    /// Calibrated 2026-09-01 from NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices
+    /// (`scripts/calibration_nibs.json`), with the two terms held to different standards.
     ///
-    /// - **Background is TUNED, not fitted.** Its gradient matches the measured 0.164 rad/voxel,
-    ///   but reconstructed phase mixes magnetization, coil and combination, scanner conventions
-    ///   and possibly reconstruction filtering, and only some of that precedes Fourier encoding.
-    ///   Treat it as an effective benchmark parameter, never as a recovered physical field.
-    /// - **Diffusion is FITTED**, with the thermal floor modelled as `1/SNR` in quadrature and
-    ///   using CIRCULAR statistics: `p = 0.445` from NIBS, against the 0.5 that `phi = q.dx`
-    ///   predicts at fixed timing. A linear-SD fit gives 0.257, because wrapped phase saturates at
-    ///   `pi/sqrt(3)` and the NIBS shells sit at 62-99% of that ceiling.
+    /// **Background is TUNED, not fitted.** Its gradient matches the measured 0.164 rad/voxel,
+    /// pinned by a test. Reconstructed phase mixes magnetization, coil and combination, scanner
+    /// conventions and possibly reconstruction filtering, and only some of that precedes Fourier
+    /// encoding, so this is an effective benchmark parameter, never a recovered physical field.
     ///
-    ///   **Two datasets disagree, and this preset takes NIBS deliberately.** An independent fit on
-    ///   ds006131 (CS-DSI, 9 shells to b=5000, `scripts/calibration_ds006131.json`) gives
-    ///   `p = 0.317`. Both sit where circular SD is reliable -- every shell's sigma is below 3.0,
-    ///   under the estimator's ~sqrt(ln N) ceiling of 3.4 -- so neither is discredited. This
-    ///   preset models the HBCD protocol and NIBS *is* that protocol (TE 88 ms, 6/8 PF, MB 3);
-    ///   ds006131 is a different sequence. Treat 0.32-0.45 as the measured spread, note that both
-    ///   fall below the theoretical 0.5, and prefer a protocol match over a wider b range.
+    /// **The b-exponent is NOT a calibrated parameter.** [`DiffusionPhase::shot`] forms
+    /// `q_eff = c_q * sqrt(b) * bvec`, so `p = 0.5` is fixed by construction -- it follows from
+    /// modelling phase as `q . dx` with `b ~ q^2` at fixed timing. Fitting `p` is therefore a
+    /// *validation* of that modelling choice, not a way to set it. Those fits bracket 0.5 without
+    /// pinning it:
     ///
-    /// `sigma_dx = 1.0` voxel with `c_q = 0.0642` reproduces the fitted `sigma_phi(b)`; only their
-    /// product is constrained by the data, so the split is a convention.
+    /// | source | estimator | fitted `p` |
+    /// |---|---|---|
+    /// | NIBS, shelled | within-volume spatial | 0.445 |
+    /// | NIBS, shelled | across-volume constant | ~0.66 |
+    /// | ds006131, per-volume | within-volume spatial | 0.270 |
+    /// | theory, bulk translation at fixed timing | -- | 0.5 |
+    ///
+    /// The estimator moves `p` more than the dataset does, and for good reason: the model's shot
+    /// phase is a constant plus a linear term, and a within-volume spatial SD is blind to the
+    /// constant while an across-volume SD sees only it. ds006131 is additionally non-shelled
+    /// CS-DSI, so direction and |q| are confounded and no b has enough volumes for a stable
+    /// across-volume estimate. Treat 0.27-0.66 as the honest spread around a theoretically fixed
+    /// 0.5.
+    ///
+    /// **Only the amplitude is calibrated:** `c_q * sigma_dx = 0.0425`, fitted with `p` held at
+    /// 0.5 (circular statistics, thermal floor modelled as `1/SNR` in quadrature). It reproduces
+    /// the measured phase SD to under 1% -- 1.344 vs 1.348 rad at b=1000, 2.328 vs 2.311 at
+    /// b=3000. An earlier version wrongly used the amplitude from a `p`-free fit, which
+    /// over-predicted phase by 51%. Only the product is constrained, so the split between `c_q`
+    /// and `sigma_dx` is a convention.
     pub fn hbcd_like() -> Self {
         PhaseModel {
             global: 0.0,
@@ -160,7 +172,7 @@ impl PhaseModel {
             background: BackgroundPhase {
                 coeffs: [0.0, 0.13, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             },
-            diffusion: DiffusionPhase { c_q: 0.0642, sigma_dx: 1.0, sigma_rot: 2.0e-3 },
+            diffusion: DiffusionPhase { c_q: 0.0425, sigma_dx: 1.0, sigma_rot: 2.0e-3 },
         }
     }
 
@@ -247,6 +259,15 @@ mod tests {
         // the background field must actually vary across the FOV
         let d = (m.background.at(8.0, 0.0, 0.0) - m.background.at(-8.0, 0.0, 0.0)).abs();
         assert!(d > 1e-3, "background phase should vary, got {d}");
+        // the calibrated amplitude must reproduce the MEASURED phase SD at real b-values.
+        // sigma_phi(b) = c_q * sqrt(b) * sigma_dx, with the fitted product 0.0425.
+        for (bval, measured) in [(1000.0_f64, 1.348_f64), (3000.0, 2.311)] {
+            let pred = m.diffusion.c_q * bval.sqrt() * m.diffusion.sigma_dx;
+            assert!(
+                (pred - measured).abs() / measured < 0.05,
+                "b={bval}: predicted sigma_phi {pred:.3} vs measured {measured:.3}"
+            );
+        }
         // and its in-plane gradient must match the measured 0.164 rad/voxel
         let gx = m.background.at(1.0, 0.0, 0.0) - m.background.at(0.0, 0.0, 0.0);
         let gy = m.background.at(0.0, 1.0, 0.0) - m.background.at(0.0, 0.0, 0.0);

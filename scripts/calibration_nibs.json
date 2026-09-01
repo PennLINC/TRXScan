@@ -6,24 +6,21 @@
     2000.0,
     3000.0
   ],
+  "circular_sd": [
+    1.0786050409891643,
+    1.3481070150252976,
+    1.8559059741025008,
+    2.3108977511115176
+  ],
   "snr": [
     337.1479963570127,
     224.6835154826958,
     115.12765634486946,
     65.96787262106652
   ],
-  "snr_handling": "thermal floor fitted as 1/SNR in quadrature",
-  "statistic_note": "circular SD; linear SD saturates at pi/sqrt(3) and biased p to 0.257",
-  "c_q": 0.06421768236662158,
-  "p": 0.4454781061357372,
-  "a_naive": 0.07448127659102258,
-  "p_naive": 0.42531726338791276,
-  "snr_corrected": true,
-  "statistic": "circular",
-  "saturation": [
-    0.6179704202781056,
-    0.8035767858018462,
-    0.9694366740947453,
-    0.994390057256587
-  ]
+  "model_note": "DiffusionPhase hardcodes p=0.5 via sqrt(b); only the amplitude is free",
+  "c_q_sigma_dx_product": 0.042510315409723554,
+  "p_free_fit_for_validation_only": 0.445,
+  "p_measurement_spread": "0.27-0.66 across datasets and estimators; theory 0.5",
+  "snr_handling": "thermal floor fitted as 1/SNR in quadrature; circular statistics"
 }
