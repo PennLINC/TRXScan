@@ -59,7 +59,7 @@ def _edge_mask(ref, frac=0.25):
     return out
 
 
-def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
+def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.0):
     """Amplitude of the voxel-alternating component of `diff`, beside `ref`'s edge.
 
     The projection onto (-1)**x, i.e. the discrete Nyquist frequency. Gibbs ringing lands almost
@@ -71,10 +71,17 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
       band-limited, so the transition voxels differ by the sinc-vs-box PSF regardless of ringing,
       and an unringer makes that transition SOFTER, enlarging the difference exactly there.
       Including the edge ranked both real methods worse than doing nothing.
-    - **Dark voxels.** These are MAGNITUDE images, so ringing that goes negative is rectified to
-      positive and the sign alternation is destroyed: beside a bright edge the deviations run
-      +0.092, -0.050, +0.034 (alternating) but on the dark side +0.092, +0.050, +0.034 (not).
-      Restrict to `ref > bright * max(ref)`, where the alternation survives.
+    - **`bright` defaults to 0.0: BOTH sides of the edge are scored.** An earlier version masked to
+      `ref > 0.5*max(ref)` because "these are magnitude images", where negative ringing is rectified
+      and the alternation destroyed. That justification stopped being true once `score()` began
+      reconstructing complex data: a negative lobe stored as positive magnitude with phase ~pi comes
+      back as a negative complex value. Measured on a real fixture, the dark-side residual runs
+      `++++++++` in magnitude but `+-+-+-+-` in complex, amplitudes 0.091 / 0.050 / 0.034 -- a full
+      Gibbs sidelobe train. Masking it away discarded half the artifact and would have scored a
+      method that fixes only the bright side as perfect.
+
+      Set `bright > 0` to restrict to the bright side; `score()` reports that as a secondary
+      `*_bright` variant for comparison with magnitude-only methods.
     """
     dp = _profiles(diff)
     dr = np.abs(np.diff(_profiles(ref), axis=-1))
@@ -92,7 +99,11 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
     rmax = float(rp.max()) if rp.size else 0.0
     if rmax <= 0:
         return 0.0
-    keep = rp[:, idx] > bright * rmax
+    # A row participates if it CROSSES AN EDGE, not if it is bright: with bright = 0 the two
+    # differ, and a `> 0.0` test silently drops exact zeros -- the dark side we now want.
+    crosses = np.abs(np.diff(rp, axis=-1)).max(axis=-1) > 1e-12
+    keep = (np.ones_like(rp[:, idx], bool) if bright <= 0.0 else rp[:, idx] > bright * rmax)
+    keep = keep & crosses[:, None]
     w = dp[:, idx] * keep
     n = keep.sum(axis=-1)
     good = n > 0
@@ -147,33 +158,52 @@ def _sharpness(a):
     return float(d.max(axis=-1).mean()) if d.size else 0.0
 
 
-def _edge_shift(est, ref, half_width=8):
-    """Sub-voxel edge displacement of `est` relative to `ref`.
+def _edge_shifts(est, ref, half_width=8):
+    """Per-edge sub-voxel displacements, in profile order.
 
-    The centroid is taken in a window around the REFERENCE edge rather than over the whole
-    profile. A whole-profile centroid is not robust: any second structural edge -- including the
-    wrap-around edge of a periodic image -- pulls it arbitrarily far, which made a +2 voxel shift
-    report as -14.
+    Reported per edge because a one-sided partial-Fourier transfer function is asymmetric: a box's
+    two edges on the same axis need not show the same apparent bias. Measured under contiguous 6/8
+    they run [+0.25, +0.49, -0.49, -0.25].
     """
     de = np.abs(np.diff(_profiles(est), axis=-1))
     dr = np.abs(np.diff(_profiles(ref), axis=-1))
     if dr.size == 0 or dr.max() <= 0:
-        return np.nan
+        return []
     x = np.arange(dr.shape[-1]) + 0.5
-    # window from the reference's strongest gradient, shared by both so the comparison is fair
-    peak = int(np.argmax(dr.sum(axis=0)))
-    lo, hi = max(0, peak - half_width), min(dr.shape[-1], peak + half_width + 1)
-    de, dr, x = de[:, lo:hi], dr[:, lo:hi], x[lo:hi]
-    we, wr = de.sum(axis=-1), dr.sum(axis=-1)
-    good = (we > 1e-12) & (wr > 1e-12)
-    if not good.any():
-        return np.nan
-    ce = (de[good] * x).sum(axis=-1) / we[good]
-    cr = (dr[good] * x).sum(axis=-1) / wr[good]
-    return float((ce - cr).mean())
+    summed = dr.sum(axis=0)
+    thr = 0.35 * summed.max()
+    peaks = [i for i in range(summed.size)
+             if summed[i] >= thr
+             and summed[i] >= summed[max(0, i - 2):min(summed.size, i + 3)].max()]
+    if not peaks:
+        peaks = [int(np.argmax(summed))]
+    out = []
+    for p in peaks:
+        lo, hi = max(0, p - half_width), min(dr.shape[-1], p + half_width + 1)
+        e, r, xx = de[:, lo:hi], dr[:, lo:hi], x[lo:hi]
+        we, wr = e.sum(axis=-1), r.sum(axis=-1)
+        good = (we > 1e-12) & (wr > 1e-12)
+        if not good.any():
+            out.append(float("nan"))
+            continue
+        ce = (e[good] * xx).sum(axis=-1) / we[good]
+        cr = (r[good] * xx).sum(axis=-1) / wr[good]
+        out.append(float((ce - cr).mean()))
+    return out
 
 
-def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bright=0.5):
+def _edge_shift(est, ref, half_width=8):
+    """Mean sub-voxel edge displacement over ALL edges. See `_edge_shifts` for the per-edge detail.
+
+    Windowed around each REFERENCE edge, not taken over the whole profile: a whole-profile centroid
+    is pulled arbitrarily far by any second structural edge -- including a periodic image's
+    wrap-around -- which once reported a +2 voxel shift as -14.
+    """
+    vals = [v for v in _edge_shifts(est, ref, half_width) if v == v]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bright=0.0):
     """How much of the CONTROL artifact survives in a method's residual.
 
     Frequency-agnostic, complex-valued, and therefore partial-Fourier-aware, which the Nyquist
@@ -185,8 +215,10 @@ def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bri
 
         alignment = |<Rm, R0>| / ||R0||^2
 
-    1.0 means the method removed nothing, 0.0 that the artifact is entirely gone, and >1 that the
-    method amplified it. All inputs are complex arrays.
+    1.0 means the method removed nothing and >1 that it amplified the artifact. **0.0 does NOT mean
+    the artifact is gone** -- only that the residual is ORTHOGONAL to the original template, which a
+    method can achieve by shifting or reshaping the pattern while preserving its energy. That is why
+    `residual_energy_ratio` exists; read the two together. All inputs are complex arrays.
     """
     est, ref, control = (np.asarray(a) for a in (est, ref, control))
     if axis is None:
@@ -202,7 +234,9 @@ def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bri
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
-    keep = rp[:, idx] > bright * rmax
+    crosses = np.abs(np.diff(rp, axis=-1)).max(axis=-1) > 1e-12
+    keep = (np.ones_like(rp[:, idx], bool) if bright <= 0.0
+            else rp[:, idx] > bright * rmax) & crosses[:, None]
     a, b = rm[:, idx] * keep, r0[:, idx] * keep
     denom = float(np.sum(np.abs(b) ** 2))
     if denom <= 0:
@@ -210,7 +244,7 @@ def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bri
     return float(abs(np.sum(a * np.conj(b))) / denom)
 
 
-def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, bright=0.5):
+def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, bright=0.0):
     """`||Rm|| / ||R0||` over the same sidelobe region as [`residual_alignment`].
 
     Alignment alone is a PROJECTION: zero means the residual is orthogonal to the original artifact
@@ -231,7 +265,9 @@ def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, 
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
-    keep = rp[:, idx] > bright * rmax
+    crosses = np.abs(np.diff(rp, axis=-1)).max(axis=-1) > 1e-12
+    keep = (np.ones_like(rp[:, idx], bool) if bright <= 0.0
+            else rp[:, idx] > bright * rmax) & crosses[:, None]
     rm = _profiles(est - ref)[:, idx] * keep
     r0 = _profiles(control - ref)[:, idx] * keep
     den = float(np.sqrt(np.sum(np.abs(r0) ** 2)))
@@ -240,7 +276,7 @@ def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, 
     return float(np.sqrt(np.sum(np.abs(rm) ** 2)) / den)
 
 
-def artifact_norm(ref, control, axis, half_width=10, guard=2, bright=0.5):
+def artifact_norm(ref, control, axis, half_width=10, guard=2, bright=0.0):
     """`||R0||` -- the ABSOLUTE size of the uncorrected artifact in the sidelobe region.
 
     Needed as an acceptance gate. `residual_energy_ratio` cannot serve: for the control itself
@@ -257,7 +293,9 @@ def artifact_norm(ref, control, axis, half_width=10, guard=2, bright=0.5):
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
-    keep = rp[:, idx] > bright * rmax
+    crosses = np.abs(np.diff(rp, axis=-1)).max(axis=-1) > 1e-12
+    keep = (np.ones_like(rp[:, idx], bool) if bright <= 0.0
+            else rp[:, idx] > bright * rmax) & crosses[:, None]
     r0 = _profiles(control - ref)[:, idx] * keep
     n = int(keep.sum())
     return float(np.sqrt(np.sum(np.abs(r0) ** 2) / n)) if n else float("nan")
@@ -344,6 +382,10 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
             per_axis[f"residual_energy_{name}"] = residual_energy_ratio(
                 ze_raw, zr_raw, zc_raw, axis=ax)
             per_axis[f"artifact_norm_{name}"] = artifact_norm(zr_raw, zc_raw, axis=ax)
+            # Secondary, bright-side only: comparable with magnitude-only methods, which cannot act
+            # on the dark side at all. Never the primary score.
+            per_axis[f"residual_alignment_{name}_bright"] = residual_alignment(
+                ze_raw, zr_raw, zc_raw, axis=ax, bright=0.5)
             em = np.moveaxis(np.abs(np.asarray(est_mag_in, float)), ax, -1)
             rm_ = np.moveaxis(np.abs(np.asarray(ref_mag_in, float)), ax, -1)
             rs = _sharpness(rm_)
@@ -351,6 +393,8 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
                 float(_sharpness(em) / rs) if rs > 0 else float("nan"))
             per_axis[f"edge_location_bias_{name}"] = (
                 _edge_shift(em, rm_) if rs > 0 else float("nan"))
+            per_axis[f"edge_location_bias_{name}_per_edge"] = (
+                _edge_shifts(em, rm_) if rs > 0 else [])
         # Unsuffixed key keeps the auto-selected axis, for 1D fixtures and general use. The
         # _ro / _pe pair is what the benchmark must consult, because auto-selection is undefined
         # on a symmetric phantom.

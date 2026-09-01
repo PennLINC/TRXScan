@@ -31,11 +31,12 @@ def _peak_indices(grad, thr_frac=0.35):
     return out or [max(range(len(grad)), key=lambda i: grad[i])]
 
 
-def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5, peaks=None):
+def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.0, peaks=None):
     """Indices beside EVERY significant edge where the reference is bright.
 
     Written independently of the primary, but to the same definition -- including scoring both of
-    a box's edges rather than only the strongest. When the primary was extended to both edges and
+    a box's edges rather than only the strongest, and (with the default `bright = 0.0`) both the
+    bright and dark sides, since the complex residual preserves alternation on both. When the primary was extended to both edges and
     this was not, the two disagreed by ~4% on the partial-Fourier box, which is exactly what this
     cross-check exists to surface.
     """
@@ -43,6 +44,9 @@ def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5, pe
     if peaks is None:
         peaks = _peak_indices([abs(ref_profile[i + 1] - ref_profile[i]) for i in range(n - 1)])
     if not peaks:
+        return []
+    # Row must cross an edge to participate; brightness is a separate, optional restriction.
+    if max(abs(ref_profile[i + 1] - ref_profile[i]) for i in range(n - 1)) <= 1e-12:
         return []
     hi = max(ref_profile)
     out = []
@@ -52,7 +56,7 @@ def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5, pe
             continue
         if any(abs(i - p) <= guard for p in peaks):
             continue
-        if ref_profile[i] > bright * hi:
+        if bright <= 0.0 or ref_profile[i] > bright * hi:
             out.append(i)
     return out
 

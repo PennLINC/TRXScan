@@ -88,10 +88,11 @@ struct Cli {
     /// `scripts/prepare_acquisition_grid.py --oversample N`. Upsampling the acquisition-grid maps
     /// instead would add no k-space content and produce no ringing.
     /// **Default 2, not 4.** o=4 is the accuracy target (residual ~4.5% of the artifact against
-    /// ~15.6% at o=2) but is not memory-safe on ordinary hardware: in-plane voxels scale as o^2,
-    /// a measured end-to-end o=4 run peaked at 13.0 GB single-threaded, and under `--features par`
-    /// the signal stage's f64 accumulator alone is 16.1 GB per buffer with a pair live during the
-    /// reduction. Use o=4 with >=32 GB, or wait for z-slab streaming.
+    /// ~15.6% at o=2) but is not viable on ordinary hardware. In-plane voxels scale as o^2, and on
+    /// the default no-motion path the dominant allocation is a dense nvox x 321 f64 orientation
+    /// histogram plus an f32 ODF copy: for an HBCD-sized grid that bound is ~26 GB at o=2 and
+    /// ~104 GB at o=4. A measured o=2 run peaked at 11.5 GB -- well under its bound, because the
+    /// histogram commits lazily, but that is data-dependent. Treat 16 GB as tight, not safe.
     #[arg(long, value_name = "N", default_value_t = 2)]
     oversample: usize,
     /// Simulation-grid white-matter map (from prepare_acquisition_grid.py --oversample)
@@ -121,7 +122,10 @@ struct Cli {
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
     #[arg(long)]
     reverse_pe: bool,
-    /// Complex k-space noise variance (→ Rician magnitude)
+    /// Noise level: the PER-COMPONENT variance of the reconstructed complex image at full
+    /// sampling, single coil, pre-combination -- so Var(Re) = Var(Im) = this, and E[|n|^2] is
+    /// twice it. The per-k-space-sample variance is derived from the reconstruction
+    /// normalization; multi-coil combination lowers the final variance by sum_c s_c^2.
     #[arg(long, default_value_t = 0.0, value_name = "VAR")]
     noise: f64,
     /// Linear eddy-current strength (DWI volumes only; b0 exempt)
@@ -250,6 +254,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
         scheme.shells(50.0));
 
+    // Pre-flight memory estimate, BEFORE the signal stage allocates anything. An earlier version
+    // computed this immediately before Stage B -- i.e. after generate_mixture had already
+    // allocated -- so an allocation failure happened before the warning could ever print.
+    //
+    // The dominant allocation differs by path:
+    //   no motion: generate_mixture's dense nvox * 321 f64 orientation histogram + f32 ODF copy
+    //   motion:    generate_compartments' nvox * ngrad f64 accumulator (x2 live under `par`)
+    // plus the f32 compartment images in both cases.
+    {
+        let nvox = sig_grid.dims.iter().product::<usize>() as f64;
+        let ngrad = scheme.len() as f64;
+        let images_gb = nvox * ngrad * 3.0 * 4.0 / 1e9;
+        let (dominant_gb, what) = if cli.motion.is_some() {
+            (nvox * ngrad * 8.0 / 1e9, "f64 signal accumulator (x2 live under --features par)")
+        } else {
+            (nvox * 321.0 * 12.0 / 1e9, "dense orientation histogram + ODF")
+        };
+        let bound = dominant_gb + images_gb;
+        if bound > 8.0 {
+            eprintln!(
+                "WARNING: signal stage upper bound about {bound:.1} GB on grid {:?} \
+                 ({dominant_gb:.1} GB {what}, {images_gb:.1} GB compartment images, {} volumes).\n\
+                 \x20        Committed memory is DATA-DEPENDENT and usually lower -- the histogram \
+                 faults in only where streamlines deposit, and an o=2 run of this size measured \
+                 11.5 GB against a 25.9 GB bound. Treat 16 GB as tight, not safe. In-plane memory \
+                 scales as o^2.",
+                sig_grid.dims, scheme.len());
+        }
+    }
+
     let base = cli.params.params();
     println!("compartment params: {}  T2 fiber/gm/csf {}/{}/{} ms",
         cli.params, base.t2_fiber, base.t2_gm, base.t2_csf);
@@ -369,29 +403,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if sim_fgrid.dims != sig_grid.dims {
             return Err(format!("sim fieldmap grid {:?} != simulation grid {:?}",
                                sim_fgrid.dims, sig_grid.dims).into());
-        }
-        // Pre-flight memory estimate. The DOMINANT allocation on the default no-motion path is
-        // generate_mixture's dense orientation histogram, nvox * 321 * 8 bytes of f64, plus its
-        // f32 ODF copy -- not the compartment images. An earlier version estimated only the
-        // latter and so predicted 6.0 GB for a run that measured 11.5 GB.
-        //
-        // Measured, full 1 M-streamline tractogram, 107x151x104 acquisition grid, 75 volumes:
-        //   o=2  ->  11.46 GB peak RSS
-        // The arithmetic upper bound is higher (~26 GB at o=2) because the histogram is allocated
-        // densely but committed lazily: only voxels a streamline actually touches fault in.
-        let sim_vox = sig_grid.dims.iter().product::<usize>() as f64;
-        let nvert = 321.0;                       // HemiSphere::icosphere(3)
-        let hist_gb = sim_vox * nvert * 12.0 / 1e9;   // f64 histogram + f32 ODF, upper bound
-        let images_gb = sim_vox * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
-        let est_gb = hist_gb + images_gb;
-        if est_gb > 8.0 {
-            eprintln!(
-                "WARNING: signal stage upper bound about {est_gb:.1} GB on grid {:?} \
-                 ({:.1} GB dense orientation histogram + ODF, {:.1} GB compartment images, \
-                 {} volumes). Committed memory is lower -- an o=2 run of this size measured \
-                 11.5 GB -- because the histogram faults in only where streamlines deposit. \
-                 In-plane memory scales as o^2.",
-                sig_grid.dims, hist_gb, images_gb, scheme.len());
         }
         println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
                  cli.oversample, cli.phase_model);

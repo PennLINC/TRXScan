@@ -88,8 +88,10 @@ partial-Fourier line skip (`kspace.rs:302-309`), populating samples that were ne
 Introduce a **simulation grid** distinct from the **acquisition matrix**.
 
 - Simulation grid: `Grid { dims: [o*nx, o*ny, nz] }` with the in-plane columns of `voxel_to_world`
-  divided by `o`. **The production default is `o = 4`**, set by the convergence study (4.1.10) and
-  the cost/accuracy tradeoff below, not assumed. Cost and memory figures below use `o = 2` only
+  divided by `o`. **The production default is `o = 2`, set by MEMORY (section 6), not by accuracy.**
+  The convergence study (4.1.10) and the cost table below identify `o = 4` as the accuracy target;
+  the dense orientation histogram makes it unaffordable, so `o = 2` is the pragmatic default and
+  `o = 4` is available where memory allows. Cost and memory figures below use `o = 2` only
   because it is the smallest non-trivial case; see the measured table for the real figures. In-plane only: the slice direction is not Fourier-encoded in 2D
   EPI, so there is nothing to truncate along z and oversampling it would only cost.
 - Acquisition matrix: `(nx, ny)` — same FOV, same voxel size, what is written out.
@@ -145,11 +147,12 @@ e(8->16) = 4.0e-4. Image-domain profile deviation against the analytic oracle, j
 | `o` | cost vs today | profile error | as a fraction of the artifact |
 |---|---|---|---|
 | 2 | 3.3x | ~1.4e-2 | 15.6% - too coarse to benchmark against |
-| **4 (default)** | **12x** | **~4e-3** | **4.5%** |
+| **4 (accuracy target, memory-limited)** | **12x** | **~4e-3** | **4.5%** |
 | 8 | 45x | 1.8e-3 | 2.0% |
 
-`o = 4` is the default **on accuracy grounds**: the residual sits well below the effect being
-measured. A strict 1e-3 acquired-band tolerance would select `o = 8`; that tolerance was never
+`o = 4` is the **accuracy target**: its residual sits well below the effect being measured. It is
+**not** the shipped default -- section 6 shows the dense orientation histogram makes it
+unaffordable, so `o = 2` ships and `o = 4` is opt-in. A strict 1e-3 acquired-band tolerance would select `o = 8`; that tolerance was never
 justified against the artifact amplitude, and the table above replaces it.
 
 **Measured wall time (release, 108x152 in-plane, single-threaded):** 124 ms/slice at `o = 1`,
@@ -827,14 +830,14 @@ more elaborate simulator.
   pre-flight estimates the histogram term, which an earlier version omitted -- predicting 6.0 GB for
   a run that measured 11.5 GB.
 
-- **Runtime: measured, and phase 10 is not needed.** Release build, 108x152 in-plane, a 104-slice
+- **Runtime: measured. The FFT path is not needed; z-slab streaming still is (see memory above).** Release build, 108x152 in-plane, a 104-slice
   75-volume acquisition:
 
   | `o` | ms/slice | full acquisition, 1 thread | on 8 cores | sim slice buffer |
   |---|---|---|---|---|
   | 1 | 110 | 0.24 h | 0.03 h | 0.1 MB |
   | 2 | 243 | 0.53 h | 0.07 h | 0.3 MB |
-  | **4 (default)** | **714** | **1.55 h** | **0.19 h** | **1.1 MB** |
+  | **4 (accuracy target)** | **714** | **1.55 h** | **0.19 h** | **1.1 MB** |
 
   Eleven minutes on 8 cores at the production factor. The phase-10 FFT path and z-slab streaming
   are therefore **not implemented**: spec 6 defers both until measurement demands them, and the

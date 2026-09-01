@@ -35,14 +35,22 @@ def check_consistency(rows):
     # Gate on a PF-AWARE quantity. Gating on oscillatory_residual -- the Nyquist projection this
     # module elsewhere documents as going blind under partial Fourier -- meant the PF-aware rule
     # could be skipped precisely where PF had moved the artifact off Nyquist.
-    ctl_all = sorted(r["oscillatory_residual"] for r in rows if r["method"] == "none")
-    floor = (NEGLIGIBLE_RINGING_FRACTION * ctl_all[len(ctl_all) // 2]) if ctl_all else 0.0
+    # Each floor is computed from the SAME population its rule applies to. Pooling PF, noisy and
+    # Hann controls into a floor used only on full-Fourier clean unapodized rows made the
+    # "negligible artifact" exemption depend on conditions the rule never sees.
+    def _median(vals):
+        v = sorted(x for x in vals if x is not None and x == x)
+        return v[len(v) // 2] if v else 0.0
+
+    in_domain_a = [r for r in rows if r["method"] == "none" and r["pf"] >= 1.0
+                   and not r.get("noisy", False) and str(r.get("window")) in ("None", "none")]
+    floor = NEGLIGIBLE_RINGING_FRACTION * _median(r["oscillatory_residual"] for r in in_domain_a)
     # Gate on the ABSOLUTE artifact size, not a ratio: residual_energy for the control is
     # identically 1 (its residual IS R0), so a ratio-based gate can never skip anything.
-    pe_all = sorted(r["artifact_norm_pe"] for r in rows
-                    if r["method"] == "none" and r.get("artifact_norm_pe") is not None
-                    and r.get("artifact_norm_pe") == r.get("artifact_norm_pe"))
-    pe_floor = (NEGLIGIBLE_RINGING_FRACTION * pe_all[len(pe_all) // 2]) if pe_all else 0.0
+    in_domain_b = [r for r in rows if r["method"] == "none" and not r.get("noisy", False)
+                   and str(r.get("window")) in ("None", "none")]
+    pe_floor = NEGLIGIBLE_RINGING_FRACTION * _median(
+        r.get("artifact_norm_pe") for r in in_domain_b)
 
     for m in methods:
         # (a) beat the no-op control -- FULL FOURIER ONLY. oscillatory_residual is the Nyquist
@@ -50,8 +58,9 @@ def check_consistency(rows):
         #     on PF rows was inconsistent with its own stated limitation. PF is covered by rule (b)
         #     on the phase-encode axis instead.
         for r in _by(rows, method=m):
-            if r["pf"] < 1.0:
-                continue
+            if r["pf"] < 1.0 or r.get("noisy", False):
+                continue          # Gibbs-removal rules run on CLEAN rows; the paired noisy rows
+                                  # are for noise-amplification and robustness reporting.
             if str(r.get("window")) not in ("None", "none"):
                 continue          # apodized input is out of domain for ALL method-performance
                                   # rules, not just (b) -- see the module docstring. An earlier
@@ -134,6 +143,8 @@ def check_consistency(rows):
         #     single auto-selected axis (readout, for the symmetric box) would not see it. This
         #     matters precisely because zero-filled PF itself trades ringing for PE-axis blur.
         for r in _by(rows, method=m):
+            if r.get("noisy", False):
+                continue                      # clean rows only, as in (a) and (b)
             if str(r.get("window")) not in ("None", "none"):
                 continue                      # apodization legitimately softens edges
             for ax in ("ro", "pe"):
@@ -270,9 +281,11 @@ def main(argv=None):
 
     ok, reasons = check_consistency(rows)
     print()
-    # Narrower than it looks: the PF axis is descriptive only (see the module docstring), so
-    # this is full-Fourier / Nyquist-component acceptance, not a PF-validated result.
-    print("ACCEPTANCE:", "PASS (unapodized in-domain; PF measured on the PE axis; RPG absent)" if ok else "FAIL")
+    # PF now carries an asserted rule on the phase-encode axis (rule b), so this is no longer
+    # full-Fourier-only acceptance. What it still excludes: apodized input (out of domain for
+    # Kellner-style methods) and noisy rows (reported separately), and no PF-AWARE method is
+    # present, RPG having no adapter.
+    print("ACCEPTANCE:", "PASS (clean unapodized rows; PF asserted on the PE axis; RPG absent)" if ok else "FAIL")
     for x in reasons[:12]:
         print("  -", x)
     return 0 if ok else 1
