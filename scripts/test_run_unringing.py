@@ -19,17 +19,19 @@ def _crop_recon_edge(n=64, o=8):
     return np.tile(np.real(np.fft.ifft(np.fft.ifftshift(c))), (n, 1))
 
 
-def _zero_filled_edge(n=64):
-    """The OLD TRXScan mechanism: crop k-space, then zero-fill back to `n`.
+def _zero_filled_edge(n=64, pct=6.0):
+    """The OLD TRXScan mechanism: zero `pct`% of k-space at each edge, reconstruct at `n`.
 
-    Rings at period 2/(1-r) > 2 voxels, so the cutoff is no longer at the reconstruction Nyquist.
-    Retained only to document why that made the simulator unusable as a benchmark.
+    `pct` defaults to **6.0, the value the old CLI actually shipped**. Rings at period
+    2/(1-pct/100) > 2 voxels, so the cutoff is no longer at the reconstruction Nyquist.
     """
     x = np.arange(n)
     obj = (x >= n // 2 + 0.5).astype(float)
     k = np.fft.fftshift(np.fft.fft(obj))
-    keep = np.zeros(n, bool)
-    keep[n // 4:3 * n // 4] = True
+    r = int(np.ceil((n / 2) * pct / 100))
+    keep = np.ones(n, bool)
+    keep[:r] = False
+    keep[n - r:] = False
     return np.tile(np.real(np.fft.ifft(np.fft.ifftshift(k * keep))), (n, 1))
 
 
@@ -75,26 +77,43 @@ def test_mrdegibbs_substantially_removes_ringing_from_a_crop_recon_edge():
 @pytest.mark.skipif(
     not {"dipy", "mrdegibbs"} & set(available_methods()), reason="no unringing method"
 )
-def test_the_old_zero_filled_mechanism_is_not_correctable():
-    """Why the forward model had to change, measured rather than argued.
+def test_correctability_degrades_as_the_old_mechanism_moves_the_cutoff():
+    """Why the forward model had to change, measured across the real parameter range.
 
-    Zero-filled truncation moves the Fourier cutoff off the reconstruction Nyquist, so the ripple
-    period is no longer 2 voxels and the sub-voxel-shift assumption these tools rest on does not
-    hold. mrdegibbs achieves essentially nothing on it and dipy makes it measurably worse -- while
-    both remove ~90% from the crop-and-reconstruct edge.
+    An earlier version of this test used only 50% truncation and concluded the old mechanism was
+    "uncorrectable". That overstated it: the CLI actually shipped **6%**, where dipy still recovers
+    a good deal. What the measurement supports is weaker and graded -- correctability DEGRADES as
+    the cutoff moves off the reconstruction Nyquist:
+
+        trunc   period     dipy    mrdegibbs
+          6%   2.07 vox    -47%        +7%
+         25%   2.58 vox     -2%       +21%
+         50%   3.88 vox    +16%        -0%
+
+    against -87% / -92% on a correctly crop-and-reconstructed edge. So even the shipped default
+    was a materially worse benchmark than the corrected forward model, and the aggressive settings
+    are actively misleading.
     """
-    old, new = _zero_filled_edge(), _crop_recon_edge()
+    new = _crop_recon_edge()
     for m in ("dipy", "mrdegibbs"):
         if m not in available_methods():
             continue
-        o_out, _ = run_method(m, old, np.zeros_like(old))
         n_out, _ = run_method(m, new, np.zeros_like(new))
-        old_gain = _ripple(o_out) / _ripple(old)
-        new_gain = _ripple(n_out) / _ripple(new)
-        assert new_gain < 0.25, f"{m}: expected a large reduction on crop+recon, got {new_gain:.3f}"
-        assert old_gain > 0.9, (
-            f"{m}: zero-filled ringing should be largely uncorrectable, got {old_gain:.3f}"
-        )
+        assert _ripple(n_out) / _ripple(new) < 0.25, f"{m}: crop+recon should be correctable"
+        # correctability must get worse as truncation grows
+        gains = []
+        for pct in (6.0, 25.0, 50.0):
+            old = _zero_filled_edge(pct=pct)
+            o_out, _ = run_method(m, old, np.zeros_like(old))
+            gains.append(_ripple(o_out) / _ripple(old))
+        # No monotonicity is asserted: mrdegibbs measures [1.07, 1.21, 1.00] across 6/25/50%,
+        # never helping but not ordered either. What holds for BOTH methods at EVERY truncation is
+        # that the zero-filled mechanism is materially harder to correct than crop+reconstruct.
+        crop_gain = _ripple(n_out) / _ripple(new)
+        for pct, g in zip((6.0, 25.0, 50.0), gains):
+            assert g > crop_gain + 0.2, (
+                f"{m} at {pct}%: gain {g:.3f} vs {crop_gain:.3f} on crop+recon -- the old "
+                f"mechanism should be clearly harder to correct")
 
 
 def test_available_methods_always_includes_the_control():

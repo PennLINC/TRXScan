@@ -83,7 +83,7 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
     idx = idx[np.abs(idx - peak) > guard]
     if idx.size == 0:
         return 0.0
-    rp = _profiles(ref)
+    rp = _profiles(np.abs(ref))
     rmax = float(rp.max()) if rp.size else 0.0
     if rmax <= 0:
         return 0.0
@@ -95,7 +95,8 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
         return 0.0
     alt = (-1.0) ** idx
     proj = (w[good] * alt).sum(axis=-1) / n[good]
-    return float(np.sqrt((proj ** 2).mean()))
+    # |.|^2 so the measure is invariant to a global complex rotation of object and residual.
+    return float(np.sqrt((np.abs(proj) ** 2).mean()))
 
 
 def _profiles(a):
@@ -168,7 +169,11 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None):
     # alternating sequence rather than high-pass filtering it: a rolling-mean high-pass cannot
     # remove a sharp edge transition, and measured a Gaussian blur as MORE oscillatory than real
     # ringing -- exactly backwards.
-    oscillatory = _nyquist_amplitude(np.real(diff), ref_mag) if edge_valid else float("nan")
+    # COMPLEX projection, not the real part. Taking np.real(diff) here made the primary ringing
+    # score depend on the global phase: a residual rotated into the imaginary channel scored
+    # better without any less complex Gibbs error. That is precisely the phase dependence this
+    # simulator was rebuilt to represent correctly.
+    oscillatory = _nyquist_amplitude(diff, ref_mag) if edge_valid else float("nan")
 
     # --- resolution and geometry ---
     # No gradient along the scoring axis means the edge metrics are undefined -- either the

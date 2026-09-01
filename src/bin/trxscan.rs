@@ -6,10 +6,14 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
 use trxscan::compartments::{
+    generate_compartments,
     generate_compartments_moving, generate_mixture, signal_from_mixture, CompartmentParams,
 };
 use trxscan::io;
-use trxscan::kspace::{KspaceWindow, simulate_acquisition, Acquisition};
+use trxscan::kspace::{
+    simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
+};
+use trxscan::phase::PhaseModel;
 use trxscan::motion;
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
@@ -72,6 +76,37 @@ struct Cli {
     /// Output BIDS stem, e.g. out/sub-01_dir-AP_run-01
     #[arg(short, long, value_name = "PREFIX")]
     out: String,
+
+    /// In-plane oversampling factor for the simulation grid.
+    ///
+    /// This is what makes Gibbs ringing INTRINSIC to the acquisition: the object is simulated
+    /// finer than the acquisition matrix and only the nominal k-space band is acquired. With
+    /// `--oversample 1` the object sits on the reconstruction matrix, the transforms are an exact
+    /// round trip, and the output has NO ringing and no object phase (the legacy path).
+    ///
+    /// Requires `--sim-*` inputs at `voxel/N`, from
+    /// `scripts/prepare_acquisition_grid.py --oversample N`. Upsampling the acquisition-grid maps
+    /// instead would add no k-space content and produce no ringing.
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    oversample: usize,
+    /// Simulation-grid white-matter map (from prepare_acquisition_grid.py --oversample)
+    #[arg(long, value_name = "NII")]
+    sim_wm: Option<PathBuf>,
+    /// Simulation-grid grey-matter map
+    #[arg(long, value_name = "NII")]
+    sim_gm: Option<PathBuf>,
+    /// Simulation-grid CSF map
+    #[arg(long, value_name = "NII")]
+    sim_csf: Option<PathBuf>,
+    /// Simulation-grid brain mask
+    #[arg(long, value_name = "NII")]
+    sim_mask: Option<PathBuf>,
+    /// Simulation-grid fieldmap (Hz)
+    #[arg(long, value_name = "NII")]
+    sim_fmap: Option<PathBuf>,
+    /// Object phase model: "hbcd" (calibrated), or "none" for a real-valued object
+    #[arg(long, value_name = "MODEL", default_value = "hbcd")]
+    phase_model: String,
 
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
     #[arg(long)]
@@ -258,7 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eddy_tau: 70.0,
         n_spikes: 0,            // spikes are rare/aggressive; left off (available)
         spike_amplitude: 1.0,
-        window: KspaceWindow::None,  // unapodized; ringing is now intrinsic to the acquisition
+        window: KspaceWindow::None,  // unapodized; ringing comes from the crop when --oversample > 1
         n_coils: cli.coils,
         accel: cli.accel,
         acs_lines: 24,
@@ -272,13 +307,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t = Instant::now();
-    let (mag, phase) =
-        simulate_acquisition(grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients);
-    println!("Acquisition stage (distortion+T2*{}{}{}): {:?}",
-        if cli.noise > 0.0 { "+noise" } else { "" },
-        if cli.eddy > 0.0 { "+eddy" } else { "" },
-        if cli.accel > 1 { "+GRAPPA" } else { "" },
-        t.elapsed());
+
+    let phase_model = match cli.phase_model.as_str() {
+        "hbcd" => PhaseModel::hbcd_like(),
+        "none" => PhaseModel::none(),
+        other => return Err(format!("unknown --phase-model {other:?}; expected hbcd or none").into()),
+    };
+
+    let (mag, phase) = if cli.oversample > 1 {
+        // Production path: finer object -> nominal band -> reconstruction at the acquisition
+        // matrix. This is what makes ringing intrinsic (spec 3.1) and the object complex (3.2).
+        let need = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
+            o.clone().ok_or_else(|| format!(
+                "--oversample {} requires --{n}; generate the simulation grid with \
+                 scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
+                 acquisition-grid maps would add no k-space content and produce no ringing.",
+                cli.oversample, cli.oversample))
+        };
+        let (sim_tissue, sim_grid) = io::load_tissue(
+            &need(&cli.sim_wm, "sim-wm")?, &need(&cli.sim_gm, "sim-gm")?,
+            &need(&cli.sim_csf, "sim-csf")?, &need(&cli.sim_mask, "sim-mask")?)?;
+        let (sim_fmap, sim_fgrid) = io::load_volume(&need(&cli.sim_fmap, "sim-fmap")?)?;
+        let o = cli.oversample;
+        if sim_grid.dims != [grid.dims[0] * o, grid.dims[1] * o, grid.dims[2]] {
+            return Err(format!(
+                "simulation grid {:?} is not {o}x the acquisition grid {:?} in-plane (z is never \
+                 oversampled)", sim_grid.dims, grid.dims).into());
+        }
+        if sim_fgrid.dims != sim_grid.dims {
+            return Err(format!("sim fieldmap grid {:?} != sim tissue grid {:?}",
+                               sim_fgrid.dims, sim_grid.dims).into());
+        }
+        println!("Stage A on the simulation grid {:?} (o={o})", sim_grid.dims);
+        let sim_comp = generate_compartments(
+            &sim_grid, &positions, &offsets, &sim_tissue, &scheme, &params);
+        println!("Stage B (oversampled: intrinsic Gibbs + object phase '{}')", cli.phase_model);
+        simulate_acquisition_oversampled(
+            sim_grid.dims, grid.dims, sim_comp.ngrad, &sim_comp.images, &sim_comp.t2,
+            &sim_fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
+    } else {
+        eprintln!(
+            "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \
+             matrix, so the transforms are an exact round trip: the output will contain NO Gibbs \
+             ringing and no object phase. Use --oversample 4 for a realistic acquisition.");
+        simulate_acquisition_legacy(
+            grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients)
+    };
+    println!("Stage B: {:?}", t.elapsed());
 
     let sidecar = io::SidecarInfo {
         reverse_pe: cli.reverse_pe,
@@ -288,6 +363,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         accel: cli.accel,
         mb: cli.mb,
     };
+
     io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
     Ok(())

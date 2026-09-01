@@ -84,6 +84,11 @@ pub enum KspaceWindow {
 
 impl KspaceWindow {
     /// Window value at normalized frequency `(kx, ky)`, each in `[-0.5, 0.5]`.
+    ///
+    /// **These are RADIAL windows**, `r = 2*hypot(kx, ky)`, not the more common separable
+    /// Cartesian form `W(kx)*W(ky)`. Radial is isotropic in-plane, which suits a benchmark whose
+    /// edges are not axis-aligned; a scanner reproducing a specific vendor filter may need the
+    /// separable convention instead.
     pub fn at(&self, kx: f64, ky: f64) -> f64 {
         let r = 2.0 * (kx * kx + ky * ky).sqrt(); // 0 at centre, 1 at the band edge
         match *self {
@@ -118,7 +123,11 @@ pub struct Acquisition {
     pub reverse_phase: bool,
     pub do_distortions: bool,
     pub do_relaxation: bool,
-    pub noise_variance: f64,  // complex k-space noise variance (0 = off); Rician magnitude in image
+    /// Per-component variance of the reconstructed complex image at **full sampling, single coil,
+    /// pre-combination**: `Var(Re n) = Var(Im n) = noise_variance`, so `E[|n|^2] = 2*noise_variance`.
+    /// The per-k-space-sample variance is derived from the reconstruction normalization; the
+    /// combined multi-coil variance emerges from the coil model as `V / sum_c s_c^2`.
+    pub noise_variance: f64,
     pub partial_fourier: f64, // fraction of PE lines acquired (1.0 = full); skips low-ky lines
     pub ghost_offset: f64,    // Nyquist ghost: kx offset (±) on odd/even PE lines (0 = off)
     pub eddy_strength: f64,   // linear (in-plane) eddy-current phase scale (0 = off)
@@ -443,11 +452,15 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
             }
         }
         let spike = peak.scale(acq.spike_amplitude);
-        let mut rng = Rng(inp.slice_seed ^ 0xA5A5_1234_5678_9ABC);
-        for _ in 0..acq.n_spikes {
-            let kx = (rng.next_u64() as usize) % nx;
-            let ky = (rng.next_u64() as usize) % ny;
-            kspace[kat(kx, ky)] = spike;
+        // Spikes land only on ACQUIRED samples. Choosing arbitrary matrix coordinates could put
+        // a spike on a partial-Fourier or GRAPPA-omitted line, which the scanner never read.
+        let acquired: Vec<usize> = (0..nx * ny).filter(|&i| mask[i]).collect();
+        if !acquired.is_empty() {
+            let mut rng = Rng(inp.slice_seed ^ 0xA5A5_1234_5678_9ABC);
+            for _ in 0..acq.n_spikes {
+                let pick = acquired[(rng.next_u64() as usize) % acquired.len()];
+                kspace[pick] = spike;
+            }
         }
     }
 
@@ -733,7 +746,118 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
 /// with an effective T2 (`t2_eff`, ms) — per-tissue T2 for realistic b0 contrast is a refinement.
 /// Returns `(magnitude, phase)` 4D arrays (phase in radians, atan2), same layout — the complex pair
 /// needed for BIDS `part-mag`/`part-phase` and complex denoisers. Parallel over volumes with `par`.
-pub fn simulate_acquisition(
+/// The production acquisition: a finer object, the nominal k-space band, reconstruction at the
+/// acquisition matrix (spec 3.1), with an object phase model applied before encoding (spec 3.2).
+///
+/// `images` and `fmap` are on the **simulation** grid `sim_dims = [nx*o, ny*o, nz]`; the output is
+/// on `acq_dims = [nx, ny, nz]`. `o` is derived and must divide both in-plane axes.
+///
+/// This is the path that makes ringing intrinsic. [`simulate_acquisition_legacy`] does not.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_acquisition_oversampled(
+    sim_dims: [usize; 3],
+    acq_dims: [usize; 3],
+    ngrad: usize,
+    images: &[Vec<f32>],
+    t2: &[f32],
+    fmap: &[f32],
+    acq: &Acquisition,
+    bvals: &[f64],
+    bvecs: &[[f64; 3]],
+    phase: &PhaseModel,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    let [snx, sny, nz] = sim_dims;
+    let [nx, ny, nzo] = acq_dims;
+    assert_eq!(nz, nzo, "slice count must match; z is never oversampled");
+    assert!(snx % nx == 0 && sny % ny == 0, "sim grid must be an integer multiple of the acquired matrix");
+    let o = snx / nx;
+    assert_eq!(o, sny / ny, "oversampling must match on both axes");
+    let (nvox_sim, nvox_acq) = (snx * sny * nz, nx * ny * nz);
+    let ncomp = images.len();
+    for im in images {
+        assert_eq!(im.len(), nvox_sim * ngrad, "compartment image is not on the simulation grid");
+    }
+    assert_eq!(fmap.len(), nvox_sim, "fieldmap is not on the simulation grid");
+
+    let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
+        let (mut mag, mut ph) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
+        let mut cslices = vec![vec![0.0f32; snx * sny]; ncomp];
+        let mut fslice = vec![0.0f32; snx * sny];
+        for z in 0..nz {
+            for y in 0..sny {
+                for x in 0..snx {
+                    let vox = x + snx * (y + sny * z);
+                    for (c, img) in images.iter().enumerate() {
+                        cslices[c][x + snx * y] = img[vox * ngrad + g];
+                    }
+                    fslice[x + snx * y] = fmap[vox];
+                }
+            }
+            let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
+            let shot = phase.diffusion.shot(bvals[g], bvecs[g], g, z, seed);
+            let phi = phase_slice(phase, &shot, snx, sny, o, z, nz);
+            let slice_seed = (g as u64)
+                .wrapping_mul(0x100_0001)
+                .wrapping_add(z as u64)
+                .wrapping_mul(0x9E37)
+                ^ seed;
+            let out = simulate_slice(
+                &SliceInput {
+                    compartments: &refs,
+                    t2,
+                    fmap: &fslice,
+                    phase0: Some(&phi),
+                    sim: [snx, sny],
+                    acq_matrix: [nx, ny],
+                    z,
+                    nz,
+                    bvec: bvecs[g],
+                    bval: bvals[g],
+                    slice_seed,
+                },
+                acq,
+            );
+            for y in 0..ny {
+                for x in 0..nx {
+                    let (re, im) = out[x + nx * y];
+                    let vox = x + nx * (y + ny * z);
+                    mag[vox] = (re * re + im * im).sqrt();
+                    ph[vox] = im.atan2(re);
+                }
+            }
+        }
+        (mag, ph)
+    };
+
+    #[cfg(feature = "par")]
+    let vols: Vec<(Vec<f32>, Vec<f32>)> = {
+        use rayon::prelude::*;
+        (0..ngrad).into_par_iter().map(per_vol).collect()
+    };
+    #[cfg(not(feature = "par"))]
+    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..ngrad).map(per_vol).collect();
+
+    let (mut magd, mut phased) = (vec![0.0f32; nvox_acq * ngrad], vec![0.0f32; nvox_acq * ngrad]);
+    for (g, (m, p)) in vols.iter().enumerate() {
+        for vox in 0..nvox_acq {
+            magd[vox * ngrad + g] = m[vox];
+            phased[vox * ngrad + g] = p[vox];
+        }
+    }
+    (magd, phased)
+}
+
+/// **Legacy path: no intrinsic Gibbs ringing and no object phase.**
+///
+/// Runs the acquisition with the object already on the reconstruction matrix (`o = 1`) and
+/// `phase0: None`. At `o = 1` the forward and inverse transforms are an exact round trip, so this
+/// produces **zero** ringing (measured: +0.0000% overshoot on a step edge) and a real-valued image.
+///
+/// Retained only for backward comparison. Production callers must use
+/// [`simulate_acquisition_oversampled`], which is what gives ringing intrinsic to the acquisition
+/// and a genuinely complex object.
+pub fn simulate_acquisition_legacy(
     dims: [usize; 3],
     ngrad: usize,
     images: &[Vec<f32>],
@@ -1471,5 +1595,104 @@ mod tests {
         let o_min = if e2 < eps { 2 } else if e4 < eps { 4 } else { 8 };
         println!("o_min at eps={eps}: {o_min}  (e2={e2:.3e}, e4={e4:.3e})");
         assert!(e4 < 1e-2, "o=4 should be within 1% of o=8: {e4:.4e}");
+    }
+
+    #[test]
+    fn production_path_produces_intrinsic_ringing_and_complex_phase() {
+        // Regression guard for the defect this test exists because of: the shipped CLI ran the
+        // o=1 legacy path, where the forward/inverse transforms are an exact round trip, so after
+        // zero_ringing was removed it produced +0.0000% overshoot and no object phase.
+        use crate::phase::PhaseModel;
+        let (nx, ny, nz, o) = (32usize, 32usize, 1usize, 4usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
+        let fmap = vec![0.0f32; snx * sny * nz];
+        let acq = Acquisition {
+            signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
+        };
+        let model = PhaseModel::hbcd_like();
+        let (mag, ph) = simulate_acquisition_oversampled(
+            [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
+            &[1000.0], &[[1.0, 0.0, 0.0]], &model, 7,
+        );
+        let row: Vec<f64> = (nx / 2 + 1..nx).map(|x| mag[(x + nx * (ny / 2)) * 1] as f64).collect();
+        let over = row.iter().cloned().fold(f64::MIN, f64::max) - 1.0;
+        assert!(over > 0.05, "production path must ring intrinsically, got {:+.4}%", over * 100.0);
+
+        // and the object must actually be complex: phase varies across the bright region
+        let bright: Vec<f64> = (nx / 2 + 2..nx - 2)
+            .map(|x| ph[(x + nx * (ny / 2)) * 1] as f64)
+            .collect();
+        let spread = bright.iter().cloned().fold(f64::MIN, f64::max)
+            - bright.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread > 0.1, "object phase should vary across the image, spread {spread}");
+    }
+
+    #[test]
+    fn legacy_path_is_documented_as_ringing_free() {
+        // Pins WHY the legacy path must not be the production one, so nobody re-wires it.
+        let (nx, ny, nz) = (32usize, 32usize, 1usize);
+        let mut img = vec![0.0f32; nx * ny * nz];
+        for y in 0..ny {
+            for x in nx / 2..nx {
+                img[x + nx * y] = 1.0;
+            }
+        }
+        let acq = Acquisition {
+            signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
+        };
+        let (mag, _) = simulate_acquisition_legacy(
+            [nx, ny, nz], 1, &[img], &[100.0], &vec![0.0f32; nx * ny * nz], &acq,
+            &[[0.0, 0.0, 0.0]],
+        );
+        let over = (nx / 2 + 1..nx)
+            .map(|x| mag[(x + nx * (ny / 2)) * 1] as f64)
+            .fold(f64::MIN, f64::max) - 1.0;
+        assert!(over.abs() < 1e-4, "legacy path is an exact round trip by construction: {over}");
+    }
+
+    #[test]
+    fn partial_fourier_keeps_the_same_line_count_in_both_pe_polarities() {
+        // AP and PA must acquire equally many PE lines, or a reverse-PE pair is not comparable --
+        // which is the whole point of simulating one (topup / DRBUDDI).
+        for (ny, pf) in [(32usize, 0.75f64), (32, 0.875), (64, 0.75), (64, 0.875), (30, 0.75)] {
+            let mk = |rev: bool| {
+                let a = Acquisition { partial_fourier: pf, reverse_phase: rev, ..Default::default() };
+                let m = sampling_mask(16, ny, &a);
+                (0..ny).filter(|&ky| m[16 * ky]).count()
+            };
+            let (f, r) = (mk(false), mk(true));
+            let want = (ny as f64 * pf).round() as usize;
+            assert_eq!(f, r, "ny={ny} pf={pf}: forward keeps {f} lines, reverse {r}");
+            assert!(
+                (f as i64 - want as i64).abs() <= 1,
+                "ny={ny} pf={pf}: kept {f} lines, expected about {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn spikes_land_only_on_acquired_samples() {
+        let (nx, ny) = (24usize, 24usize);
+        let acq = Acquisition {
+            signal_scale: 1.0, do_distortions: false, do_relaxation: false,
+            partial_fourier: 0.75, n_spikes: 40, spike_amplitude: 1.0, ..Default::default()
+        };
+        let mask = sampling_mask(nx, ny, &acq);
+        let img = vec![1.0f32; nx * ny];
+        let comps: [&[f32]; 1] = [&img];
+        let k = simulate_slice_kspace(
+            &SliceInput {
+                compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
+                sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+            },
+            &acq,
+        );
+        for i in 0..nx * ny {
+            if !mask[i] {
+                assert_eq!((k[i].0, k[i].1), (0.0, 0.0), "spike landed on unacquired sample {i}");
+            }
+        }
     }
 }

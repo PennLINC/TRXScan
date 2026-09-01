@@ -10,5 +10,21 @@
   "snr_corrected": true,
   "statistic": "circular",
   "max_circ_sd": 2.9740786613082504,
-  "superseded": "an earlier binned fit gave p=0.317 and was invalid for a non-shelled scheme"
+  "superseded": "an earlier binned fit gave p=0.317 and was invalid for a non-shelled scheme",
+  "phase_provenance": {
+    "stored_dtype": "uint16 (nifti datatype 512, bitpix 16)",
+    "scl_slope": "NaN",
+    "scl_inter": "NaN",
+    "unscaled_range": [
+      0,
+      4095
+    ],
+    "nibabel_scaled_range": [
+      -4096,
+      4094
+    ],
+    "nibabel_applies": "slope 2, inter -4096",
+    "conversion_used": "rad = nibabel_scaled * pi/4096  (equivalently unscaled*2pi/4096 - pi)",
+    "verified_on": "ds006131 sub-20188"
+  }
 }

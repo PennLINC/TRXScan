@@ -26,18 +26,37 @@ SIEMENS_HALF_RANGE = 4096.0
 
 
 def siemens_phase_to_radians(raw):
-    """Convert Siemens integer phase (-4096..4095) to radians.
+    """Convert Siemens integer phase to radians, accepting either stored representation.
 
-    NIBS stores phase as uint16 with `scl_slope` NaN and `Units: arbitrary`, so nibabel returns raw
-    integers. Skipping this rescale would inflate every phase statistic by ~1300x.
+    **Verified against NIBS sub-60515** (`_part-phase_dwi.nii.gz`):
+
+    - header `datatype` 512 (**uint16**), `bitpix` 16, `scl_slope` and `scl_inter` both **NaN**
+    - `dataobj.get_unscaled()` -> uint16 in **[0, 4095]**, one full turn
+    - `np.asanyarray(dataobj)` -> float in **[-4096, 4094]**; nibabel applies slope 2, inter -4096
+
+    Both map one turn onto 2*pi, but by different formulas, and feeding the wrong one produces
+    silently wrong numbers rather than an error:
+
+        signed   v in [-4096, 4095]:  rad = v * pi / 4096
+        unsigned u in [0, 4095]:      rad = u * 2*pi / 4096 - pi
+
+    The representation is detected from the sign of the minimum. An earlier version assumed the
+    signed form unconditionally. That happens to be what `np.asanyarray` returns, so the published
+    calibration constants are unaffected -- but a caller reading with `get_unscaled()` would have
+    got a half-scaled, pi-offset field with no warning.
     """
     raw = np.asarray(raw, float)
-    span = np.nanmax(np.abs(raw))
-    if span <= 2 * np.pi + 1e-6:
+    lo, hi = float(np.nanmin(raw)), float(np.nanmax(raw))
+    if max(abs(lo), abs(hi)) <= 2 * np.pi + 1e-6:
         raise ValueError(
-            f"data already looks like radians (max |value| = {span:.3f}); refusing to rescale twice"
+            f"data already looks like radians (max |value| = {max(abs(lo), abs(hi)):.3f}); "
+            "refusing to rescale twice"
         )
-    return raw * np.pi / SIEMENS_HALF_RANGE
+    if lo < 0:
+        return raw * np.pi / SIEMENS_HALF_RANGE                      # signed store
+    # 4096 counts span 2*pi here, so the per-count rate is 2*pi/4096 -- twice the signed rate,
+    # where 8192 counts span the same turn. Using the signed rate gives a half-scaled field.
+    return raw * (2.0 * np.pi) / SIEMENS_HALF_RANGE - np.pi          # unsigned store
 
 
 def _wrapped_diff(a, axis):
@@ -125,8 +144,12 @@ def fit_b_dependence(shots, bvals, snr, statistic="circular"):
     lg = np.polyfit(np.log(bvals), np.log(obs), 1)
     p_naive, a_naive = float(lg[0]), float(np.exp(lg[1]))
 
+    # np.interp requires ascending x; sort the observations rather than assuming the caller did.
+    order = np.argsort(bvals)
+    b_sorted, snr_sorted = bvals[order], snr[order]
+
     def model(b, a, p):
-        return np.sqrt((a * b ** p) ** 2 + (1.0 / np.interp(b, bvals, snr)) ** 2)
+        return np.sqrt((a * b ** p) ** 2 + (1.0 / np.interp(b, b_sorted, snr_sorted)) ** 2)
 
     popt, _ = curve_fit(model, bvals, obs, p0=[a_naive, p_naive],
                         bounds=([0.0, 0.0], [np.inf, 3.0]), maxfev=20000)

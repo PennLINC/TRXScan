@@ -8,7 +8,10 @@ use trxscan::kspace::KspaceWindow;
 #[test]
 fn factor_grid_is_complete_and_labelled() {
     let g = factor_grid();
-    assert_eq!(g.len(), 3 * 4 * 2 * 2, "expected 48 grid points, got {}", g.len());
+    // 3 PF x 4 phase x 2 window. Noise is NOT a factor: every fixture already emits a
+    // clean/noisy pair from one realization, so making it a factor duplicated every clean
+    // condition and gave check_consistency two candidate controls per cell.
+    assert_eq!(g.len(), 3 * 4 * 2, "expected 24 grid points, got {}", g.len());
 
     let pf: BTreeSet<_> = g.iter().map(|p| format!("{:.3}", p.partial_fourier)).collect();
     assert_eq!(pf.len(), 3, "expected full / 6-8 / 7-8, got {pf:?}");
@@ -31,7 +34,6 @@ fn grid_covers_the_shipping_configuration_and_the_clean_baseline() {
     assert!(
         g.iter().any(|p| p.partial_fourier == 0.75
             && p.phase == PhaseKind::Diffusion
-            && p.noisy
             && p.window == KspaceWindow::None),
         "grid must include the shipping configuration"
     );
@@ -39,7 +41,6 @@ fn grid_covers_the_shipping_configuration_and_the_clean_baseline() {
     assert!(
         g.iter().any(|p| p.partial_fourier == 1.0
             && p.phase == PhaseKind::None
-            && !p.noisy
             && p.window == KspaceWindow::None),
         "grid must include the clean analytic baseline"
     );

@@ -65,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             partial_fourier: p.partial_fourier,
             window: p.window,
             // Per-component image-space variance at full sampling; ~30 dB against a unit step.
-            noise_variance: if p.noisy { 1.0e-3 } else { 0.0 },
+            // One nonzero level for every fixture; produce_slice emits the clean/noisy pair.
+            noise_variance: 1.0e-3,
             ..Acquisition::default()
         });
         let model = phase_model_for(p.phase);
@@ -93,9 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir.join("factors.json"),
             format!(
                 "{{\n  \"label\": \"{}\",\n  \"partial_fourier\": {},\n  \"phase\": \"{:?}\",\n  \
-                 \"noisy\": {},\n  \"window\": \"{:?}\",\n  \"matrix\": {},\n  \"oversample\": {},\n  \
+                 \"window\": \"{:?}\",\n  \"matrix\": {},\n  \"oversample\": {},\n  \
                  \"slices\": {},\n  \"bval\": {}\n}}\n",
-                p.label, p.partial_fourier, p.phase, p.noisy, p.window, n, o, nz, bval
+                p.label, p.partial_fourier, p.phase, p.window, n, o, nz, bval
             ),
         )?;
         written += 1;

@@ -110,7 +110,7 @@ def run_suite(root, methods=None):
             continue
         f = json.loads(fj.read_text())
         ref_m, ref_p = _load_pair(d, "objectnominal")
-        for noisy in (False, True):
+        for noisy in (False, True):   # both images of the SAME fixture; noise is not a grid factor
             acq_m, acq_p = _load_pair(d, "acquirednoisy" if noisy else "acquiredclean")
             for meth in methods:
                 try:
@@ -170,7 +170,9 @@ def main(argv=None):
               f"{r['phase_rmse_masked']:>7.3f}")
     ok, reasons = check_consistency(rows)
     print()
-    print("ACCEPTANCE:", "PASS" if ok else "FAIL")
+    # Narrower than it looks: the PF axis is descriptive only (see the module docstring), so
+    # this is full-Fourier / Nyquist-component acceptance, not a PF-validated result.
+    print("ACCEPTANCE:", "PASS (full-Fourier / Nyquist component; PF descriptive only)" if ok else "FAIL")
     for x in reasons[:12]:
         print("  -", x)
     return 0 if ok else 1

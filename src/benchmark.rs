@@ -140,11 +140,16 @@ pub struct FactorPoint {
     pub label: String,
     pub partial_fourier: f64,
     pub phase: PhaseKind,
-    pub noisy: bool,
     pub window: crate::kspace::KspaceWindow,
 }
 
-/// The full factor grid: 3 partial-Fourier x 4 phase x 2 noise x 2 window = 48 points.
+/// The full factor grid: 3 partial-Fourier x 4 phase x 2 window = **24** points.
+///
+/// Noise is deliberately NOT a factor here. Every fixture emits an `acquired-clean` /
+/// `acquired-noisy` pair from one realization, so noise is already covered per fixture. Making it
+/// a factor as well duplicated every clean condition: a `_clean_` fixture sets noise_variance = 0,
+/// so its "noisy" image is also clean, yet was recorded as noisy=true -- and check_consistency
+/// then had two candidate controls per cell, one of them a mislabelled noise-free result.
 ///
 /// Partial Fourier is a first-class axis rather than an afterthought: 6/8 is the shipping default
 /// (`src/bin/trxscan.rs`), so a full-Fourier-only suite would validate a configuration nobody runs.
@@ -160,16 +165,13 @@ pub fn factor_grid() -> Vec<FactorPoint> {
             ("ramp", PhaseKind::Ramp),
             ("diff", PhaseKind::Diffusion),
         ] {
-            for (nl, noisy) in [("clean", false), ("noisy", true)] {
-                for (wl, w) in [("nowin", KspaceWindow::None), ("hann", KspaceWindow::Hann)] {
-                    v.push(FactorPoint {
-                        label: format!("{pfl}_{phl}_{nl}_{wl}"),
-                        partial_fourier: pf,
-                        phase: ph,
-                        noisy,
-                        window: w,
-                    });
-                }
+            for (wl, w) in [("nowin", KspaceWindow::None), ("hann", KspaceWindow::Hann)] {
+                v.push(FactorPoint {
+                    label: format!("{pfl}_{phl}_{wl}"),
+                    partial_fourier: pf,
+                    phase: ph,
+                    window: w,
+                });
             }
         }
     }
@@ -190,13 +192,11 @@ pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
             },
             ..PhaseModel::none()
         },
-        PhaseKind::Diffusion => PhaseModel {
-            background: BackgroundPhase {
-                coeffs: [0.0, 0.04, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            },
-            diffusion: DiffusionPhase { c_q: 2.0e-3, sigma_dx: 0.4, sigma_rot: 2.0e-3 },
-            ..PhaseModel::none()
-        },
+        // The CALIBRATED model, not invented constants. An earlier version used
+        // c_q = 2e-3, sigma_dx = 0.4, which at b = 2000 gives ~0.036 rad against the calibrated
+        // model's ~1.90 rad -- a 50x understatement, so the condition tested nothing near the
+        // realistic phase regime it is named for.
+        PhaseKind::Diffusion => PhaseModel::hbcd_like(),
     }
 }
 

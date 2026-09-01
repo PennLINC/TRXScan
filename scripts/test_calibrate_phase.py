@@ -22,6 +22,19 @@ def test_siemens_rescaling_maps_the_integer_range_onto_pi():
     assert rad[-1] < np.pi and rad[-1] > np.pi - 0.01
 
 
+def test_unsigned_and_signed_stores_agree():
+    """NIBS stores uint16 [0, 4095]; nibabel hands back [-4096, 4094] via slope 2 / inter -4096.
+
+    Both describe the same phase, so both conversions must agree. Assuming the signed form
+    unconditionally would silently mis-scale anything read with get_unscaled().
+    """
+    u = np.array([0.0, 1024.0, 2048.0, 3072.0, 4095.0])       # the actual uint16 store
+    v = 2.0 * u - 4096.0                                       # what nibabel returns
+    assert np.allclose(siemens_phase_to_radians(u), siemens_phase_to_radians(v), atol=1e-9)
+    assert abs(siemens_phase_to_radians(u)[0] + np.pi) < 1e-9
+    assert abs(siemens_phase_to_radians(u)[2]) < 1e-9
+
+
 def test_rescaling_refuses_data_that_is_already_radians():
     # Guard against double-scaling: a volume already in radians must not be silently rescaled.
     with pytest.raises(ValueError):
