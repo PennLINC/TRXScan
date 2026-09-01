@@ -256,6 +256,100 @@ fn header_for_grid(v: [[f64; 4]; 4]) -> NiftiHeader {
 }
 
 /// Write a 4D `[x,y,z,g]` (layout `(x+nx*(y+ny*z))*ngrad+g`) as NIfTI-1 with the given affine.
+/// The simulation grid's [`Grid`]: in-plane refined by `o`, same FOV, slice direction untouched.
+///
+/// The origin shifts by half the difference between the coarse and fine voxel sizes on each
+/// refined axis, matching the half-cell registration the forward transform uses and the geometry
+/// `scripts/prepare_acquisition_grid.py` writes. Identity at `o = 1`.
+pub fn hires_grid(g: &Grid, o: usize) -> Grid {
+    assert!(o > 0, "oversampling factor must be positive");
+    let f = o as f64;
+    let mut m = g.voxel_to_world;
+    for r in 0..3 {
+        for c in 0..2 {
+            m[r][c] /= f;
+        }
+    }
+    for r in 0..3 {
+        m[r][3] = g.voxel_to_world[r][3]
+            - 0.5 * g.voxel_to_world[r][0] * (1.0 - 1.0 / f)
+            - 0.5 * g.voxel_to_world[r][1] * (1.0 - 1.0 / f);
+    }
+    Grid { dims: [g.dims[0] * o, g.dims[1] * o, g.dims[2]], voxel_to_world: m }
+}
+
+/// Write the four benchmark images as BIDS-style magnitude/phase pairs.
+///
+/// `object-hires` uses [`hires_grid`]; the other three use the acquisition grid. Emitting the
+/// clean/noisy pair separately is deliberate: their difference is noise alone, which is what
+/// separates residual Gibbs from noise amplification when scoring.
+pub fn write_benchmark(
+    out_prefix: &Path,
+    dims: [usize; 3],
+    o: usize,
+    slices: &[crate::benchmark::BenchmarkSlice],
+    grid: &Grid,
+) -> R<()> {
+    let [nx, ny, nz] = dims;
+    assert_eq!(slices.len(), nz, "expected one BenchmarkSlice per slice");
+    let hg = hires_grid(grid, o);
+    let (hnx, hny) = (nx * o, ny * o);
+
+    // (name, per-slice complex accessor as (re, im) f32, dims, grid)
+    let write_pair = |name: &str,
+                          data: Vec<(f32, f32)>,
+                          d: [usize; 3],
+                          g: &Grid|
+     -> R<()> {
+        let n = d[0] * d[1] * d[2];
+        assert_eq!(data.len(), n);
+        let mag: Vec<f32> = data.iter().map(|p| (p.0 * p.0 + p.1 * p.1).sqrt()).collect();
+        let ph: Vec<f32> = data.iter().map(|p| p.1.atan2(p.0)).collect();
+        let mp = out_prefix.with_file_name(format!(
+            "{}_desc-{name}_part-mag_dwi.nii.gz",
+            out_prefix.file_name().unwrap().to_string_lossy()
+        ));
+        let pp = out_prefix.with_file_name(format!(
+            "{}_desc-{name}_part-phase_dwi.nii.gz",
+            out_prefix.file_name().unwrap().to_string_lossy()
+        ));
+        write_4d(&mp, d, 1, &mag, g)?;
+        write_4d(&pp, d, 1, &ph, g)?;
+        Ok(())
+    };
+
+    let gather_f64 = |pick: &dyn Fn(&crate::benchmark::BenchmarkSlice) -> &Vec<(f64, f64)>,
+                      w: usize,
+                      h: usize|
+     -> Vec<(f32, f32)> {
+        let mut v = vec![(0.0f32, 0.0f32); w * h * nz];
+        for (z, s) in slices.iter().enumerate() {
+            let src = pick(s);
+            for i in 0..w * h {
+                v[i + w * h * z] = (src[i].0 as f32, src[i].1 as f32);
+            }
+        }
+        v
+    };
+    let gather_f32 = |pick: &dyn Fn(&crate::benchmark::BenchmarkSlice) -> &Vec<(f32, f32)>|
+     -> Vec<(f32, f32)> {
+        let mut v = vec![(0.0f32, 0.0f32); nx * ny * nz];
+        for (z, s) in slices.iter().enumerate() {
+            let src = pick(s);
+            for i in 0..nx * ny {
+                v[i + nx * ny * z] = src[i];
+            }
+        }
+        v
+    };
+
+    write_pair("objecthires", gather_f64(&|s| &s.object_hires, hnx, hny), [hnx, hny, nz], &hg)?;
+    write_pair("objectnominal", gather_f64(&|s| &s.object_nominal, nx, ny), dims, grid)?;
+    write_pair("acquiredclean", gather_f32(&|s| &s.acquired_clean), dims, grid)?;
+    write_pair("acquirednoisy", gather_f32(&|s| &s.acquired_noisy), dims, grid)?;
+    Ok(())
+}
+
 fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
     let [nx, ny, nz] = dims;
     let arr = Array4::from_shape_fn((nx, ny, nz, ngrad), |(x, y, z, g)| {
@@ -461,5 +555,77 @@ mod tests {
         assert!(e.contains("nope") && e.contains("weights"), "unhelpful error: {e}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hires_affine_preserves_the_fov() {
+        // The hires volume must cover the same FOV as the nominal one, or the two references
+        // cannot be compared voxel-for-voxel after block reduction.
+        let g = Grid {
+            dims: [8, 8, 2],
+            voxel_to_world: [
+                [1.7, 0.0, 0.0, -10.0],
+                [0.0, 1.7, 0.0, -12.0],
+                [0.0, 0.0, 1.7, 3.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let o = 4;
+        let h = hires_grid(&g, o);
+        assert_eq!(h.dims, [32, 32, 2]);
+        for ax in 0..2 {
+            let nom = g.dims[ax] as f64 * g.voxel_to_world[ax][ax];
+            let hi = h.dims[ax] as f64 * h.voxel_to_world[ax][ax];
+            assert!((nom - hi).abs() < 1e-9, "axis {ax}: FOV {nom} vs {hi}");
+        }
+        assert_eq!(h.voxel_to_world[2][2], g.voxel_to_world[2][2], "z must not be refined");
+    }
+
+    #[test]
+    fn hires_grid_is_identity_at_o_equals_one() {
+        let g = Grid {
+            dims: [5, 7, 3],
+            voxel_to_world: [
+                [2.0, 0.0, 0.0, 1.0],
+                [0.0, 2.0, 0.0, 2.0],
+                [0.0, 0.0, 3.0, 4.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let h = hires_grid(&g, 1);
+        assert_eq!(h.dims, g.dims);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert!((h.voxel_to_world[r][c] - g.voxel_to_world[r][c]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn hires_corners_coincide_with_the_nominal_grid() {
+        // Same check the prep script's geometry satisfies: the outer FOV corners must land in the
+        // same world position, so the two grids describe one physical volume.
+        let g = Grid {
+            dims: [6, 9, 2],
+            voxel_to_world: [
+                [1.7, 0.0, 0.0, -5.0],
+                [0.0, 1.7, 0.0, -7.0],
+                [0.0, 0.0, 1.7, 0.5],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        for &o in &[2usize, 3, 4, 8] {
+            let h = hires_grid(&g, o);
+            // corner of voxel (0,0): left edge = origin - half a voxel along each in-plane axis
+            for r in 0..3 {
+                let nom = g.voxel_to_world[r][3]
+                    - 0.5 * g.voxel_to_world[r][0]
+                    - 0.5 * g.voxel_to_world[r][1];
+                let hi = h.voxel_to_world[r][3]
+                    - 0.5 * h.voxel_to_world[r][0]
+                    - 0.5 * h.voxel_to_world[r][1];
+                assert!((nom - hi).abs() < 1e-9, "o={o} row {r}: {nom} vs {hi}");
+            }
+        }
     }
 }
