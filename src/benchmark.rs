@@ -120,6 +120,86 @@ pub struct BenchmarkSlice {
     pub acquired_noisy: Vec<(f32, f32)>,
 }
 
+/// Which object-phase condition a grid point uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseKind {
+    /// Real object. The degenerate case the original assessment found in the shipped simulator.
+    None,
+    /// A single global phase: trivial but perfectly valid complex data.
+    Constant,
+    /// A smooth spatial ramp: the minimum needed for ringing to rotate across the image.
+    Ramp,
+    /// Volume-dependent diffusion phase from the effective q-vector.
+    Diffusion,
+}
+
+/// One point on the acceptance-suite factor grid (spec 5.2).
+#[derive(Debug, Clone)]
+pub struct FactorPoint {
+    /// Unique, filesystem-safe; names the output directory and the results-table row.
+    pub label: String,
+    pub partial_fourier: f64,
+    pub phase: PhaseKind,
+    pub noisy: bool,
+    pub window: crate::kspace::KspaceWindow,
+}
+
+/// The full factor grid: 3 partial-Fourier x 4 phase x 2 noise x 2 window = 48 points.
+///
+/// Partial Fourier is a first-class axis rather than an afterthought: 6/8 is the shipping default
+/// (`src/bin/trxscan.rs`), so a full-Fourier-only suite would validate a configuration nobody runs.
+/// The phase axis exists because a magnitude-only unringing method should degrade on phase error
+/// as object phase grows, and that is only visible if phase varies across the grid.
+pub fn factor_grid() -> Vec<FactorPoint> {
+    use crate::kspace::KspaceWindow;
+    let mut v = Vec::new();
+    for (pfl, pf) in [("full", 1.0), ("pf68", 0.75), ("pf78", 0.875)] {
+        for (phl, ph) in [
+            ("nophase", PhaseKind::None),
+            ("const", PhaseKind::Constant),
+            ("ramp", PhaseKind::Ramp),
+            ("diff", PhaseKind::Diffusion),
+        ] {
+            for (nl, noisy) in [("clean", false), ("noisy", true)] {
+                for (wl, w) in [("nowin", KspaceWindow::None), ("hann", KspaceWindow::Hann)] {
+                    v.push(FactorPoint {
+                        label: format!("{pfl}_{phl}_{nl}_{wl}"),
+                        partial_fourier: pf,
+                        phase: ph,
+                        noisy,
+                        window: w,
+                    });
+                }
+            }
+        }
+    }
+    v
+}
+
+/// The [`PhaseModel`] for a grid point's phase condition.
+///
+/// Deterministic per condition so a fixture set is reproducible from its label alone.
+pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
+    use crate::phase::{BackgroundPhase, DiffusionPhase};
+    match kind {
+        PhaseKind::None => PhaseModel::none(),
+        PhaseKind::Constant => PhaseModel { global: 0.7, ..PhaseModel::none() },
+        PhaseKind::Ramp => PhaseModel {
+            background: BackgroundPhase {
+                coeffs: [0.0, 0.08, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            ..PhaseModel::none()
+        },
+        PhaseKind::Diffusion => PhaseModel {
+            background: BackgroundPhase {
+                coeffs: [0.0, 0.04, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            diffusion: DiffusionPhase { c_q: 2.0e-3, sigma_dx: 0.4, sigma_rot: 2.0e-3 },
+            ..PhaseModel::none()
+        },
+    }
+}
+
 /// The canonical Gibbs-only configuration: everything that would contaminate
 /// `unringed - object_nominal` with non-Gibbs error is disabled.
 ///

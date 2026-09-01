@@ -35,6 +35,11 @@ name = "trxscan-microstructure"
 path = "src/bin/trxscan_microstructure.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "trxscan-benchmark"
+path = "src/bin/trxscan_benchmark.rs"
+required-features = ["cli"]
+
 [dependencies]
 # --- path deps to sibling checkouts (see the README for the expected layout) ---
 trx-rs = { path = "../rust/trx-rs", optional = true }
