@@ -338,6 +338,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("sim fieldmap grid {:?} != sim tissue grid {:?}",
                                sim_fgrid.dims, sim_grid.dims).into());
         }
+        // Pre-flight memory estimate. Stage A holds comp.images = nvox * ngrad * ncomp * 4 bytes,
+        // and in-plane voxels scale as o^2 -- so o=4 is 16x the acquisition grid, not 4x. Measured
+        // 13.04 GB peak for a 107x151x104 / 75-volume / 3-compartment run at o=4, which OOMs a
+        // 16 GB machine. Warn loudly rather than dying halfway through Stage A.
+        let sim_vox = sim_grid.dims.iter().product::<usize>() as f64;
+        let est_gb = sim_vox * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
+        if est_gb > 8.0 {
+            eprintln!(
+                "WARNING: Stage A will hold roughly {est_gb:.1} GB for the simulation grid {:?} \
+                 ({} volumes). In-plane memory scales as o^2, so halving --oversample quarters \
+                 this. If the machine has less RAM, use --oversample 2 (accuracy cost: residual \
+                 rises from ~4.5% to ~15.6% of the artifact) or wait for z-slab streaming.",
+                sim_grid.dims, scheme.len());
+        }
         println!("Stage A on the simulation grid {:?} (o={o})", sim_grid.dims);
         let sim_comp = generate_compartments(
             &sim_grid, &positions, &offsets, &sim_tissue, &scheme, &params);

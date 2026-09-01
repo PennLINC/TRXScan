@@ -11,7 +11,7 @@ on `edge_sharpness`; a genuine unringer does well on both.
 """
 import numpy as np
 
-__all__ = ["score"]
+__all__ = ["score", "residual_alignment", "dominant_axis"]
 
 
 def dominant_axis(ref):
@@ -136,7 +136,48 @@ def _edge_shift(est, ref, half_width=8):
     return float((ce - cr).mean())
 
 
-def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None):
+def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bright=0.5):
+    """How much of the CONTROL artifact survives in a method's residual.
+
+    Frequency-agnostic, complex-valued, and therefore partial-Fourier-aware, which the Nyquist
+    projection is not: PF ringing arises from two k-space intervals and does not sit at Nyquist,
+    so a Nyquist projection simply stops seeing it as PF grows more aggressive.
+
+    The simulator supplies the exact artifact, so its frequency need not be known a priori. With
+    `R0 = control - ref` (the uncorrected complex residual) and `Rm = est - ref`:
+
+        alignment = |<Rm, R0>| / ||R0||^2
+
+    1.0 means the method removed nothing, 0.0 that the artifact is entirely gone, and >1 that the
+    method amplified it. All inputs are complex arrays.
+    """
+    est, ref, control = (np.asarray(a) for a in (est, ref, control))
+    if axis is None:
+        axis = dominant_axis(np.abs(ref))
+    est, ref, control = (np.moveaxis(a, axis, -1) for a in (est, ref, control))
+    r0 = _profiles(control - ref)
+    rm = _profiles(est - ref)
+    rp = _profiles(np.abs(ref))
+    dr = np.abs(np.diff(rp, axis=-1))
+    if dr.size == 0 or dr.max() <= 0:
+        return float("nan")
+    peak = int(np.argmax(dr.sum(axis=0)))
+    lo, hi = max(0, peak - half_width), min(r0.shape[-1], peak + half_width + 1)
+    idx = np.arange(lo, hi)
+    idx = idx[np.abs(idx - peak) > guard]
+    rmax = float(rp.max())
+    if idx.size == 0 or rmax <= 0:
+        return float("nan")
+    keep = rp[:, idx] > bright * rmax
+    a, b = rm[:, idx] * keep, r0[:, idx] * keep
+    denom = float(np.sum(np.abs(b) ** 2))
+    if denom <= 0:
+        return float("nan")
+    return float(abs(np.sum(a * np.conj(b))) / denom)
+
+
+def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
+          control_mag=None, control_phase=None):
     """Decompose the error of `est` against the artifact-free reference `ref`.
 
     All inputs are magnitude/phase pairs of identical shape. `mag_threshold` is a fraction of
@@ -191,8 +232,17 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None):
     else:
         phase_rmse = np.nan
 
+    # PF-aware, frequency-agnostic companion to the Nyquist projection.
+    if control_mag is not None and control_phase is not None and edge_valid:
+        zc = (_to_last(np.asarray(control_mag, float), axis)
+              * np.exp(1j * _to_last(np.asarray(control_phase, float), axis)))
+        alignment = residual_alignment(ze, zr, zc, axis=-1)
+    else:
+        alignment = float("nan")
+
     return {
         "edge_metrics_valid": bool(edge_valid),
+        "residual_alignment": alignment,
         "oscillatory_residual": oscillatory,
         "edge_location_bias": float(bias),
         "edge_sharpness": sharpness,

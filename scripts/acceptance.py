@@ -4,11 +4,11 @@ The criterion is that varying partial Fourier, phase, noise and windowing produc
 and physically consistent changes in method behaviour -- NOT that methods achieve a predetermined
 ranking. Relative quality between methods is recorded in the results table and never asserted.
 
-**Known limitation: the partial-Fourier axis is reported, not asserted.** The oscillatory metric
-projects onto the Nyquist frequency, which is ringing's signature under a rectangular window, but
-PF ringing arises from two k-space intervals and lies elsewhere. Fixtures are generated across
-three PF values and the trend is tabulated, but no rule is applied to it. Closing that needs a
-PF-aware metric and RPG, which is not installed here.
+**Partial Fourier is now covered by **, a frequency-agnostic complex metric
+that measures how much of the simulator's own control artifact survives a method's output. The
+Nyquist projection remains as a specialised full-Fourier measure; PF ringing does not sit at
+Nyquist, so that one alone could not see it. RPG is still absent, so the PF-*aware method*
+comparison remains unavailable -- but the PF *axis* is no longer unmeasured.
 """
 from collections import defaultdict
 
@@ -51,7 +51,24 @@ def check_consistency(rows):
                     f"({r['oscillatory_residual']:.4f} vs {ctrl[0]['oscillatory_residual']:.4f})"
                 )
 
-        # (b) WITHDRAWN -- the PF axis cannot be asserted on with the current metric.
+        # (b) a method must remove some of the control artifact wherever there is one to remove.
+        #     residual_alignment is frequency-agnostic, so unlike the Nyquist projection it stays
+        #     valid under partial Fourier.
+        for r in _by(rows, method=m):
+            a = r.get("residual_alignment")
+            if a is None or a != a:            # NaN
+                continue
+            ctrl = _by(rows, method="none", pf=r["pf"], phase=r["phase"],
+                       noisy=r.get("noisy", False), window=r.get("window"))
+            if not ctrl or ctrl[0]["oscillatory_residual"] < floor:
+                continue
+            if a > 1.0:
+                reasons.append(
+                    f"{m}: amplifies the control artifact at pf={r['pf']} phase={r['phase']} "
+                    f"window={r.get('window')} (alignment {a:.3f} > 1)"
+                )
+
+        # (b-legacy) WITHDRAWN -- the Nyquist projection alone cannot assert on the PF axis.
         #
         # The intended rule was that more aggressive partial Fourier makes unringing harder. It is
         # not testable here, and both real methods violate any form of it, for a reason that is
@@ -118,7 +135,9 @@ def run_suite(root, methods=None):
                 except MethodUnavailable as e:
                     skipped.append((meth, str(e)))
                     continue
-                s = score(om, op, ref_m, ref_p)
+                # The uncorrected acquisition is the control artifact for residual_alignment.
+                s = score(om, op, ref_m, ref_p,
+                          control_mag=acq_m, control_phase=acq_p)
                 rows.append({"label": f["label"], "method": meth, "pf": f["partial_fourier"],
                              "phase": f["phase"], "window": f["window"], "noisy": noisy, **s})
     return rows, sorted(set(m for m, _ in skipped))
@@ -138,6 +157,7 @@ def summarise(rows):
         out.append({
             "method": m, "pf": pf, "n": n,
             "oscillatory_residual": sum(r["oscillatory_residual"] for r in rs) / n,
+            "residual_alignment": sum(r["residual_alignment"] for r in rs) / n,
             "edge_sharpness": sum(r["edge_sharpness"] for r in rs) / n,
             "phase_rmse_masked": sum(r["phase_rmse_masked"] for r in rs) / n,
         })
@@ -163,16 +183,16 @@ def main(argv=None):
     if skipped:
         print(f"SKIPPED (not installed): {', '.join(skipped)}")
     print()
-    print(f"  {'method':<10} {'pf':>6} {'n':>4} {'oscill':>9} {'sharp':>7} {'phase':>7}")
+    print(f"  {'method':<10} {'pf':>6} {'n':>4} {'oscill':>9} {'align':>7} {'sharp':>7} {'phase':>7}")
     for r in summarise(rows):
         print(f"  {r['method']:<10} {r['pf']:>6.3f} {r['n']:>4} "
-              f"{r['oscillatory_residual']:>9.5f} {r['edge_sharpness']:>7.3f} "
-              f"{r['phase_rmse_masked']:>7.3f}")
+              f"{r['oscillatory_residual']:>9.5f} {r['residual_alignment']:>7.3f} "
+              f"{r['edge_sharpness']:>7.3f} {r['phase_rmse_masked']:>7.3f}")
     ok, reasons = check_consistency(rows)
     print()
     # Narrower than it looks: the PF axis is descriptive only (see the module docstring), so
     # this is full-Fourier / Nyquist-component acceptance, not a PF-validated result.
-    print("ACCEPTANCE:", "PASS (full-Fourier / Nyquist component; PF descriptive only)" if ok else "FAIL")
+    print("ACCEPTANCE:", "PASS (all PF conditions measured via residual_alignment; RPG absent)" if ok else "FAIL")
     for x in reasons[:12]:
         print("  -", x)
     return 0 if ok else 1

@@ -6,7 +6,7 @@ tests pin the separation.
 """
 import numpy as np
 import pytest
-from score_unringing import score
+from score_unringing import score, residual_alignment
 
 
 def _edge(n=64, ring=0.0, blur=0.0):
@@ -80,3 +80,37 @@ def test_edge_location_bias_detects_a_shift():
     z = np.zeros_like(ref)
     s = score(shifted, z, ref, z)
     assert abs(s["edge_location_bias"] - 2.0) < 0.25, s["edge_location_bias"]
+
+
+def _complex_edge(n=64, ring=0.0):
+    x = np.arange(n)
+    img = (x >= n // 2 + 0.5).astype(float)
+    if ring:
+        img = img + ring * ((-1.0) ** x) * np.exp(-np.abs(x - n // 2) / 6.0)
+    return np.tile(img, (n, 1)).astype(complex)
+
+
+def test_residual_alignment_spans_zero_to_one():
+    ref = _complex_edge()
+    ctl = _complex_edge(ring=0.09)
+    assert abs(residual_alignment(ctl, ref, ctl) - 1.0) < 1e-9, "control removed nothing"
+    assert abs(residual_alignment(ref, ref, ctl)) < 1e-9, "perfect recovery"
+    half = ref + 0.5 * (ctl - ref)
+    assert abs(residual_alignment(half, ref, ctl) - 0.5) < 1e-6, "half removed"
+
+
+def test_residual_alignment_is_invariant_to_global_rotation():
+    """The reason this metric exists alongside the Nyquist projection: complex-aware methods must
+    not be scored differently just because the object carries a different global phase."""
+    ref, ctl = _complex_edge(), _complex_edge(ring=0.09)
+    base = residual_alignment(ref + 0.4 * (ctl - ref), ref, ctl)
+    for a in (0.3, 1.1, 2.7):
+        r = np.exp(1j * a)
+        rot = residual_alignment((ref + 0.4 * (ctl - ref)) * r, ref * r, ctl * r)
+        assert abs(rot - base) < 1e-9, f"alignment moved under rotation {a}: {rot} vs {base}"
+
+
+def test_residual_alignment_flags_amplification():
+    ref, ctl = _complex_edge(), _complex_edge(ring=0.09)
+    worse = ref + 1.5 * (ctl - ref)
+    assert residual_alignment(worse, ref, ctl) > 1.0

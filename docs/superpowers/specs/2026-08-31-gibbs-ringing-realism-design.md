@@ -791,11 +791,31 @@ more elaborate simulator.
 
 ## 6. Risks
 
-- **Stage A memory, 4x.** `comp.images` is `nvox * ngrad` per compartment; a 1.7 mm HBCD grid at
-  ~100 volumes and 3 compartments is order 1.4 GB today, ~5.5 GB at `o=2`. Mitigation is z-slab
-  streaming, which is natural because Stage B is already per-slice and z is not oversampled. Measured
-  at the start of phase 1; built in phase 10 if it bites. Per 5.1, `--oversample 1` is a debugging
-  aid, not a shipping configuration.
+- **Stage A memory: MEASURED, and it gates the default.** An earlier draft said "4x memory,
+  1.4 GB -> 5.5 GB". That 4x was the `o = 2` figure and was never re-derived when `o = 4` became
+  the default: in-plane voxel count scales as **`o^2`**, so `o = 4` is **16x**, not 4x.
+
+  `comp.images` is `nvox * ngrad * ncomp * 4` bytes. For the bundled HBCD-sized case
+  (107x151x104 acquisition, 75 volumes, 3 compartments):
+
+  | `o` | sim voxels | predicted `comp.images` | measured peak RSS |
+  |---|---|---|---|
+  | 1 | 1.68 M | 1.51 GB | -- |
+  | 2 | 6.72 M | 6.05 GB | -- |
+  | **4 (default)** | **26.89 M** | **24.20 GB** | **13.04 GB** (end-to-end, 1 M streamlines) |
+
+  Measured on a real run: `prepare_acquisition_grid.py --oversample 4`, Stage A on the
+  (428, 604, 104) simulation grid, then Stage B. **13.04 GB peak.** That fits a 32 GB machine and
+  would OOM a 16 GB one, so `--oversample 4` is **not safely production-default on typical
+  hardware** without the slab-streaming mitigation below.
+
+  The run was stopped during Stage B, which is ~1.5 h single-threaded at this size without the
+  `par` feature. Stage A dominates the peak and had already allocated, so the figure stands.
+
+  **Mitigation, now warranted rather than deferred:** Stage B is already per-slice and z is never
+  oversampled, so streaming Stage A by z-slab bounds the resident set to one slab rather than the
+  whole volume. Until that lands the CLI runs a pre-flight estimate and warns.
+
 - **Runtime: measured, and phase 10 is not needed.** Release build, 108x152 in-plane, a 104-slice
   75-volume acquisition:
 

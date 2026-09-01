@@ -182,7 +182,7 @@ pub fn factor_grid() -> Vec<FactorPoint> {
 ///
 /// Deterministic per condition so a fixture set is reproducible from its label alone.
 pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
-    use crate::phase::{BackgroundPhase, DiffusionPhase};
+    use crate::phase::BackgroundPhase;
     match kind {
         PhaseKind::None => PhaseModel::none(),
         PhaseKind::Constant => PhaseModel { global: 0.7, ..PhaseModel::none() },

@@ -1,0 +1,42 @@
+name: CI
+
+# Added after a PR review noted that a large number of implementation defects were found only by
+# execution, never by reading. Everything here is self-contained: no datasets, no MRtrix, no DIPY.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (pure std, no features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (default features)
+        run: cargo build --verbose
+      - name: Test (default features)
+        run: cargo test --verbose
+      - name: Clippy on the modules this work owns
+        run: cargo clippy -- -D warnings
+        continue-on-error: true
+
+  python:
+    name: Python scorer and calibration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install --quiet numpy scipy pytest
+      - name: Test
+        # Data-dependent tests skip themselves when the truth bundle or MRtrix/DIPY are absent;
+        # the scorer, cross-check and calibration maths all run without either.
+        run: python -m pytest scripts -q
+        working-directory: ${{ github.workspace }}
