@@ -129,6 +129,33 @@ impl PhaseModel {
         self.global + self.background.at(r[0], r[1], r[2]) + shot.at(r)
     }
 
+    /// A preset tuned to the HBCD-protocol NIBS data (spec 4.2).
+    ///
+    /// Calibrated 2026-09-01 from NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices,
+    /// `scripts/calibration_nibs.json`. Two different standards, as spec 4.2 requires:
+    ///
+    /// - **Background is TUNED, not fitted.** Its gradient matches the measured 0.164 rad/voxel,
+    ///   but reconstructed phase mixes magnetization, coil and combination, scanner conventions
+    ///   and possibly reconstruction filtering, and only some of that precedes Fourier encoding.
+    ///   Treat it as an effective benchmark parameter, never as a recovered physical field.
+    /// - **Diffusion is FITTED**, with the thermal floor modelled as `1/SNR` in quadrature and
+    ///   using CIRCULAR statistics: `p = 0.445`, close to the 0.5 that `phi = q.dx` predicts at
+    ///   fixed timing. A linear-SD fit gives 0.257 because wrapped phase saturates at
+    ///   `pi/sqrt(3)`, and the NIBS shells sit at 62-99% of that ceiling.
+    ///
+    /// `sigma_dx = 1.0` voxel with `c_q = 0.0642` reproduces the fitted `sigma_phi(b)`; only their
+    /// product is constrained by the data, so the split is a convention.
+    pub fn hbcd_like() -> Self {
+        PhaseModel {
+            global: 0.0,
+            // hypot(0.13, 0.10) = 0.164 rad/voxel, the measured background gradient
+            background: BackgroundPhase {
+                coeffs: [0.0, 0.13, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            diffusion: DiffusionPhase { c_q: 0.0642, sigma_dx: 1.0, sigma_rot: 2.0e-3 },
+        }
+    }
+
     /// A zero model: real-valued object. Useful for isolating non-phase behaviour in tests.
     pub fn none() -> Self {
         PhaseModel {
@@ -195,5 +222,27 @@ mod tests {
         assert_eq!(bg.at(1.0, 2.0, 3.0), bg.at(1.0, 2.0, 3.0));
         let step = (bg.at(1.1, 2.0, 3.0) - bg.at(1.0, 2.0, 3.0)).abs();
         assert!(step < 0.05, "background phase must vary slowly, got {step} per 0.1 voxel");
+    }
+
+    #[test]
+    fn hbcd_like_preset_is_nondegenerate_and_sqrt_b_dependent() {
+        let m = PhaseModel::hbcd_like();
+        // b = 0 must still be phase-free.
+        let s0 = m.diffusion.shot(0.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        assert_eq!(s0.at([3.0, 1.0, 0.0]), 0.0);
+        // a real shell gives non-trivial phase, scaling as sqrt(b)
+        let a = m.diffusion.shot(1000.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        let b = m.diffusion.shot(4000.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        let r = [2.0, -1.0, 0.0];
+        assert!(a.at(r).abs() > 1e-6, "calibrated model should give real phase");
+        assert!((b.at(r) / a.at(r) - 2.0).abs() < 1e-9, "sqrt(b) scaling");
+        // the background field must actually vary across the FOV
+        let d = (m.background.at(8.0, 0.0, 0.0) - m.background.at(-8.0, 0.0, 0.0)).abs();
+        assert!(d > 1e-3, "background phase should vary, got {d}");
+        // and its in-plane gradient must match the measured 0.164 rad/voxel
+        let gx = m.background.at(1.0, 0.0, 0.0) - m.background.at(0.0, 0.0, 0.0);
+        let gy = m.background.at(0.0, 1.0, 0.0) - m.background.at(0.0, 0.0, 0.0);
+        let g = (gx * gx + gy * gy).sqrt();
+        assert!((g - 0.164).abs() < 0.005, "background gradient {g}, expected ~0.164 rad/voxel");
     }
 }
