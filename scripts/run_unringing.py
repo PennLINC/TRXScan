@@ -23,6 +23,21 @@ class MethodUnavailable(RuntimeError):
     """Raised when a requested method is not installed, or is not a known method at all."""
 
 
+def _has_mrdegibbs():
+    """Both the binary AND nibabel: the adapter shells out through a temporary NIfTI.
+
+    Checking `shutil.which` alone made `available_methods()` claim mrdegibbs was usable in an
+    environment without nibabel, so the tests ran it and crashed instead of skipping.
+    """
+    if not shutil.which("mrdegibbs"):
+        return False
+    try:
+        import nibabel  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _has_dipy():
     try:
         from dipy.denoise.gibbs import gibbs_removal  # noqa: F401
@@ -44,7 +59,7 @@ def _has_rpg():
 def available_methods():
     """Which methods can actually run here. `none` is always present."""
     out = ["none"]
-    if shutil.which("mrdegibbs"):
+    if _has_mrdegibbs():
         out.append("mrdegibbs")
     if _has_dipy():
         out.append("dipy")

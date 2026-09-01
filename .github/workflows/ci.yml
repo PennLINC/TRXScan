@@ -1,7 +1,7 @@
 name: CI
 
 # Added after a PR review noted that a large number of implementation defects were found only by
-# execution, never by reading. Everything here is self-contained: no datasets, no MRtrix, no DIPY.
+# execution, never by reading.
 on:
   push:
     branches: [main]
@@ -13,18 +13,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: TRXScan
+
+      # Cargo resolves OPTIONAL path dependencies too, so `../rust/trx-rs` and `../odx-rs` must
+      # exist even for the default feature set (which is pure std and uses neither). Without them
+      # the build fails at manifest resolution:
+      #   failed to read /home/runner/work/TRXScan/odx-rs/Cargo.toml
+      # Cloning the real crates rather than stubbing them keeps the dependency graph honest.
+      - name: Check out sibling path dependencies
+        run: |
+          git clone --depth 1 https://github.com/tee-ar-ex/trx-rs.git rust/trx-rs
+          git clone --depth 1 https://github.com/PennLINC/odx-rs.git odx-rs
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: TRXScan
+
       - name: Build (default features)
         run: cargo build --verbose
+        working-directory: TRXScan
       - name: Test (default features)
         run: cargo test --verbose
-      # Reported, not enforced: 34 findings, almost all pre-existing in modules this branch does
-      # not touch (microstructure, mixture, sphere). Turning it into a gate is a separate cleanup.
+        working-directory: TRXScan
+
+      # Reported, not enforced: most findings are pre-existing in modules this branch does not
+      # touch (microstructure, mixture, sphere). Making it a gate is a separate cleanup.
       - name: Clippy (advisory)
         run: cargo clippy --all-targets
+        working-directory: TRXScan
         continue-on-error: true
 
   python:
@@ -35,11 +55,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # Deliberately NOT installing nibabel, MRtrix or DIPY: the scorer, its independent
+      # cross-check and the calibration maths must stand on numpy/scipy alone. Tests needing more
+      # skip themselves via pytest.importorskip, so this run proves the core is self-contained.
       - name: Install
         run: python -m pip install --quiet numpy scipy pytest
       - name: Test
-        # Self-contained: data-dependent tests skip themselves when the truth bundle, MRtrix or
-        # DIPY are absent, so the scorer, its independent cross-check, and the calibration maths
-        # all run on a bare runner. Verified locally from the repo root, which is how pytest
-        # resolves `scripts/` onto sys.path here.
         run: python -m pytest scripts -q

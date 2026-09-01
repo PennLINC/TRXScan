@@ -1,6 +1,11 @@
 """Checks --oversample emits a sim grid that is an exact integer refinement of the acq grid."""
 import subprocess, sys, pathlib
-import nibabel as nib
+
+import pytest
+
+# Imported lazily: nibabel is not part of the self-contained CI environment, and a module-level
+# import fails at COLLECTION -- before any in-test skip guard can run.
+nib = pytest.importorskip("nibabel")
 
 
 def test_sim_grid_is_integer_refinement(tmp_path):
