@@ -32,8 +32,17 @@ def check_consistency(rows):
     """Return (ok, reasons). Each reason names a physically implausible behaviour."""
     reasons = []
     methods = sorted({r["method"] for r in rows if r["method"] != "none"})
+    # Gate on a PF-AWARE quantity. Gating on oscillatory_residual -- the Nyquist projection this
+    # module elsewhere documents as going blind under partial Fourier -- meant the PF-aware rule
+    # could be skipped precisely where PF had moved the artifact off Nyquist.
     ctl_all = sorted(r["oscillatory_residual"] for r in rows if r["method"] == "none")
     floor = (NEGLIGIBLE_RINGING_FRACTION * ctl_all[len(ctl_all) // 2]) if ctl_all else 0.0
+    # Gate on the ABSOLUTE artifact size, not a ratio: residual_energy for the control is
+    # identically 1 (its residual IS R0), so a ratio-based gate can never skip anything.
+    pe_all = sorted(r["artifact_norm_pe"] for r in rows
+                    if r["method"] == "none" and r.get("artifact_norm_pe") is not None
+                    and r.get("artifact_norm_pe") == r.get("artifact_norm_pe"))
+    pe_floor = (NEGLIGIBLE_RINGING_FRACTION * pe_all[len(pe_all) // 2]) if pe_all else 0.0
 
     for m in methods:
         # (a) a method must beat the no-op control wherever both were run
@@ -51,21 +60,40 @@ def check_consistency(rows):
                     f"({r['oscillatory_residual']:.4f} vs {ctrl[0]['oscillatory_residual']:.4f})"
                 )
 
-        # (b) a method must remove some of the control artifact wherever there is one to remove.
-        #     residual_alignment is frequency-agnostic, so unlike the Nyquist projection it stays
-        #     valid under partial Fourier.
+        # (b) a method must not AMPLIFY the artifact -- stated as what the code enforces, not the
+        #     stronger "must remove some" an earlier comment claimed while the check was `a > 1`.
+        #     Scored on the PHASE-ENCODE axis, since that is the one partial Fourier acts on, and
+        #     gated on a PF-aware quantity so the rule is not skipped exactly where PF matters.
         for r in _by(rows, method=m):
-            a = r.get("residual_alignment")
+            a = r.get("residual_alignment_pe")
+            e = r.get("residual_energy_pe")
             if a is None or a != a:            # NaN
                 continue
             ctrl = _by(rows, method="none", pf=r["pf"], phase=r["phase"],
                        noisy=r.get("noisy", False), window=r.get("window"))
-            if not ctrl or ctrl[0]["oscillatory_residual"] < floor:
+            if not ctrl:
+                continue
+            cpe = ctrl[0].get("artifact_norm_pe")
+            if cpe is None or cpe != cpe or cpe < pe_floor:
+                continue                        # nothing to remove on this axis
+            if r.get("window") not in (None, "None"):
+                # OUT OF DOMAIN, reported not asserted. Kellner's sub-voxel shift assumes an
+                # unapodized rectangular window -- MRtrix says as much, recommending scanner
+                # filtering be disabled for best mrdegibbs performance. Measured here, mrdegibbs
+                # amplifies the PE-axis artifact ~30% on Hann-windowed data (alignment 1.18-1.31)
+                # while dipy is near-neutral (~1.00-1.07). That is a real result about the
+                # methods, so it belongs in the table; failing the suite for a method misbehaving
+                # outside its documented domain would not be.
                 continue
             if a > 1.0:
                 reasons.append(
-                    f"{m}: amplifies the control artifact at pf={r['pf']} phase={r['phase']} "
-                    f"window={r.get('window')} (alignment {a:.3f} > 1)"
+                    f"{m}: amplifies the control artifact (PE axis) at pf={r['pf']} "
+                    f"phase={r['phase']} window={r.get('window')} (alignment {a:.3f} > 1)"
+                )
+            if e is not None and e == e and e > 1.5:
+                reasons.append(
+                    f"{m}: residual energy grew {e:.2f}x on the PE axis at pf={r['pf']} "
+                    f"phase={r['phase']} window={r.get('window')}"
                 )
 
         # (b-legacy) WITHDRAWN -- the Nyquist projection alone cannot assert on the PF axis.
@@ -127,6 +155,11 @@ def run_suite(root, methods=None):
             continue
         f = json.loads(fj.read_text())
         ref_m, ref_p = _load_pair(d, "objectnominal")
+        # The artifact template is the CLEAN acquisition for BOTH rows. Using the noisy image as
+        # its own template folds thermal noise into R0, so a method that only denoises would lower
+        # residual_alignment without removing any Gibbs -- defeating the point of the paired
+        # clean/noisy emission.
+        ctl_m, ctl_p = _load_pair(d, "acquiredclean")
         for noisy in (False, True):   # both images of the SAME fixture; noise is not a grid factor
             acq_m, acq_p = _load_pair(d, "acquirednoisy" if noisy else "acquiredclean")
             for meth in methods:
@@ -137,7 +170,7 @@ def run_suite(root, methods=None):
                     continue
                 # The uncorrected acquisition is the control artifact for residual_alignment.
                 s = score(om, op, ref_m, ref_p,
-                          control_mag=acq_m, control_phase=acq_p)
+                          control_mag=ctl_m, control_phase=ctl_p)
                 rows.append({"label": f["label"], "method": meth, "pf": f["partial_fourier"],
                              "phase": f["phase"], "window": f["window"], "noisy": noisy, **s})
     return rows, sorted(set(m for m, _ in skipped))
@@ -146,18 +179,22 @@ def run_suite(root, methods=None):
 def summarise(rows):
     """Mean score per (method, pf) and per (method, phase), for the report table."""
     from collections import defaultdict
+    # Grouped by window and noise as well as pf. Averaging Hann with unwindowed, and clean with
+    # noisy, made the reported PF trend look cleaner than the underlying data supports.
     agg = defaultdict(list)
     for r in rows:
         if not r.get("edge_metrics_valid", True):
             continue          # never average NaN edge metrics into a summary row
-        agg[(r["method"], r["pf"])].append(r)
+        agg[(r["method"], r["pf"], r.get("window"), r.get("noisy", False))].append(r)
     out = []
-    for (m, pf), rs in sorted(agg.items()):
+    for (m, pf, win, noisy), rs in sorted(agg.items(), key=lambda kv: tuple(map(str, kv[0]))):
         n = len(rs)
+        ok = [r for r in rs if r.get("residual_alignment_pe") == r.get("residual_alignment_pe")]
         out.append({
-            "method": m, "pf": pf, "n": n,
+            "method": m, "pf": pf, "window": win, "noisy": noisy, "n": n,
+            "align_pe": (sum(r["residual_alignment_pe"] for r in ok) / len(ok)) if ok else float("nan"),
+            "energy_pe": (sum(r["residual_energy_pe"] for r in ok) / len(ok)) if ok else float("nan"),
             "oscillatory_residual": sum(r["oscillatory_residual"] for r in rs) / n,
-            "residual_alignment": sum(r["residual_alignment"] for r in rs) / n,
             "edge_sharpness": sum(r["edge_sharpness"] for r in rs) / n,
             "phase_rmse_masked": sum(r["phase_rmse_masked"] for r in rs) / n,
         })
@@ -183,16 +220,36 @@ def main(argv=None):
     if skipped:
         print(f"SKIPPED (not installed): {', '.join(skipped)}")
     print()
-    print(f"  {'method':<10} {'pf':>6} {'n':>4} {'oscill':>9} {'align':>7} {'sharp':>7} {'phase':>7}")
+    print(f"  {'method':<10} {'pf':>6} {'window':>6} {'noisy':>6} {'n':>3} "
+          f"{'oscill':>8} {'algn_pe':>8} {'engy_pe':>8} {'sharp':>6}")
     for r in summarise(rows):
-        print(f"  {r['method']:<10} {r['pf']:>6.3f} {r['n']:>4} "
-              f"{r['oscillatory_residual']:>9.5f} {r['residual_alignment']:>7.3f} "
-              f"{r['edge_sharpness']:>7.3f} {r['phase_rmse_masked']:>7.3f}")
+        print(f"  {r['method']:<10} {r['pf']:>6.3f} {str(r['window']):>6} "
+              f"{str(r['noisy']):>6} {r['n']:>3} "
+              f"{r['oscillatory_residual']:>8.5f} {r['align_pe']:>8.3f} "
+              f"{r['energy_pe']:>8.3f} {r['edge_sharpness']:>6.3f}")
+    # Out-of-domain observations: reported, never asserted (see rule b). Kellner's sub-voxel
+    # shift assumes an unapodized rectangular window, and MRtrix recommends disabling scanner
+    # filtering for best mrdegibbs performance -- so how these methods behave on apodized input is
+    # a real result worth tabulating, not a reason to fail the suite.
+    apod = [r for r in rows
+            if r["method"] != "none" and str(r.get("window")) not in ("None", "none")
+            and r.get("residual_alignment_pe") == r.get("residual_alignment_pe")]
+    if apod:
+        by = defaultdict(list)
+        for r in apod:
+            by[r["method"]].append(r["residual_alignment_pe"])
+        print()
+        print("  Out of domain (apodized input; Kellner assumes an unapodized rectangular window):")
+        for meth, v in sorted(by.items()):
+            mean = sum(v) / len(v)
+            note = "AMPLIFIES the PE artifact" if mean > 1.05 else "near-neutral"
+            print(f"    {meth:<10} mean PE alignment {mean:.3f}   {note}")
+
     ok, reasons = check_consistency(rows)
     print()
     # Narrower than it looks: the PF axis is descriptive only (see the module docstring), so
     # this is full-Fourier / Nyquist-component acceptance, not a PF-validated result.
-    print("ACCEPTANCE:", "PASS (all PF conditions measured via residual_alignment; RPG absent)" if ok else "FAIL")
+    print("ACCEPTANCE:", "PASS (unapodized in-domain; PF measured on the PE axis; RPG absent)" if ok else "FAIL")
     for x in reasons[:12]:
         print("  -", x)
     return 0 if ok else 1

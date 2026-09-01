@@ -7,10 +7,13 @@ import pytest
 from acceptance import check_consistency
 
 
-def _row(method, pf, phase, osc, sharp=1.0, phase_err=0.0, noisy=False, window="None"):
+def _row(method, pf, phase, osc, sharp=1.0, phase_err=0.0, noisy=False, window="None",
+         align_pe=0.3, energy_pe=0.5, artifact_pe=0.04):
     return {"method": method, "pf": pf, "phase": phase, "noisy": noisy, "window": window,
             "oscillatory_residual": osc, "edge_sharpness": sharp,
-            "phase_rmse_masked": phase_err}
+            "phase_rmse_masked": phase_err,
+            "residual_alignment_pe": align_pe, "residual_energy_pe": energy_pe,
+            "artifact_norm_pe": artifact_pe}
 
 
 def test_partial_fourier_trend_is_reported_not_asserted():
@@ -91,5 +94,37 @@ def test_conditions_with_no_ringing_left_are_exempt_from_beating_the_control():
         _row("x", 0.75, "nophase", 0.008, sharp=0.95, window="None"),
         _row("x", 1.0, "nophase", 0.002, sharp=0.95, window="Hann"),   # worse, but exempt
     ]
+    ok, reasons = check_consistency(rows)
+    assert ok, reasons
+
+
+def test_flags_a_method_that_amplifies_the_pe_artifact():
+    """The PF rule, on the phase-encode axis, gated by the ABSOLUTE artifact norm."""
+    rows = [_row("none", 1.0, "nophase", 0.02, align_pe=1.0, energy_pe=1.0),
+            _row("x", 1.0, "nophase", 0.01, sharp=0.95, align_pe=1.4)]
+    ok, reasons = check_consistency(rows)
+    assert not ok and any("amplifies" in r for r in reasons), reasons
+
+
+def test_flags_growth_in_pe_residual_energy():
+    rows = [_row("none", 1.0, "nophase", 0.02, align_pe=1.0, energy_pe=1.0),
+            _row("x", 1.0, "nophase", 0.01, sharp=0.95, align_pe=0.4, energy_pe=2.0)]
+    ok, reasons = check_consistency(rows)
+    assert not ok and any("energy grew" in r for r in reasons), reasons
+
+
+def test_apodized_rows_are_out_of_domain_and_never_fail():
+    """Kellner assumes an unapodized rectangular window; misbehaviour outside that is reported."""
+    rows = [_row("none", 1.0, "nophase", 0.02, window="Hann", align_pe=1.0),
+            _row("x", 1.0, "nophase", 0.01, sharp=0.95, window="Hann", align_pe=1.4, energy_pe=2.0)]
+    ok, reasons = check_consistency(rows)
+    assert ok, reasons
+
+
+def test_pe_gate_skips_when_the_absolute_artifact_is_negligible():
+    """Gating on residual_energy could never skip: the control's ratio is 1.0 by construction."""
+    rows = [_row("none", 1.0, "nophase", 0.02, align_pe=1.0, energy_pe=1.0, artifact_pe=0.04),
+            _row("none", 0.75, "nophase", 0.02, align_pe=1.0, energy_pe=1.0, artifact_pe=0.0001),
+            _row("x", 0.75, "nophase", 0.01, sharp=0.95, align_pe=9.0, artifact_pe=0.0001)]
     ok, reasons = check_consistency(rows)
     assert ok, reasons

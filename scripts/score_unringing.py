@@ -11,7 +11,8 @@ on `edge_sharpness`; a genuine unringer does well on both.
 """
 import numpy as np
 
-__all__ = ["score", "residual_alignment", "dominant_axis"]
+__all__ = ["score", "residual_alignment", "residual_energy_ratio", "artifact_norm",
+           "dominant_axis", "READOUT_AXIS", "PHASE_ENCODE_AXIS"]
 
 
 def dominant_axis(ref):
@@ -28,9 +29,16 @@ def dominant_axis(ref):
         if a.shape[k] < 2:
             continue
         v = float(np.abs(np.diff(a, axis=k)).mean())
-        if v > best:
+        if v > best + 1e-12:            # strict, so an exact tie keeps the FIRST axis
             best, ax = v, k
     return ax
+
+
+# Axis convention for simulator output: 0 = readout (x), 1 = phase-encode (y).
+# Partial Fourier undersamples ky, so anything PF-related must be scored on AXIS 1. Auto-selection
+# cannot be trusted for that: the benchmark phantom is a symmetric box, its two gradient means tie
+# exactly, and the tie-break silently decides which physics you measure.
+READOUT_AXIS, PHASE_ENCODE_AXIS = 0, 1
 
 
 def _to_last(a, axis):
@@ -176,6 +184,65 @@ def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bri
     return float(abs(np.sum(a * np.conj(b))) / denom)
 
 
+def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, bright=0.5):
+    """`||Rm|| / ||R0||` over the same sidelobe region as [`residual_alignment`].
+
+    Alignment alone is a PROJECTION: zero means the residual is orthogonal to the original artifact
+    template, not that it is gone. A method could preserve substantial residual energy while
+    shifting or reshaping the pattern and still score near zero. Reporting both makes that much
+    harder to hit by accident -- energy says how much error remains at all, alignment says how much
+    of the original artifact pattern remains.
+    """
+    est, ref, control = (np.asarray(a) for a in (est, ref, control))
+    if axis is None:
+        axis = dominant_axis(np.abs(ref))
+    est, ref, control = (np.moveaxis(a, axis, -1) for a in (est, ref, control))
+    rp = _profiles(np.abs(ref))
+    dr = np.abs(np.diff(rp, axis=-1))
+    if dr.size == 0 or dr.max() <= 0:
+        return float("nan")
+    peak = int(np.argmax(dr.sum(axis=0)))
+    lo, hi = max(0, peak - half_width), min(rp.shape[-1], peak + half_width + 1)
+    idx = np.arange(lo, hi)
+    idx = idx[np.abs(idx - peak) > guard]
+    rmax = float(rp.max())
+    if idx.size == 0 or rmax <= 0:
+        return float("nan")
+    keep = rp[:, idx] > bright * rmax
+    rm = _profiles(est - ref)[:, idx] * keep
+    r0 = _profiles(control - ref)[:, idx] * keep
+    den = float(np.sqrt(np.sum(np.abs(r0) ** 2)))
+    if den <= 0:
+        return float("nan")
+    return float(np.sqrt(np.sum(np.abs(rm) ** 2)) / den)
+
+
+def artifact_norm(ref, control, axis, half_width=10, guard=2, bright=0.5):
+    """`||R0||` -- the ABSOLUTE size of the uncorrected artifact in the sidelobe region.
+
+    Needed as an acceptance gate. `residual_energy_ratio` cannot serve: for the control itself
+    `Rm == R0`, so its ratio is identically 1 no matter how little artifact there is, and a gate
+    built on it never skips anything. This is the quantity that actually distinguishes "apodized,
+    almost nothing to remove" from "unapodized, plenty to remove".
+    """
+    ref, control = np.moveaxis(np.asarray(ref), axis, -1), np.moveaxis(np.asarray(control), axis, -1)
+    rp = _profiles(np.abs(ref))
+    dr = np.abs(np.diff(rp, axis=-1))
+    if dr.size == 0 or dr.max() <= 0:
+        return float("nan")
+    peak = int(np.argmax(dr.sum(axis=0)))
+    lo, hi = max(0, peak - half_width), min(rp.shape[-1], peak + half_width + 1)
+    idx = np.arange(lo, hi)
+    idx = idx[np.abs(idx - peak) > guard]
+    rmax = float(rp.max())
+    if idx.size == 0 or rmax <= 0:
+        return float("nan")
+    keep = rp[:, idx] > bright * rmax
+    r0 = _profiles(control - ref)[:, idx] * keep
+    n = int(keep.sum())
+    return float(np.sqrt(np.sum(np.abs(r0) ** 2) / n)) if n else float("nan")
+
+
 def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
           control_mag=None, control_phase=None):
     """Decompose the error of `est` against the artifact-free reference `ref`.
@@ -189,6 +256,13 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
     ref_phase = np.asarray(ref_phase, float)
     if est_mag.shape != ref_mag.shape:
         raise ValueError(f"shape mismatch: {est_mag.shape} vs {ref_mag.shape}")
+    # Keep the ORIGINAL orientation for the per-axis metrics below. Reusing the reoriented arrays
+    # while leaving `control_*` untouched compared a transposed estimate against an untransposed
+    # control, and the control's own alignment -- which is 1.0 by construction -- came out 0.24
+    # whenever the auto-axis resolved to 0.
+    est_mag_in, est_phase_in = est_mag, est_phase
+    ref_mag_in, ref_phase_in = ref_mag, ref_phase
+
     # Orient so the varying axis is last, since every metric below works along axis -1.
     if axis is None:
         axis = dominant_axis(ref_mag)
@@ -232,17 +306,35 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
     else:
         phase_rmse = np.nan
 
-    # PF-aware, frequency-agnostic companion to the Nyquist projection.
-    if control_mag is not None and control_phase is not None and edge_valid:
-        zc = (_to_last(np.asarray(control_mag, float), axis)
-              * np.exp(1j * _to_last(np.asarray(control_phase, float), axis)))
-        alignment = residual_alignment(ze, zr, zc, axis=-1)
+    # PF-aware, frequency-agnostic companions to the Nyquist projection. Reported PER AXIS:
+    # readout and phase-encode are different physics under partial Fourier, and collapsing them
+    # onto one auto-selected axis silently measured readout for a symmetric phantom.
+    per_axis = {}
+    if control_mag is not None and control_phase is not None:
+        cm = np.asarray(control_mag, float)
+        cp = np.asarray(control_phase, float)
+        zc_raw = cm * np.exp(1j * cp)
+        ze_raw = np.asarray(est_mag_in, float) * np.exp(1j * np.asarray(est_phase_in, float))
+        zr_raw = np.asarray(ref_mag_in, float) * np.exp(1j * np.asarray(ref_phase_in, float))
+        for name, ax in (("ro", READOUT_AXIS), ("pe", PHASE_ENCODE_AXIS)):
+            if zr_raw.ndim <= ax:
+                continue
+            per_axis[f"residual_alignment_{name}"] = residual_alignment(
+                ze_raw, zr_raw, zc_raw, axis=ax)
+            per_axis[f"residual_energy_{name}"] = residual_energy_ratio(
+                ze_raw, zr_raw, zc_raw, axis=ax)
+            per_axis[f"artifact_norm_{name}"] = artifact_norm(zr_raw, zc_raw, axis=ax)
+        # Unsuffixed key keeps the auto-selected axis, for 1D fixtures and general use. The
+        # _ro / _pe pair is what the benchmark must consult, because auto-selection is undefined
+        # on a symmetric phantom.
+        alignment = residual_alignment(ze_raw, zr_raw, zc_raw, axis=axis)
     else:
         alignment = float("nan")
 
     return {
         "edge_metrics_valid": bool(edge_valid),
         "residual_alignment": alignment,
+        **per_axis,
         "oscillatory_residual": oscillatory,
         "edge_location_bias": float(bias),
         "edge_sharpness": sharpness,

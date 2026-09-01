@@ -29,11 +29,17 @@ def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5):
     return out
 
 
-def naive_oscillatory(est, ref):
-    """Nyquist amplitude by explicit Python loops over rows. `est`/`ref` are complex 2D arrays."""
+def naive_oscillatory(est, ref, axis=None):
+    """Nyquist amplitude by explicit Python loops over rows. `est`/`ref` are complex 2D arrays.
+
+    `axis` must be given for any phantom whose gradients tie -- the benchmark's symmetric box does,
+    and this implementation's tie-break historically chose axis 1 while the primary chose axis 0.
+    That disagreement was invisible while the fixtures were all one-dimensional.
+    """
     est, ref = np.asarray(est), np.asarray(ref)
-    axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
-        np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
+    if axis is None:
+        axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
+            np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
     if axis == 0:
         est, ref = est.T, ref.T
     tot, rows = 0.0, 0
@@ -50,11 +56,12 @@ def naive_oscillatory(est, ref):
     return float(np.sqrt(tot / rows)) if rows else float("nan")
 
 
-def naive_alignment(est, ref, control):
-    """`|<Rm, R0>| / ||R0||^2` by explicit loops."""
+def naive_alignment(est, ref, control, axis=None):
+    """`|<Rm, R0>| / ||R0||^2` by explicit loops. See `naive_oscillatory` on `axis`."""
     est, ref, control = (np.asarray(a) for a in (est, ref, control))
-    axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
-        np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
+    if axis is None:
+        axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
+            np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
     if axis == 0:
         est, ref, control = est.T, ref.T, control.T
     num, den = 0j, 0.0
@@ -68,14 +75,19 @@ def naive_alignment(est, ref, control):
     return float(abs(num) / den) if den > 0 else float("nan")
 
 
-def compare_scorers(est, ref, control, rtol=0.02, atol=1e-6):
-    """Run both implementations; return (agree, detail)."""
+def compare_scorers(est, ref, control, rtol=0.02, atol=1e-6, axis=None):
+    """Run both implementations; return (agree, detail).
+
+    Pass `axis` explicitly for phantoms whose gradients tie -- otherwise the two implementations
+    may silently score different physics and still "agree" on a one-dimensional fixture.
+    """
     from score_unringing import residual_alignment, score
     s = score(np.abs(est), np.angle(est), np.abs(ref), np.angle(ref),
-              control_mag=np.abs(control), control_phase=np.angle(control))
+              control_mag=np.abs(control), control_phase=np.angle(control), axis=axis)
+    key = {0: "residual_alignment_ro", 1: "residual_alignment_pe"}.get(axis, "residual_alignment")
     pairs = [
-        ("oscillatory_residual", s["oscillatory_residual"], naive_oscillatory(est, ref)),
-        ("residual_alignment", s["residual_alignment"], naive_alignment(est, ref, control)),
+        ("oscillatory_residual", s["oscillatory_residual"], naive_oscillatory(est, ref, axis)),
+        (key, s[key], naive_alignment(est, ref, control, axis)),
     ]
     bad = []
     for name, a, b in pairs:

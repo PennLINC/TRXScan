@@ -6,7 +6,6 @@ use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
 use trxscan::compartments::{
-    generate_compartments,
     generate_compartments_moving, generate_mixture, signal_from_mixture, CompartmentParams,
 };
 use trxscan::io;
@@ -199,6 +198,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kappa = cli.kappa.filter(|k| *k > 0.0);
 
     let (tissue, grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
+
+    // The signal stage runs on ONE grid, chosen here. With --oversample > 1 that is the finer
+    // simulation grid; the acquisition grid still defines the output matrix. Building the nominal
+    // `comp` and then discarding it would silently drop motion, SIFT2 weights, kappa, myelin and
+    // dropout -- and waste a full Stage A -- which is exactly what an earlier version did.
+    let (sig_tissue, sig_grid, sig_fmap_path) = if cli.oversample > 1 {
+        let need = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
+            o.clone().ok_or_else(|| format!(
+                "--oversample {} requires --{n}; generate the simulation grid with \
+                 scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
+                 acquisition-grid maps would add no k-space content and produce no ringing.",
+                cli.oversample, cli.oversample))
+        };
+        let (st, sg) = io::load_tissue(
+            &need(&cli.sim_wm, "sim-wm")?, &need(&cli.sim_gm, "sim-gm")?,
+            &need(&cli.sim_csf, "sim-csf")?, &need(&cli.sim_mask, "sim-mask")?)?;
+        let o = cli.oversample;
+        if sg.dims != [grid.dims[0] * o, grid.dims[1] * o, grid.dims[2]] {
+            return Err(format!(
+                "simulation grid {:?} is not {o}x the acquisition grid {:?} in-plane \
+                 (z is never oversampled)", sg.dims, grid.dims).into());
+        }
+        (st, sg, need(&cli.sim_fmap, "sim-fmap")?)
+    } else {
+        (tissue, grid.clone(), cli.fmap.clone())
+    };
     let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
     if let Some(n) = cli.subsample {
@@ -210,8 +235,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fgrid.dims != grid.dims {
         return Err(format!("fieldmap grid {:?} != tissue grid {:?}", fgrid.dims, grid.dims).into());
     }
-    println!("grid {:?}  {} streamlines  {} volumes  shells {:?}", grid.dims,
-        offsets.len().saturating_sub(1), scheme.len(), scheme.shells(50.0));
+    println!("acquisition grid {:?}  signal grid {:?}  {} streamlines  {} volumes  shells {:?}",
+        grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
+        scheme.shells(50.0));
 
     let base = cli.params.params();
     println!("compartment params: {}  T2 fiber/gm/csf {}/{}/{} ms",
@@ -230,16 +256,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let moved = poses.iter().filter(|p| **p != motion::Pose::IDENTITY).count();
         println!("Motion (faithful re-simulation): {} poses, {} moved, from {}",
             poses.len(), moved, tsv.display());
-        generate_compartments_moving(&grid, &positions, &offsets, &tissue, &scheme, &params, &poses)
+        generate_compartments_moving(
+            &sig_grid, &positions, &offsets, &sig_tissue, &scheme, &params, &poses)
     } else {
         let mut mix = generate_mixture(
-            &grid, &positions, &offsets, weights.as_deref(), &tissue, &params, kappa,
+            &sig_grid, &positions, &offsets, weights.as_deref(), &sig_tissue, &params, kappa,
             HemiSphere::icosphere(3),
         );
         if let Some(mp) = &cli.myelin {
             let (my, mgrid) = io::load_volume(mp)?;
-            if mgrid.dims != grid.dims {
-                return Err(format!("myelin grid {:?} != tissue grid {:?}", mgrid.dims, grid.dims).into());
+            if mgrid.dims != sig_grid.dims {
+                return Err(format!(
+                    "myelin grid {:?} != signal grid {:?}. With --oversample > 1 the myelin map \
+                     must be on the SIMULATION grid.", mgrid.dims, sig_grid.dims).into());
             }
             println!("myelin map: {} (per-voxel lerp to adult endpoint)", mp.display());
             mix.myelin = Some(my);
@@ -258,11 +287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
     if cli.mb > 1 && cli.dropout_rate > 0.0 {
-        let n_shots = (grid.dims[2] / cli.mb).max(1);
+        let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
         let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate,
             0xB10C_5EED ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let gt = motion::apply_multiband_motion(
-            &mut comp.images, grid.dims, comp.ngrad, grid.voxel_to_world,
+            &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world,
             cli.mb, true, &scheme.bvals, scheme.b_max, &events);
         let mut tsv = String::from("volume\tshot\tslices\tattenuation\n");
         for d in &gt {
@@ -315,49 +344,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (mag, phase) = if cli.oversample > 1 {
-        // Production path: finer object -> nominal band -> reconstruction at the acquisition
-        // matrix. This is what makes ringing intrinsic (spec 3.1) and the object complex (3.2).
-        let need = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
-            o.clone().ok_or_else(|| format!(
-                "--oversample {} requires --{n}; generate the simulation grid with \
-                 scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
-                 acquisition-grid maps would add no k-space content and produce no ringing.",
-                cli.oversample, cli.oversample))
-        };
-        let (sim_tissue, sim_grid) = io::load_tissue(
-            &need(&cli.sim_wm, "sim-wm")?, &need(&cli.sim_gm, "sim-gm")?,
-            &need(&cli.sim_csf, "sim-csf")?, &need(&cli.sim_mask, "sim-mask")?)?;
-        let (sim_fmap, sim_fgrid) = io::load_volume(&need(&cli.sim_fmap, "sim-fmap")?)?;
-        let o = cli.oversample;
-        if sim_grid.dims != [grid.dims[0] * o, grid.dims[1] * o, grid.dims[2]] {
-            return Err(format!(
-                "simulation grid {:?} is not {o}x the acquisition grid {:?} in-plane (z is never \
-                 oversampled)", sim_grid.dims, grid.dims).into());
-        }
-        if sim_fgrid.dims != sim_grid.dims {
-            return Err(format!("sim fieldmap grid {:?} != sim tissue grid {:?}",
-                               sim_fgrid.dims, sim_grid.dims).into());
+        // `comp` was already built on the simulation grid above, so motion, SIFT2 weights, kappa,
+        // myelin and dropout all apply here exactly as they do on the nominal path.
+        let (sim_fmap, sim_fgrid) = io::load_volume(&sig_fmap_path)?;
+        if sim_fgrid.dims != sig_grid.dims {
+            return Err(format!("sim fieldmap grid {:?} != simulation grid {:?}",
+                               sim_fgrid.dims, sig_grid.dims).into());
         }
         // Pre-flight memory estimate. Stage A holds comp.images = nvox * ngrad * ncomp * 4 bytes,
-        // and in-plane voxels scale as o^2 -- so o=4 is 16x the acquisition grid, not 4x. Measured
-        // 13.04 GB peak for a 107x151x104 / 75-volume / 3-compartment run at o=4, which OOMs a
-        // 16 GB machine. Warn loudly rather than dying halfway through Stage A.
-        let sim_vox = sim_grid.dims.iter().product::<usize>() as f64;
-        let est_gb = sim_vox * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
+        // and in-plane voxels scale as o^2 -- o=4 is 16x the acquisition grid, not 4x. Measured
+        // 13.04 GB peak for 107x151x104 / 75 volumes / 3 compartments at o=4.
+        let est_gb = sig_grid.dims.iter().product::<usize>() as f64
+            * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
         if est_gb > 8.0 {
             eprintln!(
-                "WARNING: Stage A will hold roughly {est_gb:.1} GB for the simulation grid {:?} \
-                 ({} volumes). In-plane memory scales as o^2, so halving --oversample quarters \
-                 this. If the machine has less RAM, use --oversample 2 (accuracy cost: residual \
-                 rises from ~4.5% to ~15.6% of the artifact) or wait for z-slab streaming.",
-                sim_grid.dims, scheme.len());
+                "WARNING: the signal stage holds roughly {est_gb:.1} GB on grid {:?} ({} volumes). \
+                 In-plane memory scales as o^2, so halving --oversample quarters it. On limited \
+                 RAM use --oversample 2 (residual rises from ~4.5% to ~15.6% of the artifact).",
+                sig_grid.dims, scheme.len());
         }
-        println!("Stage A on the simulation grid {:?} (o={o})", sim_grid.dims);
-        let sim_comp = generate_compartments(
-            &sim_grid, &positions, &offsets, &sim_tissue, &scheme, &params);
-        println!("Stage B (oversampled: intrinsic Gibbs + object phase '{}')", cli.phase_model);
+        println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
+                 cli.oversample, cli.phase_model);
         simulate_acquisition_oversampled(
-            sim_grid.dims, grid.dims, sim_comp.ngrad, &sim_comp.images, &sim_comp.t2,
+            sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
             &sim_fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
     } else {
         eprintln!(

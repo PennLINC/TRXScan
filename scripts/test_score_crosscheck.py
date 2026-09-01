@@ -41,3 +41,75 @@ def test_naive_alignment_matches_its_definition_exactly():
 def test_naive_oscillatory_is_zero_for_perfect_recovery():
     ref = _edge()
     assert naive_oscillatory(ref, ref) < 1e-12
+
+
+def _box(n=64, o=4, ring=True):
+    """The benchmark's symmetric 2D box, k-space cropped -- edges on BOTH axes.
+
+    This is the fixture whose gradient means tie exactly, so it is the one that exposes an
+    axis-selection disagreement. Every earlier cross-check fixture was one-dimensional and
+    therefore could not.
+    """
+    N = n * o
+    q = N // 4
+    obj = np.zeros((N, N))
+    obj[q:3 * q, q:3 * q] = 1.0
+    if not ring:
+        return obj[::o, ::o].astype(complex)
+    K = np.fft.fftshift(np.fft.fft2(obj))
+    c = K[N // 2 - n // 2:N // 2 + n // 2, N // 2 - n // 2:N // 2 + n // 2] / (o * o)
+    return np.fft.ifft2(np.fft.ifftshift(c))
+
+
+def test_symmetric_box_gradients_tie_so_the_axis_must_be_explicit():
+    box = np.abs(_box(ring=False))
+    gx = np.abs(np.diff(box, axis=0)).mean()
+    gy = np.abs(np.diff(box, axis=1)).mean()
+    assert abs(gx - gy) < 1e-12, f"expected an exact tie, got {gx} vs {gy}"
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_implementations_agree_on_the_2d_box_per_axis(axis):
+    """Both scorers, both axes, on the actual benchmark phantom.
+
+    Without an explicit axis the primary broke the tie to axis 0 and the naive one to axis 1, so
+    they measured different physics while every one-dimensional test still passed.
+    """
+    ref = _box(ring=False)
+    ctl = _box(ring=True)
+    est = ref + 0.4 * (ctl - ref)
+    ok, detail = compare_scorers(est, ref, ctl, axis=axis)
+    assert ok, f"axis {axis}: {detail}"
+
+
+def test_partial_fourier_breaks_the_axis_symmetry_of_the_box():
+    """PF acts on ky only, so it must break the box's exact readout/phase-encode symmetry.
+
+    An earlier version of this test asserted `energy_pe > energy_ro`, on the assumption that PF
+    "shows up more on phase-encode". That is measurably false here: zero-filled PF trades ringing
+    for blur along PE, and the blur sits at the edge, which the sidelobe guard excludes. Measured
+    artifact norms are ro 0.0828 / pe 0.0757 -- PF makes the READOUT axis worse on this metric.
+
+    What is defensible, and is what the per-axis machinery exists to detect, is that a symmetric
+    box has exactly equal artifact on both axes under full Fourier, and PF destroys that equality.
+    """
+    from score_unringing import artifact_norm
+    n, o = 64, 4
+    N = n * o
+    q = N // 4
+    obj = np.zeros((N, N))
+    obj[q:3 * q, q:3 * q] = 1.0
+    K = np.fft.fftshift(np.fft.fft2(obj))
+    c = K[N // 2 - n // 2:N // 2 + n // 2, N // 2 - n // 2:N // 2 + n // 2] / (o * o)
+    ref = obj[::o, ::o].astype(complex)
+
+    full = np.fft.ifft2(np.fft.ifftshift(c))
+    ro_f, pe_f = artifact_norm(ref, full, 0), artifact_norm(ref, full, 1)
+    assert abs(ro_f - pe_f) < 1e-9, f"symmetric box must be axis-symmetric: {ro_f} vs {pe_f}"
+
+    pf = c.copy()
+    pf[:, : int(n * 0.25)] = 0                    # drop low-ky lines: PF along axis 1
+    pf_img = np.fft.ifft2(np.fft.ifftshift(pf))
+    ro_p, pe_p = artifact_norm(ref, pf_img, 0), artifact_norm(ref, pf_img, 1)
+    assert abs(ro_p - pe_p) > 0.05 * ro_f, (
+        f"PF must break the symmetry: ro={ro_p:.5f} pe={pe_p:.5f} (full {ro_f:.5f})")
