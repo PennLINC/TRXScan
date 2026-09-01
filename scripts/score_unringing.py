@@ -92,29 +92,28 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.0):
     # differ by the sinc-vs-box PSF regardless of ringing, and an unringer makes the transition
     # SOFTER, enlarging the difference exactly there. Including the edge ranked both real methods
     # worse than doing nothing despite each cutting plateau ripple 76-88%.
-    idx = _sidelobe_indices(dr.sum(axis=0), dp.shape[-1], half_width, guard)
-    if idx.size == 0:
+    runs = sidelobe_runs(dr.sum(axis=0), dp.shape[-1], half_width, guard)
+    if not runs:
         return 0.0
     rp = _profiles(np.abs(ref))
     rmax = float(rp.max()) if rp.size else 0.0
     if rmax <= 0:
         return 0.0
-    # A row participates if it CROSSES AN EDGE, not if it is bright: with bright = 0 the two
-    # differ, and a `> 0.0` test silently drops exact zeros -- the dark side we now want.
     crosses = np.abs(np.diff(rp, axis=-1)).max(axis=-1) > 1e-12
-    keep = (np.ones_like(rp[:, idx], bool) if bright <= 0.0 else rp[:, idx] > bright * rmax)
-    keep = keep & crosses[:, None]
-    w = dp[:, idx] * keep
-    n = keep.sum(axis=-1)
-    good = n > 0
-    if not good.any():
-        return 0.0
-    alt = (-1.0) ** idx
-    proj = (w[good] * alt).sum(axis=-1) / n[good]
-    # |.|^2 so the measure is invariant to a global complex rotation of object and residual.
-    return float(np.sqrt((np.abs(proj) ** 2).mean()))
-
-
+    # One projection PER RUN, magnitude taken before aggregation -- see `sidelobe_runs`.
+    acc, cnt = 0.0, 0
+    for idx in runs:
+        keep = (np.ones((rp.shape[0], idx.size), bool) if bright <= 0.0
+                else rp[:, idx] > bright * rmax) & crosses[:, None]
+        n = keep.sum(axis=-1)
+        good = n > 0
+        if not good.any():
+            continue
+        alt = (-1.0) ** idx
+        proj = ((dp[:, idx] * keep)[good] * alt).sum(axis=-1) / n[good]
+        acc += float(np.sum(np.abs(proj) ** 2))
+        cnt += int(good.sum())
+    return float(np.sqrt(acc / cnt)) if cnt else 0.0
 
 def physical_edges(grad_profile, thr_frac=0.35):
     """Centroids of the PHYSICAL edges in a gradient profile, one per edge.
@@ -147,6 +146,31 @@ def physical_edges(grad_profile, thr_frac=0.35):
     return edges or [float(np.argmax(g))]
 
 
+def sidelobe_runs(grad_profile, n, half_width=10, guard=2):
+    """Sidelobe index runs, ONE PER SIDE OF EACH physical edge.
+
+    Gibbs is ANTISYMMETRIC about an edge: it overshoots on one side and undershoots on the other.
+    Projecting both sides onto a single global `(-1)**x` and summing therefore annihilates it --
+    measured on a real fixture, the dark side projects to +0.01936 and the bright side to -0.01936,
+    summing to exactly zero. That is what made `oscillatory_residual` collapse once the round-4
+    change started including both sides.
+
+    So each run is kept separate; callers project within a run, take the magnitude, and only then
+    aggregate. `physical_edges` already collapses gradient plateaus to one edge, so a box yields
+    four runs per axis: two edges, two sides each.
+    """
+    runs = []
+    for c in physical_edges(grad_profile):
+        p = int(np.floor(c + 0.5))
+        lo, hi = max(0, p - half_width), min(n, p + half_width + 1)
+        left = np.arange(lo, min(hi, p - guard))
+        right = np.arange(max(lo, p + guard + 1), hi)
+        for r in (left, right):
+            if r.size:
+                runs.append(r)
+    return runs
+
+
 def _sidelobe_indices(grad_profile, n, half_width, guard):
     """Sidelobe indices around EVERY significant edge, not just the strongest.
 
@@ -155,7 +179,10 @@ def _sidelobe_indices(grad_profile, n, half_width, guard):
     two phase-encode edges need not have equivalent sidelobes -- so measuring one of them measures
     half the artifact.
     """
-    peaks = [int(round(c)) for c in physical_edges(grad_profile)]
+    # floor(c + 0.5), not round(): Python rounds half to EVEN, so a centroid of 2.5 becomes 2
+    # while the partial-volume voxel is 3. Parity-dependent, and trxscan-benchmark accepts
+    # arbitrary matrix sizes, so which way it lands is not fixed.
+    peaks = [int(np.floor(c + 0.5)) for c in physical_edges(grad_profile)]
     if not peaks:
         return np.arange(0)
     keep = np.zeros(n, bool)
@@ -173,9 +200,30 @@ def _profiles(a):
 
 
 def _sharpness(a):
-    """Mean peak absolute gradient across profiles: the resolution proxy."""
+    """Mean peak absolute gradient across profiles: the resolution proxy.
+
+    Whole-profile maximum, so it is dominated by the sharpest edge. Use `_sharpness_per_edge` for
+    acceptance: a method can blur one edge of a box while leaving the other sharp, and this scalar
+    would not notice.
+    """
     d = np.abs(np.diff(_profiles(a), axis=-1))
     return float(d.max(axis=-1).mean()) if d.size else 0.0
+
+
+def _sharpness_per_edge(est, ref, half_width=8):
+    """Sharpness ratio per PHYSICAL edge, so an asymmetric blur cannot hide behind a sharp edge."""
+    de = np.abs(np.diff(_profiles(est), axis=-1))
+    dr = np.abs(np.diff(_profiles(ref), axis=-1))
+    if dr.size == 0 or dr.max() <= 0:
+        return []
+    out = []
+    for c in physical_edges(dr.sum(axis=0)):
+        p = int(np.floor(c + 0.5))
+        lo, hi = max(0, p - half_width), min(dr.shape[-1], p + half_width + 1)
+        r = float(dr[:, lo:hi].max(axis=-1).mean())
+        e = float(de[:, lo:hi].max(axis=-1).mean())
+        out.append(e / r if r > 0 else float("nan"))
+    return out
 
 
 def _edge_shifts(est, ref, half_width=8):
@@ -190,7 +238,7 @@ def _edge_shifts(est, ref, half_width=8):
     if dr.size == 0 or dr.max() <= 0:
         return []
     x = np.arange(dr.shape[-1]) + 0.5
-    peaks = [int(round(c)) for c in physical_edges(dr.sum(axis=0))]
+    peaks = [int(np.floor(c + 0.5)) for c in physical_edges(dr.sum(axis=0))]
     if not peaks:
         return []
     out = []
@@ -419,6 +467,13 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
             rs = _sharpness(rm_)
             per_axis[f"edge_sharpness_{name}"] = (
                 float(_sharpness(em) / rs) if rs > 0 else float("nan"))
+            pe_sharp = _sharpness_per_edge(em, rm_) if rs > 0 else []
+            per_axis[f"edge_sharpness_{name}_per_edge"] = pe_sharp
+            # Acceptance uses the WORST edge: a method must not buy ringing reduction by blurring
+            # any single boundary.
+            per_axis[f"edge_sharpness_{name}_worst"] = (
+                float(min(v for v in pe_sharp if v == v)) if any(v == v for v in pe_sharp)
+                else float("nan"))
             per_axis[f"edge_location_bias_{name}"] = (
                 _edge_shift(em, rm_) if rs > 0 else float("nan"))
             per_axis[f"edge_location_bias_{name}_per_edge"] = (

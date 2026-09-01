@@ -274,8 +274,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let nvox = sig_grid.dims.iter().product::<usize>() as f64;
         let ngrad = scheme.len() as f64;
         let images_gb = nvox * ngrad * 3.0 * 4.0 / 1e9;
+        // Rayon's actual pool size when it is running the show, since RAYON_NUM_THREADS may
+        // differ from the machine's parallelism; available_parallelism is only the fallback.
         let workers = if cfg!(feature = "par") {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64
+            std::env::var("RAYON_NUM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1) as f64
         } else {
             1.0
         };
@@ -291,13 +297,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The motion path's figure already includes the images; the mixture path's does not.
         let bound = if cli.motion.is_some() { dominant_gb } else { dominant_gb + images_gb };
         if bound > 8.0 {
+            // The caveat differs by path and must not be copied across: only the mixture path's
+            // dense histogram commits lazily.
+            let caveat = if cli.motion.is_some() {
+                "These arrays are densely written, so committed memory tracks the bound closely -- \
+                 unlike the no-motion histogram, this does not benefit from sparse page commitment."
+            } else {
+                "Committed memory is DATA-DEPENDENT and usually lower: the histogram faults in \
+                 only where streamlines deposit, and an o=2 run of this size measured 11.5 GB \
+                 against a 25.9 GB bound. Treat 16 GB as tight, not safe."
+            };
             eprintln!(
                 "WARNING: signal stage upper bound about {bound:.1} GB on grid {:?} \
                  ({dominant_gb:.1} GB {what}; compartment images {images_gb:.1} GB; {} volumes).\n\
-                 \x20        Committed memory is DATA-DEPENDENT and usually lower -- the histogram \
-                 faults in only where streamlines deposit, and an o=2 run of this size measured \
-                 11.5 GB against a 25.9 GB bound. Treat 16 GB as tight, not safe. In-plane memory \
-                 scales as o^2.",
+                 \x20        {caveat} In-plane memory scales as o^2.",
                 sig_grid.dims, scheme.len());
         }
     }

@@ -72,11 +72,11 @@ def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.0, pe
 
 
 def naive_oscillatory(est, ref, axis=None):
-    """Nyquist amplitude by explicit Python loops over rows. `est`/`ref` are complex 2D arrays.
+    """Nyquist amplitude by explicit loops, projecting each side of each edge SEPARATELY.
 
-    `axis` must be given for any phantom whose gradients tie -- the benchmark's symmetric box does,
-    and this implementation's tie-break historically chose axis 1 while the primary chose axis 0.
-    That disagreement was invisible while the fixtures were all one-dimensional.
+    Gibbs is antisymmetric about an edge, so a single projection spanning both sides cancels: on a
+    real fixture the dark side gives +0.019 and the bright side -0.019. Magnitude is taken per run
+    before aggregating. Independent of the primary, same definition.
     """
     est, ref = np.asarray(est), np.asarray(ref)
     if axis is None:
@@ -86,18 +86,26 @@ def naive_oscillatory(est, ref, axis=None):
         est, ref = est.T, ref.T
     gsum = list(np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0))
     peaks = _peak_indices(gsum)
-    tot, rows = 0.0, 0
+    n = est.shape[-1]
+    tot, cnt = 0.0, 0
     for r in range(est.shape[0]):
         rp = list(np.abs(ref[r]))
-        idx = _bright_sidelobe_indices(rp, peaks=peaks)
-        if not idx:
+        if max(abs(rp[i + 1] - rp[i]) for i in range(len(rp) - 1)) <= 1e-12:
             continue
-        acc = 0j
-        for i in idx:
-            acc += (est[r][i] - ref[r][i]) * ((-1.0) ** i)
-        tot += abs(acc / len(idx)) ** 2
-        rows += 1
-    return float(np.sqrt(tot / rows)) if rows else float("nan")
+        for p in peaks:
+            for side in ("left", "right"):
+                if side == "left":
+                    idx = [i for i in range(max(0, p - 10), p - 2)]
+                else:
+                    idx = [i for i in range(p + 3, min(n, p + 11))]
+                if not idx:
+                    continue
+                acc = 0j
+                for i in idx:
+                    acc += (est[r][i] - ref[r][i]) * ((-1.0) ** i)
+                tot += abs(acc / len(idx)) ** 2
+                cnt += 1
+    return float(np.sqrt(tot / cnt)) if cnt else float("nan")
 
 
 def naive_alignment(est, ref, control, axis=None):

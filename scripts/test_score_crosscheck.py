@@ -44,18 +44,22 @@ def test_naive_oscillatory_is_zero_for_perfect_recovery():
 
 
 def _box(n=64, o=4, ring=True):
-    """The benchmark's symmetric 2D box, k-space cropped -- edges on BOTH axes.
+    """The benchmark's box, built the way `trxscan-benchmark` builds it.
 
-    This is the fixture whose gradient means tie exactly, so it is the one that exposes an
-    axis-selection disagreement. Every earlier cross-check fixture was one-dimensional and
-    therefore could not.
+    Edges sit at `(q + 0.5)` and `(3q + 0.5)` ACQUIRED voxels, and the reference is a block MEAN --
+    both matching the Rust fixture. An earlier version placed the box on voxel boundaries and
+    point-sampled with `obj[::o, ::o]`, which produces a single-sample gradient and therefore could
+    not reproduce the partial-volume `0, 0.5, 1` plateau that made one physical edge detect as two.
+    That made `test_the_box_has_exactly_two_edges_per_axis` pass vacuously.
     """
     N = n * o
-    q = N // 4
-    obj = np.zeros((N, N))
-    obj[q:3 * q, q:3 * q] = 1.0
+    q = n // 4
+    lo, hi = (q + 0.5) * o, (3 * q + 0.5) * o
+    ax = np.arange(N)
+    cov = np.clip(np.minimum(ax + 1.0, hi) - np.maximum(ax, lo), 0.0, 1.0)
+    obj = cov[:, None] * cov[None, :]
     if not ring:
-        return obj[::o, ::o].astype(complex)
+        return obj.reshape(n, o, n, o).mean(axis=(1, 3)).astype(complex)   # block MEAN
     K = np.fft.fftshift(np.fft.fft2(obj))
     c = K[N // 2 - n // 2:N // 2 + n // 2, N // 2 - n // 2:N // 2 + n // 2] / (o * o)
     return np.fft.ifft2(np.fft.ifftshift(c))
@@ -163,3 +167,41 @@ def test_the_box_has_exactly_two_edges_per_axis():
         g = np.abs(np.diff(box, axis=axis)).sum(axis=1 - axis)
         assert len(physical_edges(g)) == 2, f"primary, axis {axis}: {physical_edges(g)}"
         assert len(_peak_indices(list(g))) == 2, f"naive, axis {axis}: {_peak_indices(list(g))}"
+
+
+def test_box_reference_really_has_partial_volume_edges():
+    """Guards the fixture itself: without a 0/0.5/1 transition the edge test proves nothing."""
+    box = np.abs(_box(ring=False))
+    row = box[box.shape[0] // 2]
+    assert np.any(np.isclose(row, 0.5, atol=0.02)), (
+        f"expected a partial-volume edge voxel, profile has {sorted(set(np.round(row, 3)))[:5]}")
+
+
+def test_nyquist_score_does_not_cancel_across_an_edge():
+    """The round-6 blocker: Gibbs is antisymmetric about an edge.
+
+    Projecting both sides onto one global (-1)**x and summing annihilates it -- measured +0.019 on
+    the dark side and -0.019 on the bright side of the same edge. Each side must be projected
+    separately and combined in magnitude.
+    """
+    from score_unringing import _nyquist_amplitude, physical_edges, sidelobe_runs
+    ref, ctl = _box(ring=False), _box(ring=True)
+    diff = ctl - ref
+    dr = np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0)
+
+    assert len(physical_edges(dr)) == 2, "two physical edges per axis"
+    runs = sidelobe_runs(dr, ref.shape[-1])
+    assert len(runs) == 4, f"two edges x two sides = 4 runs, got {len(runs)}"
+
+    row = ref.shape[0] // 2
+    per = []
+    for idx in runs:
+        per.append(abs((diff[row][idx] * ((-1.0) ** idx)).sum() / idx.size))
+    assert all(v > 1e-3 for v in per), f"every side must carry artifact: {per}"
+
+    union = np.concatenate(runs)
+    cancelled = abs((diff[row][union] * ((-1.0) ** union)).sum() / union.size)
+    combined = _nyquist_amplitude(diff, np.abs(ref))
+    assert combined > 5 * max(cancelled, 1e-9), (
+        f"per-side aggregation {combined:.5f} must survive where the union projection "
+        f"cancels to {cancelled:.5f}")

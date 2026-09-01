@@ -851,8 +851,9 @@ more elaborate simulator.
   measurement does not. Revisit only if the acquired matrix or oversampling factor grows
   substantially.
 
-  Note this measures **Stage B**. Stage A's 4x memory (below) is a separate question and remains
-  unmeasured end-to-end, since it needs a full pipeline run against sim-grid maps.
+  Note this measures **Stage B** only. The signal stage has since been measured end-to-end at
+  11.46 GB for `o = 2` -- see the memory subsection above, which supersedes the earlier claim that
+  it was unmeasured.
 - **Motion path: cost.** `apply_multiband_motion` and `generate_compartments_moving` operate on
   `comp.images` at the grid dims and inherit both the 4x memory and the 4x rasterization cost. No
   logic change needed; cost only.
@@ -934,7 +935,8 @@ choices; this table is rewritten wholesale whenever the body changes rather than
 | Fitting `p` | Must model or exclude thermal phase noise | Magnitude SNR falls with b; naive fits bias `p` upward |
 | Motion during phases 1-4 | Disabled | 3D rotation vs. in-plane-only oversampling is unresolved until phase 9 |
 | R1 optional? | **No** | Stopping after R2 leaves the wrong Gibbs mechanism (5.1) |
-| z-slab streaming | Deferred to phase 10, measured in phase 1 | YAGNI until the measurement says otherwise |
+| z-slab streaming | **Warranted**, not deferred | The measurement said otherwise: 11.46 GB at `o = 2`, and it is the blocker on raising the default |
+| Sparse/masked orientation storage | Warranted | The dense `nvox x 321` histogram is the dominant allocation on the default path |
 
 ## 8. Disposition of the external review
 

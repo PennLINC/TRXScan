@@ -4,7 +4,7 @@ The criterion is that varying partial Fourier, phase, noise and windowing produc
 and physically consistent changes in method behaviour -- NOT that methods achieve a predetermined
 ranking. Relative quality between methods is recorded in the results table and never asserted.
 
-**Partial Fourier is now covered by `residual_alignment_pe` and `residual_energy_pe`**, , a frequency-agnostic complex metric
+**Partial Fourier is now covered by `residual_alignment_pe` and `residual_energy_pe`**, frequency-agnostic complex metric
 that measures how much of the simulator's own control artifact survives a method's output. The
 Nyquist projection remains as a specialised full-Fourier measure; PF ringing does not sit at
 Nyquist, so that one alone could not see it. RPG is still absent, so the PF-*aware method*
@@ -148,7 +148,9 @@ def check_consistency(rows):
             if str(r.get("window")) not in ("None", "none"):
                 continue                      # apodization legitimately softens edges
             for ax in ("ro", "pe"):
-                sv = r.get(f"edge_sharpness_{ax}")
+                # Worst physical edge, not the profile maximum: the latter is dominated by the
+                # sharpest edge, so blurring one boundary of a box hid behind the other.
+                sv = r.get(f"edge_sharpness_{ax}_worst", r.get(f"edge_sharpness_{ax}"))
                 if sv is not None and sv == sv and sv < SHARPNESS_FLOOR:
                     reasons.append(
                         f"{m}: {ax} edge sharpness {sv:.2f} below floor {SHARPNESS_FLOOR} at "
