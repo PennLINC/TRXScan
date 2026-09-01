@@ -10,7 +10,7 @@ use trxscan::benchmark::{
     factor_grid, gibbs_benchmark_acquisition, phase_model_for, produce_slice, PhaseKind,
 };
 use trxscan::io;
-use trxscan::kspace::{step_hires, Acquisition};
+use trxscan::kspace::{box_hires, Acquisition};
 use trxscan::raster::Grid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,9 +28,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let only = a.get(5).cloned();
 
     let (snx, sny) = (n * o, n * o);
-    // A sub-voxel-positioned edge: the offset is what makes ringing appear at all, and 0.5 puts
-    // the first sample near the continuous overshoot maximum.
-    let img = step_hires(snx, sny, (n as f64 / 2.0 + 0.5) * o as f64);
+    // A centred rectangle with sub-voxel-positioned edges on ALL FOUR sides. Edges along both
+    // axes matter: partial Fourier acts only along phase-encode, so a readout-only step would
+    // leave the whole PF axis of the factor grid inert. The +0.5 offsets put the first sample
+    // near the continuous overshoot maximum.
+    let q = n as f64 / 4.0;
+    let img = box_hires(
+        snx, sny,
+        (q + 0.5) * o as f64, (3.0 * q + 0.5) * o as f64,
+        (q + 0.5) * o as f64, (3.0 * q + 0.5) * o as f64,
+    );
     let fmap = vec![0.0f32; snx * sny];
     let grid = Grid {
         dims: [n, n, nz],

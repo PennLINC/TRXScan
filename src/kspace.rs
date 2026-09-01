@@ -225,6 +225,30 @@ pub struct SliceInput<'a> {
     pub slice_seed: u64,
 }
 
+/// A rectangle with sub-voxel-positioned edges on all four sides, with exact fractional occupancy
+/// in every boundary voxel.
+///
+/// Unlike [`step_hires`], this has edges along BOTH axes, so an artifact that acts on only one --
+/// partial Fourier, which zero-fills phase-encode lines -- actually shows up. A readout-only step
+/// leaves the whole PF axis of a factor grid inert.
+pub fn box_hires(snx: usize, sny: usize, x0: f64, x1: f64, y0: f64, y1: f64) -> Vec<f32> {
+    let cover = |lo: f64, hi: f64, a: f64, b: f64| -> f64 {
+        (hi.min(b) - lo.max(a)).clamp(0.0, 1.0)
+    };
+    let mut v = vec![0.0f32; snx * sny];
+    for y in 0..sny {
+        let fy = cover(y as f64, y as f64 + 1.0, y0, y1);
+        if fy <= 0.0 {
+            continue;
+        }
+        for x in 0..snx {
+            let fx = cover(x as f64, x as f64 + 1.0, x0, x1);
+            v[x + snx * y] = (fx * fy) as f32;
+        }
+    }
+    v
+}
+
 /// Step edge at continuous position `edge` (sim-voxel units) with exact fractional occupancy in
 /// the boundary voxel. This is the same partial-volume representation the path-length rasterizer
 /// produces for real anatomy, so it is a production code path, not a test-only fixture.
