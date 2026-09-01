@@ -13,7 +13,14 @@ Two standards, deliberately different:
 import numpy as np
 from scipy.optimize import curve_fit
 
-__all__ = ["siemens_phase_to_radians", "phase_spatial_stats", "fit_b_dependence"]
+__all__ = [
+    "siemens_phase_to_radians", "phase_spatial_stats", "fit_b_dependence",
+    "circular_sd", "WRAP_CEILING",
+]
+
+# Linear SD of a uniformly-wrapped phase. Any measurement approaching this is saturated and says
+# nothing about the underlying spread.
+WRAP_CEILING = np.pi / np.sqrt(3.0)
 
 SIEMENS_HALF_RANGE = 4096.0
 
@@ -78,7 +85,27 @@ def phase_spatial_stats(phase, mag, mask):
     return {"grad_rms": grad_rms, "corr_length_vox": corr_length, "wrap_density": wrap_density}
 
 
-def fit_b_dependence(shots, bvals, snr):
+def circular_sd(samples):
+    """Circular SD, sqrt(-2 ln R), where R is the mean resultant length.
+
+    Linear `np.std` is wrong for wrapped phase: it saturates at `WRAP_CEILING` = pi/sqrt(3) once
+    the phase is uniformly distributed, so shells whose true spread exceeds ~pi all report the same
+    number and the fitted exponent is biased DOWNWARD. Measured on NIBS, b=3000 sat at 99.4% of the
+    ceiling, and the linear fit gave p = 0.257 against a circular fit of ~0.43.
+    """
+    z = np.exp(1j * np.asarray(samples, float))
+    R = float(np.abs(z.mean()))
+    if R <= 0:
+        return np.inf
+    return float(np.sqrt(-2.0 * np.log(R)))
+
+
+def saturation_fraction(samples):
+    """How close a shell's LINEAR SD sits to the wrapped-phase ceiling. >0.9 means unusable."""
+    return float(np.std(np.asarray(samples, float)) / WRAP_CEILING)
+
+
+def fit_b_dependence(shots, bvals, snr, statistic="circular"):
     """Fit `sigma_phi(b) = a * b**p`, correcting for thermal phase noise.
 
     `shots[i]` are per-shot phase samples at `bvals[i]`; `snr[i]` is the magnitude SNR there. The
@@ -88,7 +115,12 @@ def fit_b_dependence(shots, bvals, snr):
     """
     bvals = np.asarray(bvals, float)
     snr = np.asarray(snr, float)
-    obs = np.array([float(np.std(s)) for s in shots])
+    if statistic == "circular":
+        obs = np.array([circular_sd(s) for s in shots])
+    elif statistic == "linear":
+        obs = np.array([float(np.std(s)) for s in shots])
+    else:
+        raise ValueError(f"unknown statistic {statistic!r}")
 
     lg = np.polyfit(np.log(bvals), np.log(obs), 1)
     p_naive, a_naive = float(lg[0]), float(np.exp(lg[1]))
@@ -104,4 +136,6 @@ def fit_b_dependence(shots, bvals, snr):
         "a_naive": a_naive,
         "p_naive": p_naive,
         "snr_corrected": True,
+        "statistic": statistic,
+        "saturation": [saturation_fraction(s) for s in shots],
     }

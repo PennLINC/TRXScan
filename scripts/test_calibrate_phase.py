@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from calibrate_phase import (
     siemens_phase_to_radians, phase_spatial_stats, fit_b_dependence,
+    circular_sd, WRAP_CEILING,
 )
 
 
@@ -70,3 +71,25 @@ def test_snr_correction_removes_the_upward_bias():
     assert abs(out["p"] - p_true) < 0.12, out
     assert out["p_naive"] > out["p"] + 0.05, f"naive fit should be biased upward: {out}"
     assert out["snr_corrected"] is True
+
+
+def test_linear_sd_saturates_where_circular_sd_does_not():
+    """Why the fit uses circular statistics: wrapped phase has a hard linear-SD ceiling."""
+    rng = np.random.RandomState(1)
+    tight = rng.normal(0, 0.5, 200000)
+    wide = rng.normal(0, 4.0, 200000)          # true spread well beyond pi
+    wrap = lambda a: np.angle(np.exp(1j * a))
+    assert np.std(wrap(tight)) < 0.9 * WRAP_CEILING
+    assert np.std(wrap(wide)) > 0.97 * WRAP_CEILING, "a wide spread must saturate the linear SD"
+    # circular SD keeps ordering the two correctly
+    assert circular_sd(wrap(wide)) > 2.0 * circular_sd(wrap(tight))
+
+
+def test_fit_reports_saturation_so_a_bad_shell_is_visible():
+    rng = np.random.RandomState(2)
+    bvals = np.array([1000.0, 2000.0, 3000.0])
+    shots = [np.angle(np.exp(1j * rng.normal(0, s, 20000))) for s in (0.4, 1.0, 6.0)]
+    out = fit_b_dependence(shots, bvals, np.array([50.0, 40.0, 30.0]))
+    assert out["statistic"] == "circular"
+    assert out["saturation"][-1] > 0.9, "the saturated shell must be flagged"
+    assert out["saturation"][0] < 0.5

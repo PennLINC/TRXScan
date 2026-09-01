@@ -1,0 +1,29 @@
+{
+  "source": "NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices",
+  "shells": [
+    500.0,
+    1000.0,
+    2000.0,
+    3000.0
+  ],
+  "snr": [
+    337.1479963570127,
+    224.6835154826958,
+    115.12765634486946,
+    65.96787262106652
+  ],
+  "snr_handling": "thermal floor fitted as 1/SNR in quadrature",
+  "statistic_note": "circular SD; linear SD saturates at pi/sqrt(3) and biased p to 0.257",
+  "c_q": 0.06421768236662158,
+  "p": 0.4454781061357372,
+  "a_naive": 0.07448127659102258,
+  "p_naive": 0.42531726338791276,
+  "snr_corrected": true,
+  "statistic": "circular",
+  "saturation": [
+    0.6179704202781056,
+    0.8035767858018462,
+    0.9694366740947453,
+    0.994390057256587
+  ]
+}
