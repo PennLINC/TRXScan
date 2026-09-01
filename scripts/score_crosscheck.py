@@ -12,17 +12,45 @@ analytic fixtures, at least one is wrong and CI should fail.
 """
 import numpy as np
 
-__all__ = ["naive_oscillatory", "naive_alignment", "compare_scorers"]
+__all__ = ["naive_oscillatory", "naive_alignment", "naive_energy_ratio",
+           "naive_artifact_norm", "compare_scorers"]
 
 
-def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5):
-    """Indices beside the edge where the reference is bright. Written independently."""
-    g = [abs(ref_profile[i + 1] - ref_profile[i]) for i in range(len(ref_profile) - 1)]
-    peak = max(range(len(g)), key=lambda i: g[i])
+def _peak_indices(grad, thr_frac=0.35):
+    """Local maxima of a gradient profile above a fraction of its max. Independent of the primary."""
+    if not grad or max(grad) <= 0:
+        return []
+    thr = thr_frac * max(grad)
+    out = []
+    for i in range(len(grad)):
+        if grad[i] < thr:
+            continue
+        lo, hi = max(0, i - 2), min(len(grad), i + 3)
+        if grad[i] >= max(grad[lo:hi]):
+            out.append(i)
+    return out or [max(range(len(grad)), key=lambda i: grad[i])]
+
+
+def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.5, peaks=None):
+    """Indices beside EVERY significant edge where the reference is bright.
+
+    Written independently of the primary, but to the same definition -- including scoring both of
+    a box's edges rather than only the strongest. When the primary was extended to both edges and
+    this was not, the two disagreed by ~4% on the partial-Fourier box, which is exactly what this
+    cross-check exists to surface.
+    """
+    n = len(ref_profile)
+    if peaks is None:
+        peaks = _peak_indices([abs(ref_profile[i + 1] - ref_profile[i]) for i in range(n - 1)])
+    if not peaks:
+        return []
     hi = max(ref_profile)
     out = []
-    for i in range(len(ref_profile)):
-        if abs(i - peak) <= guard or abs(i - peak) > half_width:
+    for i in range(n):
+        near = [p for p in peaks if abs(i - p) <= half_width]
+        if not near:
+            continue
+        if any(abs(i - p) <= guard for p in peaks):
             continue
         if ref_profile[i] > bright * hi:
             out.append(i)
@@ -42,10 +70,12 @@ def naive_oscillatory(est, ref, axis=None):
             np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
     if axis == 0:
         est, ref = est.T, ref.T
+    gsum = list(np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0))
+    peaks = _peak_indices(gsum)
     tot, rows = 0.0, 0
     for r in range(est.shape[0]):
         rp = list(np.abs(ref[r]))
-        idx = _bright_sidelobe_indices(rp)
+        idx = _bright_sidelobe_indices(rp, peaks=peaks)
         if not idx:
             continue
         acc = 0j
@@ -64,15 +94,50 @@ def naive_alignment(est, ref, control, axis=None):
             np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
     if axis == 0:
         est, ref, control = est.T, ref.T, control.T
+    peaks = _peak_indices(list(np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0)))
     num, den = 0j, 0.0
     for r in range(est.shape[0]):
-        idx = _bright_sidelobe_indices(list(np.abs(ref[r])))
+        idx = _bright_sidelobe_indices(list(np.abs(ref[r])), peaks=peaks)
         for i in idx:
             rm = est[r][i] - ref[r][i]
             r0 = control[r][i] - ref[r][i]
             num += rm * np.conj(r0)
             den += abs(r0) ** 2
     return float(abs(num) / den) if den > 0 else float("nan")
+
+
+def naive_energy_ratio(est, ref, control, axis=None):
+    """`||Rm|| / ||R0||` by explicit loops. See `naive_oscillatory` on `axis`."""
+    est, ref, control = (np.asarray(a) for a in (est, ref, control))
+    if axis is None:
+        axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
+            np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
+    if axis == 0:
+        est, ref, control = est.T, ref.T, control.T
+    peaks = _peak_indices(list(np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0)))
+    num, den = 0.0, 0.0
+    for r in range(est.shape[0]):
+        for i in _bright_sidelobe_indices(list(np.abs(ref[r])), peaks=peaks):
+            num += abs(est[r][i] - ref[r][i]) ** 2
+            den += abs(control[r][i] - ref[r][i]) ** 2
+    return float(np.sqrt(num) / np.sqrt(den)) if den > 0 else float("nan")
+
+
+def naive_artifact_norm(ref, control, axis=None):
+    """RMS `|R0|` over the sidelobe region, by explicit loops."""
+    ref, control = np.asarray(ref), np.asarray(control)
+    if axis is None:
+        axis = 0 if np.abs(np.diff(np.abs(ref), axis=0)).mean() > \
+            np.abs(np.diff(np.abs(ref), axis=1)).mean() else 1
+    if axis == 0:
+        ref, control = ref.T, control.T
+    peaks = _peak_indices(list(np.abs(np.diff(np.abs(ref), axis=-1)).sum(axis=0)))
+    tot, n = 0.0, 0
+    for r in range(ref.shape[0]):
+        for i in _bright_sidelobe_indices(list(np.abs(ref[r])), peaks=peaks):
+            tot += abs(control[r][i] - ref[r][i]) ** 2
+            n += 1
+    return float(np.sqrt(tot / n)) if n else float("nan")
 
 
 def compare_scorers(est, ref, control, rtol=0.02, atol=1e-6, axis=None):
@@ -85,10 +150,20 @@ def compare_scorers(est, ref, control, rtol=0.02, atol=1e-6, axis=None):
     s = score(np.abs(est), np.angle(est), np.abs(ref), np.angle(ref),
               control_mag=np.abs(control), control_phase=np.angle(control), axis=axis)
     key = {0: "residual_alignment_ro", 1: "residual_alignment_pe"}.get(axis, "residual_alignment")
+    sfx = {0: "_ro", 1: "_pe"}.get(axis, "")
     pairs = [
         ("oscillatory_residual", s["oscillatory_residual"], naive_oscillatory(est, ref, axis)),
         (key, s[key], naive_alignment(est, ref, control, axis)),
     ]
+    # The two quantities that now drive PF acceptance need independent implementations too --
+    # exercising them only through synthetic acceptance rows tests the branching, not the maths.
+    if sfx:
+        pairs += [
+            (f"residual_energy{sfx}", s[f"residual_energy{sfx}"],
+             naive_energy_ratio(est, ref, control, axis)),
+            (f"artifact_norm{sfx}", s[f"artifact_norm{sfx}"],
+             naive_artifact_norm(ref, control, axis)),
+        ]
     bad = []
     for name, a, b in pairs:
         if np.isnan(a) and np.isnan(b):

@@ -80,15 +80,12 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
     dr = np.abs(np.diff(_profiles(ref), axis=-1))
     if dr.size == 0 or dr.max() <= 0:
         return 0.0
-    peak = int(np.argmax(dr.sum(axis=0)))
-    lo, hi = max(0, peak - half_width), min(dp.shape[-1], peak + half_width + 1)
-    idx = np.arange(lo, hi)
-    # EXCLUDE a guard band around the edge itself. The reference is box-integrated while the
-    # estimate is band-limited, so the transition voxels differ by the sinc-vs-box PSF regardless
-    # of ringing -- and an unringer makes that transition SOFTER, enlarging the difference there.
-    # Including the edge made the metric rank both real methods worse than doing nothing, even
-    # though both cut the plateau ripple by 76-88%. Ringing lives in the sidelobes; measure there.
-    idx = idx[np.abs(idx - peak) > guard]
+    # Sidelobes beside EVERY significant edge, with a guard band excluding the transition voxels
+    # themselves: the reference is box-integrated while the estimate is band-limited, so those
+    # differ by the sinc-vs-box PSF regardless of ringing, and an unringer makes the transition
+    # SOFTER, enlarging the difference exactly there. Including the edge ranked both real methods
+    # worse than doing nothing despite each cutting plateau ripple 76-88%.
+    idx = _sidelobe_indices(dr.sum(axis=0), dp.shape[-1], half_width, guard)
     if idx.size == 0:
         return 0.0
     rp = _profiles(np.abs(ref))
@@ -106,6 +103,38 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.5):
     # |.|^2 so the measure is invariant to a global complex rotation of object and residual.
     return float(np.sqrt((np.abs(proj) ** 2).mean()))
 
+
+
+def _sidelobe_indices(grad_profile, n, half_width, guard):
+    """Sidelobe indices around EVERY significant edge, not just the strongest.
+
+    A box has two edges per axis. Scoring only `argmax` was fine under full Fourier, where symmetry
+    makes them equivalent, but a one-sided partial-Fourier transfer function is asymmetric and the
+    two phase-encode edges need not have equivalent sidelobes -- so measuring one of them measures
+    half the artifact.
+    """
+    g = np.asarray(grad_profile, float)
+    if g.size == 0 or g.max() <= 0:
+        return np.arange(0)
+    peaks = []
+    thr = 0.35 * g.max()
+    for i in range(g.size):
+        if g[i] < thr:
+            continue
+        lo = max(0, i - 2)
+        hi = min(g.size, i + 3)
+        if g[i] >= g[lo:hi].max():          # local maximum above threshold
+            peaks.append(i)
+    if not peaks:
+        peaks = [int(np.argmax(g))]
+    keep = np.zeros(n, bool)
+    for p in peaks:
+        lo, hi = max(0, p - half_width), min(n, p + half_width + 1)
+        w = np.arange(lo, hi)
+        keep[w[np.abs(w - p) > guard]] = True
+    for p in peaks:                          # guard bands win over neighbouring windows
+        keep[max(0, p - guard):min(n, p + guard + 1)] = False
+    return np.nonzero(keep)[0]
 
 def _profiles(a):
     """Rows of a 2D image, or of every slice of a 3D stack."""
@@ -169,10 +198,7 @@ def residual_alignment(est, ref, control, axis=None, half_width=10, guard=2, bri
     dr = np.abs(np.diff(rp, axis=-1))
     if dr.size == 0 or dr.max() <= 0:
         return float("nan")
-    peak = int(np.argmax(dr.sum(axis=0)))
-    lo, hi = max(0, peak - half_width), min(r0.shape[-1], peak + half_width + 1)
-    idx = np.arange(lo, hi)
-    idx = idx[np.abs(idx - peak) > guard]
+    idx = _sidelobe_indices(dr.sum(axis=0), r0.shape[-1], half_width, guard)
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
@@ -201,10 +227,7 @@ def residual_energy_ratio(est, ref, control, axis=None, half_width=10, guard=2, 
     dr = np.abs(np.diff(rp, axis=-1))
     if dr.size == 0 or dr.max() <= 0:
         return float("nan")
-    peak = int(np.argmax(dr.sum(axis=0)))
-    lo, hi = max(0, peak - half_width), min(rp.shape[-1], peak + half_width + 1)
-    idx = np.arange(lo, hi)
-    idx = idx[np.abs(idx - peak) > guard]
+    idx = _sidelobe_indices(dr.sum(axis=0), rp.shape[-1], half_width, guard)
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
@@ -230,10 +253,7 @@ def artifact_norm(ref, control, axis, half_width=10, guard=2, bright=0.5):
     dr = np.abs(np.diff(rp, axis=-1))
     if dr.size == 0 or dr.max() <= 0:
         return float("nan")
-    peak = int(np.argmax(dr.sum(axis=0)))
-    lo, hi = max(0, peak - half_width), min(rp.shape[-1], peak + half_width + 1)
-    idx = np.arange(lo, hi)
-    idx = idx[np.abs(idx - peak) > guard]
+    idx = _sidelobe_indices(dr.sum(axis=0), rp.shape[-1], half_width, guard)
     rmax = float(rp.max())
     if idx.size == 0 or rmax <= 0:
         return float("nan")
@@ -324,6 +344,13 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
             per_axis[f"residual_energy_{name}"] = residual_energy_ratio(
                 ze_raw, zr_raw, zc_raw, axis=ax)
             per_axis[f"artifact_norm_{name}"] = artifact_norm(zr_raw, zc_raw, axis=ax)
+            em = np.moveaxis(np.abs(np.asarray(est_mag_in, float)), ax, -1)
+            rm_ = np.moveaxis(np.abs(np.asarray(ref_mag_in, float)), ax, -1)
+            rs = _sharpness(rm_)
+            per_axis[f"edge_sharpness_{name}"] = (
+                float(_sharpness(em) / rs) if rs > 0 else float("nan"))
+            per_axis[f"edge_location_bias_{name}"] = (
+                _edge_shift(em, rm_) if rs > 0 else float("nan"))
         # Unsuffixed key keeps the auto-selected axis, for 1D fixtures and general use. The
         # _ro / _pe pair is what the benchmark must consult, because auto-selection is undefined
         # on a symmetric phantom.

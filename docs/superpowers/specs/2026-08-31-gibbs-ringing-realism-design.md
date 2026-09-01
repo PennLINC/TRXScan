@@ -791,42 +791,41 @@ more elaborate simulator.
 
 ## 6. Risks
 
-- **Stage A memory: MEASURED, and it gates the default.** An earlier draft said "4x memory,
-  1.4 GB -> 5.5 GB". That 4x was the `o = 2` figure and was never re-derived when `o = 4` became
-  the default: in-plane voxel count scales as **`o^2`**, so `o = 4` is **16x**, not 4x.
+- **Signal-stage memory: REMEASURED on the current path.** Two earlier figures in this section
+  were stale. The first ("4x memory, 1.4 GB -> 5.5 GB") was the `o=2` arithmetic when the default
+  was `o=4`; in-plane voxels scale as `o^2`, so `o=4` is 16x. The second (13.04 GB at `o=4`)
+  measured `generate_compartments`, which the default no-motion path **no longer uses** -- after the
+  production-path fix it runs `generate_mixture` + `signal_from_mixture` on the simulation grid.
 
-  `comp.images` is `nvox * ngrad * ncomp * 4` bytes. For the bundled HBCD-sized case
-  (107x151x104 acquisition, 75 volumes, 3 compartments):
+  `generate_mixture` allocates a dense orientation histogram, `nvox * nvert * 8` bytes of f64 with
+  `nvert = 321` (`HemiSphere::icosphere(3)`), plus an f32 ODF copy. That, not the compartment
+  images, is the dominant allocation:
 
-  | `o` | sim voxels | predicted `comp.images` | measured peak RSS |
-  |---|---|---|---|
-  | 1 | 1.68 M | 1.51 GB | -- |
-  | 2 | 6.72 M | 6.05 GB | -- |
-  | **4 (default)** | **26.89 M** | **24.20 GB** | **13.04 GB** (end-to-end, 1 M streamlines) |
+  | `o` | sim voxels | histogram + ODF (upper bound) | compartment images | **measured peak RSS** |
+  |---|---|---|---|---|
+  | 1 | 1.68 M | 6.5 GB | 1.5 GB | -- |
+  | **2 (default)** | 6.72 M | 25.9 GB | 6.0 GB | **11.46 GB** |
+  | 4 | 26.89 M | 103.6 GB | 24.2 GB | -- |
 
-  Measured on a real run: `prepare_acquisition_grid.py --oversample 4`, Stage A on the
-  (428, 604, 104) simulation grid, then Stage B. **13.04 GB peak.** That fits a 32 GB machine and
-  would OOM a 16 GB one, so `--oversample 4` is **not safely production-default on typical
-  hardware** without the slab-streaming mitigation below.
+  Measured with the full 1 M-streamline tractogram on a 107x151x104 acquisition grid, 75 volumes.
+  **Committed memory is well below the arithmetic bound** because the histogram is allocated densely
+  but faulted in lazily -- only voxels a streamline actually touches are ever written, 781,325 of
+  6.72 M here. The bound is what a fully-covered volume would need; 11.46 GB is what this tractogram
+  actually costs.
 
-  The run was stopped during Stage B, which is ~1.5 h single-threaded at this size without the
-  `par` feature. Stage A dominates the peak and had already allocated, so the figure stands.
+  `o = 2` therefore fits a 16 GB machine, with little headroom. `o = 4` is not attempted: its bound
+  is 104 GB and even a sparsely-covered run would be far beyond ordinary hardware.
 
-  **Under `--features par` it is worse.** The signal stage's fiber accumulator is **f64**, so one
-  buffer is `nvox * ngrad * 8` bytes = **16.1 GB** at `o = 4`, and `reduce_with` holds a pair live.
-  `compartments.rs` already warns against `fold` here for exactly this reason. The 13.04 GB figure
-  above was measured WITHOUT `par`; the parallel path needs upwards of 32 GB at `o = 4`.
+  **Under `--features par` it is worse still.** The `generate_compartments` motion path uses an f64
+  accumulator, `nvox * ngrad * 8` = 16.1 GB per buffer at `o = 4`, with a pair live during
+  `reduce_with`; `compartments.rs` already warns against `fold` for that reason.
 
-  **Consequence: the CLI default is `o = 2`, not `o = 4`.** There is no setting that is both
-  accurate and memory-safe on ordinary hardware until slab streaming lands, and a default that runs
-  and is documented as approximate beats one that OOMs. `o = 4` remains the accuracy target
-  (~4.5% residual against ~15.6% at `o = 2`) and the benchmark fixtures use it, since their
-  matrices are small.
-
-  **Mitigation, now warranted rather than deferred:** Stage B is already per-slice and z is never
-  oversampled, so streaming Stage A by z-slab bounds the resident set to one slab rather than the
-  whole volume. Redesigning the parallel accumulation so it does not replicate full-volume f64
-  buffers is the companion fix. Until both land the CLI defaults to `o = 2` and warns above 8 GB.
+  **Mitigations, all now warranted rather than deferred:** z-slab streaming (Stage B is already
+  per-slice and z is never oversampled); sparse or masked-voxel orientation storage instead of the
+  dense `nvox x 321` field; and a lower-memory signal-only path for when weights, kappa and
+  microstructure ground truth are not needed. Until those land the CLI defaults to `o = 2` and its
+  pre-flight estimates the histogram term, which an earlier version omitted -- predicting 6.0 GB for
+  a run that measured 11.5 GB.
 
 - **Runtime: measured, and phase 10 is not needed.** Release build, 108x152 in-plane, a 104-slice
   75-volume acquisition:

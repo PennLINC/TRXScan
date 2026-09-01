@@ -8,9 +8,11 @@ from acceptance import check_consistency
 
 
 def _row(method, pf, phase, osc, sharp=1.0, phase_err=0.0, noisy=False, window="None",
-         align_pe=0.3, energy_pe=0.5, artifact_pe=0.04):
+         align_pe=0.3, energy_pe=0.5, artifact_pe=0.04, sharp_ro=None, sharp_pe=None):
     return {"method": method, "pf": pf, "phase": phase, "noisy": noisy, "window": window,
             "oscillatory_residual": osc, "edge_sharpness": sharp,
+            "edge_sharpness_ro": sharp if sharp_ro is None else sharp_ro,
+            "edge_sharpness_pe": sharp if sharp_pe is None else sharp_pe,
             "phase_rmse_masked": phase_err,
             "residual_alignment_pe": align_pe, "residual_energy_pe": energy_pe,
             "artifact_norm_pe": artifact_pe}
@@ -128,3 +130,16 @@ def test_pe_gate_skips_when_the_absolute_artifact_is_negligible():
             _row("x", 0.75, "nophase", 0.01, sharp=0.95, align_pe=9.0, artifact_pe=0.0001)]
     ok, reasons = check_consistency(rows)
     assert ok, reasons
+
+
+def test_blurring_along_phase_encode_only_is_still_caught():
+    """A method could blur along PE while leaving readout sharp.
+
+    Rule (c) used a single auto-selected axis, which for the symmetric box is readout -- so this
+    failure mode was invisible. It matters because zero-filled PF itself trades ringing for
+    PE-axis blur.
+    """
+    rows = [_row("none", 1.0, "nophase", 0.09),
+            _row("x", 1.0, "nophase", 0.01, sharp_ro=0.99, sharp_pe=0.30)]
+    ok, reasons = check_consistency(rows)
+    assert not ok and any("pe edge sharpness" in r for r in reasons), reasons

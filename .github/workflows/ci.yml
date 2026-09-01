@@ -40,6 +40,19 @@ jobs:
         run: cargo test --verbose
         working-directory: TRXScan
 
+      # `default = []` and every bin has required-features = ["cli"], so the two steps above
+      # compile NO binary at all. Both major regressions in this PR's review history were in
+      # src/bin/trxscan.rs wiring, which a green pure-std job never touched.
+      - name: Check the production binaries
+        run: |
+          cargo check --features cli --bin trxscan
+          cargo check --features cli --bin trxscan-benchmark
+        working-directory: TRXScan
+      # The parallel signal stage has materially different memory and code behaviour.
+      - name: Check the parallel path
+        run: cargo check --features cli,par --bin trxscan
+        working-directory: TRXScan
+
       # Reported, not enforced: most findings are pre-existing in modules this branch does not
       # touch (microstructure, mixture, sphere). Making it a gate is a separate cleanup.
       - name: Clippy (advisory)

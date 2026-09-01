@@ -45,8 +45,19 @@ def check_consistency(rows):
     pe_floor = (NEGLIGIBLE_RINGING_FRACTION * pe_all[len(pe_all) // 2]) if pe_all else 0.0
 
     for m in methods:
-        # (a) a method must beat the no-op control wherever both were run
+        # (a) beat the no-op control -- FULL FOURIER ONLY. oscillatory_residual is the Nyquist
+        #     projection this module documents as invalid under partial Fourier, so asserting it
+        #     on PF rows was inconsistent with its own stated limitation. PF is covered by rule (b)
+        #     on the phase-encode axis instead.
         for r in _by(rows, method=m):
+            if r["pf"] < 1.0:
+                continue
+            if str(r.get("window")) not in ("None", "none"):
+                continue          # apodized input is out of domain for ALL method-performance
+                                  # rules, not just (b) -- see the module docstring. An earlier
+                                  # version skipped it only in (b), so
+                                  # test_apodized_rows_are_out_of_domain_and_never_fail promised
+                                  # more than the implementation delivered.
             # Match the control on EVERY factor, window included. Matching only pf and phase
             # compared an unapodized method row against an apodized control, which made all three
             # methods look like they lost to doing nothing.
@@ -65,6 +76,12 @@ def check_consistency(rows):
         #     Scored on the PHASE-ENCODE axis, since that is the one partial Fourier acts on, and
         #     gated on a PF-aware quantity so the rule is not skipped exactly where PF matters.
         for r in _by(rows, method=m):
+            # CLEAN rows only. ||Rm|| for a noisy output still contains thermal noise, so applying
+            # an artifact-amplification threshold to it makes residual_energy simultaneously a
+            # Gibbs metric and a noise metric. The paired noisy rows are for noise-amplification
+            # and robustness questions, reported separately.
+            if r.get("noisy", False):
+                continue
             a = r.get("residual_alignment_pe")
             e = r.get("residual_energy_pe")
             if a is None or a != a:            # NaN
@@ -90,7 +107,7 @@ def check_consistency(rows):
                     f"{m}: amplifies the control artifact (PE axis) at pf={r['pf']} "
                     f"phase={r['phase']} window={r.get('window')} (alignment {a:.3f} > 1)"
                 )
-            if e is not None and e == e and e > 1.5:
+            if e is not None and e == e and e > 1.05:
                 reasons.append(
                     f"{m}: residual energy grew {e:.2f}x on the PE axis at pf={r['pf']} "
                     f"phase={r['phase']} window={r.get('window')}"
@@ -112,14 +129,20 @@ def check_consistency(rows):
         # results table instead. Closing this properly needs a PF-aware metric AND RPG installed;
         # RPG is absent here, so the PF-aware comparison is unavailable in any case.
 
-        # (c) ringing reduction must not be bought with resolution
+        # (c) ringing reduction must not be bought with resolution -- checked on BOTH axes.
+        #     A method could blur along phase-encode while leaving readout sharp, and a
+        #     single auto-selected axis (readout, for the symmetric box) would not see it. This
+        #     matters precisely because zero-filled PF itself trades ringing for PE-axis blur.
         for r in _by(rows, method=m):
-            s = r.get("edge_sharpness")
-            if s is not None and s < SHARPNESS_FLOOR:
-                reasons.append(
-                    f"{m}: edge sharpness {s:.2f} below floor {SHARPNESS_FLOOR} at "
-                    f"pf={r['pf']} phase={r['phase']} -- suppressing ringing by blurring"
-                )
+            if str(r.get("window")) not in ("None", "none"):
+                continue                      # apodization legitimately softens edges
+            for ax in ("ro", "pe"):
+                sv = r.get(f"edge_sharpness_{ax}")
+                if sv is not None and sv == sv and sv < SHARPNESS_FLOOR:
+                    reasons.append(
+                        f"{m}: {ax} edge sharpness {sv:.2f} below floor {SHARPNESS_FLOOR} at "
+                        f"pf={r['pf']} phase={r['phase']} -- suppressing ringing by blurring"
+                    )
 
     return (not reasons), reasons
 

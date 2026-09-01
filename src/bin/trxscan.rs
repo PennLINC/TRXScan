@@ -112,6 +112,11 @@ struct Cli {
     /// Object phase model: "hbcd" (calibrated), or "none" for a real-valued object
     #[arg(long, value_name = "MODEL", default_value = "hbcd")]
     phase_model: String,
+    /// Partial-Fourier line-dropping rule: "contiguous" (scanner-like, exactly round(ny*pf)
+    /// consecutive lines) or "fiberfox" (the ported rule, which preserves line zero on even
+    /// matrices and so keeps ~78% at a nominal 6/8).
+    #[arg(long, value_name = "MODE", default_value = "contiguous")]
+    pf_mode: String,
 
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
     #[arg(long)]
@@ -322,10 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         do_relaxation: true,
         noise_variance: cli.noise,
         partial_fourier: 0.75,  // HBCD
-        // Fiberfox's rule, so shipped behaviour is unchanged. Note it is not exactly 6/8: on an
-        // even matrix it preserves line zero, e.g. 25/32 = 78.1%. Use PartialFourierMode::
-        // Contiguous for scanner-like PF when benchmarking PF-aware reconstruction.
-        pf_mode: PartialFourierMode::FiberfoxCompatible,
+        // Defaults to CONTIGUOUS: this CLI describes itself as HBCD-like, and a scanner produces
+        // contiguous PF. The Fiberfox rule keeps ~78% at a nominal 6/8 because it preserves line
+        // zero on even matrices; it stays available via --pf-mode fiberfox.
+        pf_mode: match cli.pf_mode.as_str() {
+            "contiguous" => PartialFourierMode::Contiguous,
+            "fiberfox" => PartialFourierMode::FiberfoxCompatible,
+            o => return Err(format!("unknown --pf-mode {o:?}; expected contiguous or fiberfox").into()),
+        },
         ghost_offset: 0.015,    // subtle residual Nyquist ghost
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,
@@ -361,20 +370,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("sim fieldmap grid {:?} != simulation grid {:?}",
                                sim_fgrid.dims, sig_grid.dims).into());
         }
-        // Pre-flight memory estimate. Stage A holds comp.images = nvox * ngrad * ncomp * 4 bytes,
-        // and in-plane voxels scale as o^2 -- o=4 is 16x the acquisition grid, not 4x. Measured
-        // 13.04 GB peak for 107x151x104 / 75 volumes / 3 compartments at o=4.
-        let est_gb = sig_grid.dims.iter().product::<usize>() as f64
-            * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
+        // Pre-flight memory estimate. The DOMINANT allocation on the default no-motion path is
+        // generate_mixture's dense orientation histogram, nvox * 321 * 8 bytes of f64, plus its
+        // f32 ODF copy -- not the compartment images. An earlier version estimated only the
+        // latter and so predicted 6.0 GB for a run that measured 11.5 GB.
+        //
+        // Measured, full 1 M-streamline tractogram, 107x151x104 acquisition grid, 75 volumes:
+        //   o=2  ->  11.46 GB peak RSS
+        // The arithmetic upper bound is higher (~26 GB at o=2) because the histogram is allocated
+        // densely but committed lazily: only voxels a streamline actually touches fault in.
+        let sim_vox = sig_grid.dims.iter().product::<usize>() as f64;
+        let nvert = 321.0;                       // HemiSphere::icosphere(3)
+        let hist_gb = sim_vox * nvert * 12.0 / 1e9;   // f64 histogram + f32 ODF, upper bound
+        let images_gb = sim_vox * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
+        let est_gb = hist_gb + images_gb;
         if est_gb > 8.0 {
             eprintln!(
-                "WARNING: the signal stage holds roughly {est_gb:.1} GB of f32 compartment images \
-                 on grid {:?} ({} volumes), and its f64 accumulator is about {:.1} GB per buffer \
-                 with a pair live during the parallel reduction. In-plane memory scales as o^2, so \
-                 halving --oversample quarters it. A measured o=4 run peaked at 13.0 GB \
-                 single-threaded.",
-                sig_grid.dims, scheme.len(),
-                sig_grid.dims.iter().product::<usize>() as f64 * scheme.len() as f64 * 8.0 / 1e9);
+                "WARNING: signal stage upper bound about {est_gb:.1} GB on grid {:?} \
+                 ({:.1} GB dense orientation histogram + ODF, {:.1} GB compartment images, \
+                 {} volumes). Committed memory is lower -- an o=2 run of this size measured \
+                 11.5 GB -- because the histogram faults in only where streamlines deposit. \
+                 In-plane memory scales as o^2.",
+                sig_grid.dims, hist_gb, images_gb, scheme.len());
         }
         println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
                  cli.oversample, cli.phase_model);

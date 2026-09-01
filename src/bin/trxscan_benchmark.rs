@@ -10,7 +10,7 @@ use trxscan::benchmark::{
     factor_grid, gibbs_benchmark_acquisition, phase_model_for, produce_slice, PhaseKind,
 };
 use trxscan::io;
-use trxscan::kspace::{box_hires, Acquisition};
+use trxscan::kspace::{box_hires, Acquisition, PartialFourierMode};
 use trxscan::raster::Grid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let acq = gibbs_benchmark_acquisition(&Acquisition {
             signal_scale: 1.0,
             partial_fourier: p.partial_fourier,
+            // Scanner-like CONTIGUOUS partial Fourier, not the Fiberfox default. The fixtures are
+            // named pf68/pf78 and the whole point of the PF axis is to evaluate PF-aware
+            // reconstruction, so they must actually be 6/8 and 7/8 rather than the Fiberfox rule's
+            // 78.1%/90.6% with a detached line-zero.
+            pf_mode: PartialFourierMode::Contiguous,
             window: p.window,
             // Per-component image-space variance at full sampling; ~30 dB against a unit step.
             // One nonzero level for every fixture; produce_slice emits the clean/noisy pair.
@@ -94,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dir.join("factors.json"),
             format!(
                 "{{\n  \"label\": \"{}\",\n  \"partial_fourier\": {},\n  \"phase\": \"{:?}\",\n  \
-                 \"window\": \"{:?}\",\n  \"matrix\": {},\n  \"oversample\": {},\n  \
+                 \"window\": \"{:?}\",\n  \"pf_mode\": \"Contiguous\",\n  \"matrix\": {},\n  \"oversample\": {},\n  \
                  \"slices\": {},\n  \"bval\": {}\n}}\n",
                 p.label, p.partial_fourier, p.phase, p.window, n, o, nz, bval
             ),

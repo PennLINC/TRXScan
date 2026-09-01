@@ -47,13 +47,13 @@ def _has_dipy():
 
 
 def _has_rpg():
-    if shutil.which("rpg_degibbs") or shutil.which("rpg"):
-        return True
-    try:
-        import rpg  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Always False: no adapter exists yet.
+
+    Detecting an RPG executable or module and reporting it available was misleading, because
+    `run_method("rpg")` raises unconditionally regardless. A method is "available" only if it can
+    actually run.
+    """
+    return False
 
 
 def available_methods():

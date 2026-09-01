@@ -113,3 +113,37 @@ def test_partial_fourier_breaks_the_axis_symmetry_of_the_box():
     ro_p, pe_p = artifact_norm(ref, pf_img, 0), artifact_norm(ref, pf_img, 1)
     assert abs(ro_p - pe_p) > 0.05 * ro_f, (
         f"PF must break the symmetry: ro={ro_p:.5f} pe={pe_p:.5f} (full {ro_f:.5f})")
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_energy_and_artifact_norm_agree_on_the_2d_box(axis):
+    """The two metrics that drive PF acceptance, independently reimplemented."""
+    from score_crosscheck import naive_artifact_norm, naive_energy_ratio
+    from score_unringing import artifact_norm, residual_energy_ratio
+    ref, ctl = _box(ring=False), _box(ring=True)
+    est = ref + 0.4 * (ctl - ref)
+    a = residual_energy_ratio(est, ref, ctl, axis=axis)
+    b = naive_energy_ratio(est, ref, ctl, axis=axis)
+    assert np.isclose(a, b, rtol=0.02), f"energy axis {axis}: {a} vs {b}"
+    a = artifact_norm(ref, ctl, axis)
+    b = naive_artifact_norm(ref, ctl, axis=axis)
+    assert np.isclose(a, b, rtol=0.02), f"artifact_norm axis {axis}: {a} vs {b}"
+
+
+def test_partial_fourier_box_cross_checks_on_both_axes():
+    """The scanner-like contiguous PF case, both scorers, both axes."""
+    n, o = 64, 4
+    N = n * o
+    q = N // 4
+    obj = np.zeros((N, N))
+    obj[q:3 * q, q:3 * q] = 1.0
+    K = np.fft.fftshift(np.fft.fft2(obj))
+    c = K[N // 2 - n // 2:N // 2 + n // 2, N // 2 - n // 2:N // 2 + n // 2] / (o * o)
+    ref = obj[::o, ::o].astype(complex)
+    ctl = np.fft.ifft2(np.fft.ifftshift(c))
+    pf = c.copy()
+    pf[:, : n - int(round(n * 0.75))] = 0          # contiguous 6/8 along ky
+    est = np.fft.ifft2(np.fft.ifftshift(pf))
+    for axis in (0, 1):
+        ok, detail = compare_scorers(est, ref, ctl, axis=axis)
+        assert ok, f"axis {axis}: {detail}"
