@@ -649,9 +649,10 @@ phase 0 and used as the oracle for everything below.
     o_min = min { o : error(o) < epsilon }
     ```
 
-    from the 4.1.6 convergence criterion and the 4.1.1 profile comparison. The **production default
-    becomes `o_min`**, optionally with a safety margin. The test checks convergence; it does not
-    prescribe in advance which oversampling level passes.
+    from the 4.1.6 convergence criterion and the 4.1.1 profile comparison. `o_min` is the
+    **accuracy-selected** factor -- it came out 4. It is **not** the shipped default: section 6
+    shows `o = 4` is unaffordable in memory, so production ships `o = 2` and `o = 4` is opt-in.
+    The test checks convergence; it does not prescribe which level passes, nor which ships.
 11. **`even_matrix_window_asymmetry_is_intentional`.** Pins R4.
 
 Removed from revision 1: `gibbs_overshoot_matches_theory` (invalid, see test 1),
@@ -846,10 +847,14 @@ more elaborate simulator.
   | 2 | 243 | 0.53 h | 0.07 h | 0.3 MB |
   | **4 (accuracy target)** | **714** | **1.55 h** | **0.19 h** | **1.1 MB** |
 
-  Eleven minutes on 8 cores at the production factor. The phase-10 FFT path and z-slab streaming
-  are therefore **not implemented**: spec 6 defers both until measurement demands them, and the
-  measurement does not. Revisit only if the acquired matrix or oversampling factor grows
-  substantially.
+  Eleven minutes on 8 cores. **Runtime and memory reach opposite conclusions about phase 10, and
+  both stand:**
+
+  - the **FFT path is not implemented** and is not justified -- runtime does not demand it;
+  - **z-slab streaming and sparse orientation storage ARE warranted** -- on memory grounds, per the
+    subsection above, and they are the blocker on shipping the accuracy target `o = 4`.
+
+  The shipped default stays `o = 2` until that memory work lands.
 
   Note this measures **Stage B** only. The signal stage has since been measured end-to-end at
   11.46 GB for `o = 2` -- see the memory subsection above, which supersedes the earlier claim that
@@ -895,7 +900,7 @@ choices; this table is rewritten wholesale whenever the body changes rather than
 | R1 mechanism | Crop during the forward transform | 3.3x rather than 8x; keeps direct sums as oracle |
 | FFT rewrite | Deferred to optional phase 10 | Preserves the comparison oracle during validation |
 | Oversampling axes | In-plane only | Slice direction is not Fourier-encoded in 2D EPI |
-| Oversample factor | `o_min = min{o : error(o) < eps}` from the convergence study | Tolerance-driven; rev. 3 still presupposed `o=4` would pass (4.1.10) |
+| Oversample factor, accuracy-selected | `o_min = 4` from the convergence study (4.1.10) | Tolerance-driven; rev. 3 wrongly presupposed `o=4` would pass |
 | Finer object source | Native 1 mm anat maps via `--oversample` | Interpolating the 1.7 mm maps is a mathematical no-op |
 | Integer sim/acq ratio | Implementation restriction, not a requirement | Voxel-subdivision clarity and parity safety (3.1) |
 | `zero_ringing` | **Replaced by `window: KspaceWindow`**, default `None` | Tukey/Hann/Fermi are different PSFs; benchmark wants none |

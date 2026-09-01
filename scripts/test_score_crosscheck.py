@@ -205,3 +205,30 @@ def test_nyquist_score_does_not_cancel_across_an_edge():
     assert combined > 5 * max(cancelled, 1e-9), (
         f"per-side aggregation {combined:.5f} must survive where the union projection "
         f"cancels to {cancelled:.5f}")
+
+
+@pytest.mark.parametrize("n", [60, 64])
+def test_edge_centroid_rounding_agrees_across_parities(n):
+    """Both scorers must map a fractional centroid the same way, at any matrix size.
+
+    Python's round() is ties-to-even, so a centroid of 14.5 became 14 in the naive scorer while
+    the primary mapped it to 15. n=64 hid this -- its centroids happen to round the same way --
+    so the parity must be tested at both.
+    """
+    from score_crosscheck import _peak_indices
+    from score_unringing import physical_edges
+
+    q = n // 4
+    lo, hi = q + 0.5, 3 * q + 0.5
+    ax = np.arange(n)
+    cov = np.clip(np.minimum(ax + 1.0, hi) - np.maximum(ax, lo), 0.0, 1.0)
+    g = np.abs(np.diff(cov))
+
+    centroids = physical_edges(g)
+    assert len(centroids) == 2, f"n={n}: {centroids}"
+    assert all(abs(c - round(c)) > 0.4 for c in centroids), (
+        f"n={n}: fixture must produce HALF-integer centroids to exercise the parity, got {centroids}")
+
+    primary = [int(np.floor(c + 0.5)) for c in centroids]
+    naive = _peak_indices(list(g))
+    assert primary == naive, f"n={n}: primary {primary} vs naive {naive}"

@@ -160,3 +160,36 @@ def test_dark_side_alternation_survives_the_complex_reconstruction():
     cpx_resid = (ctl - ref).real[row, dark]
     assert np.all(mag_resid > 0), "magnitude rectifies the dark side"
     assert np.any(np.diff(np.sign(cpx_resid)) != 0), "complex must retain the alternation"
+
+
+def test_worst_edge_sharpness_catches_a_one_sided_blur():
+    """The failure mode that motivated per-edge sharpness.
+
+    `_sharpness` takes the profile MAXIMUM gradient, so blurring one boundary of a box while
+    leaving the other perfectly sharp leaves that maximum untouched -- the whole-profile ratio
+    still looks healthy. Rule (c) would have passed a method that destroyed half the resolution.
+    """
+    from score_unringing import _sharpness, _sharpness_per_edge
+
+    n = 64
+    q = n // 4
+    ax = np.arange(n)
+    cov = np.clip(np.minimum(ax + 1.0, 3 * q + 0.5) - np.maximum(ax, q + 0.5), 0.0, 1.0)
+    ref = np.tile(cov, (n, 1))
+
+    # Blur ONLY the left boundary; leave the right one bit-identical to the reference.
+    est = ref.copy()
+    k = np.exp(-0.5 * (np.arange(-6, 7) / 2.2) ** 2)
+    k /= k.sum()
+    left = slice(0, n // 2)
+    for r in range(n):
+        est[r, left] = np.convolve(ref[r], k, mode="same")[left]
+
+    whole = _sharpness(est) / _sharpness(ref)
+    per = _sharpness_per_edge(est, ref)
+
+    assert len(per) == 2, f"expected two edges, got {per}"
+    assert whole > 0.9, (
+        f"whole-profile sharpness should look fine -- that is the blind spot -- got {whole:.3f}")
+    assert min(per) < 0.6, f"the blurred edge must be detected: per-edge {per}"
+    assert max(per) > 0.9, f"the untouched edge must stay sharp: per-edge {per}"

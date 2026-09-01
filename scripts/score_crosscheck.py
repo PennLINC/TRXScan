@@ -10,6 +10,8 @@ So this module recomputes the same quantities the dumbest way that is still corr
 code with the primary implementation. It is slower and cruder. If the two disagree materially on
 analytic fixtures, at least one is wrong and CI should fail.
 """
+import math
+
 import numpy as np
 
 __all__ = ["naive_oscillatory", "naive_alignment", "naive_energy_ratio",
@@ -36,7 +38,11 @@ def _peak_indices(grad, thr_frac=0.35):
             j += 1
         w = grad[i:j + 1]
         tot = sum(w)
-        out.append(int(round(sum(k * w[k - i] for k in range(i, j + 1)) / tot)))
+        # floor(c + 0.5), matching the primary. Python's round() is ties-to-even, so a centroid
+        # of 14.5 becomes 14 here while the primary maps it to 15 -- verified to diverge at n=60
+        # and to agree at n=64 only by parity luck.
+        centroid = sum(k * w[k - i] for k in range(i, j + 1)) / tot
+        out.append(int(math.floor(centroid + 0.5)))
         i = j + 1
     return out or [max(range(n), key=lambda i: grad[i])]
 
