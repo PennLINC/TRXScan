@@ -139,9 +139,17 @@ impl PhaseModel {
     ///   and possibly reconstruction filtering, and only some of that precedes Fourier encoding.
     ///   Treat it as an effective benchmark parameter, never as a recovered physical field.
     /// - **Diffusion is FITTED**, with the thermal floor modelled as `1/SNR` in quadrature and
-    ///   using CIRCULAR statistics: `p = 0.445`, close to the 0.5 that `phi = q.dx` predicts at
-    ///   fixed timing. A linear-SD fit gives 0.257 because wrapped phase saturates at
-    ///   `pi/sqrt(3)`, and the NIBS shells sit at 62-99% of that ceiling.
+    ///   using CIRCULAR statistics: `p = 0.445` from NIBS, against the 0.5 that `phi = q.dx`
+    ///   predicts at fixed timing. A linear-SD fit gives 0.257, because wrapped phase saturates at
+    ///   `pi/sqrt(3)` and the NIBS shells sit at 62-99% of that ceiling.
+    ///
+    ///   **Two datasets disagree, and this preset takes NIBS deliberately.** An independent fit on
+    ///   ds006131 (CS-DSI, 9 shells to b=5000, `scripts/calibration_ds006131.json`) gives
+    ///   `p = 0.317`. Both sit where circular SD is reliable -- every shell's sigma is below 3.0,
+    ///   under the estimator's ~sqrt(ln N) ceiling of 3.4 -- so neither is discredited. This
+    ///   preset models the HBCD protocol and NIBS *is* that protocol (TE 88 ms, 6/8 PF, MB 3);
+    ///   ds006131 is a different sequence. Treat 0.32-0.45 as the measured spread, note that both
+    ///   fall below the theoretical 0.5, and prefer a protocol match over a wider b range.
     ///
     /// `sigma_dx = 1.0` voxel with `c_q = 0.0642` reproduces the fitted `sigma_phi(b)`; only their
     /// product is constrained by the data, so the split is a convention.
