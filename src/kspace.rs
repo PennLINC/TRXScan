@@ -67,6 +67,25 @@ impl Rng {
     }
 }
 
+/// How partial Fourier drops phase-encode lines.
+///
+/// These differ by more than an off-by-one, and the difference matters for anything evaluating
+/// PF-aware unringing (RPG and friends), so it is an explicit choice rather than a hidden quirk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialFourierMode {
+    /// Fiberfox's rule, ported as-is. On an even matrix it additionally **preserves line zero**,
+    /// because that line's Nyquist conjugate is absent. The consequence is that nominal "6/8" is
+    /// not 75%: at `ny = 32` it keeps 25 of 32 lines, **78.1%**, and leaves one isolated line
+    /// disconnected from the acquired block. Faithful to the reference implementation, and the
+    /// default so existing behaviour is unchanged.
+    FiberfoxCompatible,
+    /// Conventional contiguous zero-filled partial Fourier: keep exactly `round(ny * pf)`
+    /// consecutive lines from one end. This is what a scanner produces, and it is the more
+    /// relevant condition for benchmarking PF-aware reconstruction -- especially now the object is
+    /// genuinely complex and has no Hermitian symmetry to exploit.
+    Contiguous,
+}
+
 /// Scanner-side reconstruction apodization. Distinct transfer functions with distinct PSFs, so
 /// they are named rather than hidden behind one ambiguous scalar.
 ///
@@ -129,6 +148,9 @@ pub struct Acquisition {
     /// combined multi-coil variance emerges from the coil model as `V / sum_c s_c^2`.
     pub noise_variance: f64,
     pub partial_fourier: f64, // fraction of PE lines acquired (1.0 = full); skips low-ky lines
+    /// Which PF line-dropping rule to use. See [`PartialFourierMode`]: the default is NOT exactly
+    /// `partial_fourier` of the lines on an even matrix.
+    pub pf_mode: PartialFourierMode,
     pub ghost_offset: f64,    // Nyquist ghost: kx offset (±) on odd/even PE lines (0 = off)
     pub eddy_strength: f64,   // linear (in-plane) eddy-current phase scale (0 = off)
     pub eddy_quad: f64,       // quadratic (x²,y²,z²) eddy-current phase scale (0 = off)
@@ -170,6 +192,7 @@ impl Default for Acquisition {
             do_relaxation: true,
             noise_variance: 0.0,
             partial_fourier: 1.0,
+            pf_mode: PartialFourierMode::FiberfoxCompatible,
             ghost_offset: 0.0,
             eddy_strength: 0.0,
             eddy_quad: 0.0,
@@ -294,8 +317,16 @@ pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
     let accel = acq.accel.max(1);
     let acs_half = (acq.acs_lines / 2) as i64;
     let mut m = vec![false; nx * ny];
+    // Contiguous mode: exactly round(ny*pf) consecutive lines, dropped from the low-ky end
+    // (high-ky when the polarity is reversed).
+    let keep_n = (ny as f64 * acq.partial_fourier).round() as usize;
     for kyi in 0..ny {
-        if acq.partial_fourier < 1.0 {
+        if acq.partial_fourier < 1.0 && acq.pf_mode == PartialFourierMode::Contiguous {
+            let skip = if acq.reverse_phase { kyi >= keep_n } else { kyi < ny - keep_n };
+            if skip {
+                continue;
+            }
+        } else if acq.partial_fourier < 1.0 {
             let skip = if acq.reverse_phase {
                 kyi as f64 > (ny as f64 * acq.partial_fourier).ceil()
             } else {
@@ -1177,6 +1208,7 @@ mod tests {
             do_relaxation: false,
             noise_variance: 0.0,
             partial_fourier: 1.0,
+            pf_mode: PartialFourierMode::FiberfoxCompatible,
             ghost_offset: 0.0,
             eddy_strength: 0.0,
             n_coils: 1,
@@ -1694,5 +1726,51 @@ mod tests {
                 assert_eq!((k[i].0, k[i].1), (0.0, 0.0), "spike landed on unacquired sample {i}");
             }
         }
+    }
+
+    #[test]
+    fn contiguous_partial_fourier_keeps_exactly_the_nominal_fraction() {
+        // The default Fiberfox rule does NOT: on an even matrix it preserves line zero because
+        // that line's Nyquist conjugate is absent, so nominal 6/8 is 25/32 = 78.1%, with one
+        // isolated line detached from the acquired block. Contiguous mode is what a scanner
+        // produces and what a PF-aware unringing benchmark should default to comparing against.
+        for &(ny, pf) in &[(32usize, 0.75f64), (32, 0.875), (64, 0.75), (140, 0.75)] {
+            let count = |mode, rev| {
+                let a = Acquisition {
+                    partial_fourier: pf, pf_mode: mode, reverse_phase: rev, ..Default::default()
+                };
+                let m = sampling_mask(8, ny, &a);
+                (0..ny).filter(|&k| m[8 * k]).count()
+            };
+            let want = (ny as f64 * pf).round() as usize;
+            for rev in [false, true] {
+                assert_eq!(
+                    count(PartialFourierMode::Contiguous, rev), want,
+                    "ny={ny} pf={pf} reverse={rev}: contiguous must keep exactly {want} lines"
+                );
+            }
+            // and the two modes must actually differ on an even matrix
+            if ny % 2 == 0 {
+                assert!(
+                    count(PartialFourierMode::FiberfoxCompatible, false) > want,
+                    "ny={ny} pf={pf}: the Fiberfox rule should keep MORE than {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_partial_fourier_lines_are_actually_contiguous() {
+        let a = Acquisition {
+            partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous, ..Default::default()
+        };
+        let ny = 32;
+        let m = sampling_mask(8, ny, &a);
+        let kept: Vec<usize> = (0..ny).filter(|&k| m[8 * k]).collect();
+        assert!(!kept.is_empty());
+        assert_eq!(
+            kept.last().unwrap() - kept[0] + 1, kept.len(),
+            "contiguous mode must leave no gaps, got {kept:?}"
+        );
     }
 }

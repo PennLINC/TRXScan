@@ -812,9 +812,21 @@ more elaborate simulator.
   The run was stopped during Stage B, which is ~1.5 h single-threaded at this size without the
   `par` feature. Stage A dominates the peak and had already allocated, so the figure stands.
 
+  **Under `--features par` it is worse.** The signal stage's fiber accumulator is **f64**, so one
+  buffer is `nvox * ngrad * 8` bytes = **16.1 GB** at `o = 4`, and `reduce_with` holds a pair live.
+  `compartments.rs` already warns against `fold` here for exactly this reason. The 13.04 GB figure
+  above was measured WITHOUT `par`; the parallel path needs upwards of 32 GB at `o = 4`.
+
+  **Consequence: the CLI default is `o = 2`, not `o = 4`.** There is no setting that is both
+  accurate and memory-safe on ordinary hardware until slab streaming lands, and a default that runs
+  and is documented as approximate beats one that OOMs. `o = 4` remains the accuracy target
+  (~4.5% residual against ~15.6% at `o = 2`) and the benchmark fixtures use it, since their
+  matrices are small.
+
   **Mitigation, now warranted rather than deferred:** Stage B is already per-slice and z is never
   oversampled, so streaming Stage A by z-slab bounds the resident set to one slab rather than the
-  whole volume. Until that lands the CLI runs a pre-flight estimate and warns.
+  whole volume. Redesigning the parallel accumulation so it does not replicate full-volume f64
+  buffers is the companion fix. Until both land the CLI defaults to `o = 2` and warns above 8 GB.
 
 - **Runtime: measured, and phase 10 is not needed.** Release build, 108x152 in-plane, a 104-slice
   75-volume acquisition:

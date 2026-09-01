@@ -11,6 +11,7 @@ use trxscan::compartments::{
 use trxscan::io;
 use trxscan::kspace::{
     simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
+    PartialFourierMode,
 };
 use trxscan::phase::PhaseModel;
 use trxscan::motion;
@@ -86,7 +87,12 @@ struct Cli {
     /// Requires `--sim-*` inputs at `voxel/N`, from
     /// `scripts/prepare_acquisition_grid.py --oversample N`. Upsampling the acquisition-grid maps
     /// instead would add no k-space content and produce no ringing.
-    #[arg(long, value_name = "N", default_value_t = 4)]
+    /// **Default 2, not 4.** o=4 is the accuracy target (residual ~4.5% of the artifact against
+    /// ~15.6% at o=2) but is not memory-safe on ordinary hardware: in-plane voxels scale as o^2,
+    /// a measured end-to-end o=4 run peaked at 13.0 GB single-threaded, and under `--features par`
+    /// the signal stage's f64 accumulator alone is 16.1 GB per buffer with a pair live during the
+    /// reduction. Use o=4 with >=32 GB, or wait for z-slab streaming.
+    #[arg(long, value_name = "N", default_value_t = 2)]
     oversample: usize,
     /// Simulation-grid white-matter map (from prepare_acquisition_grid.py --oversample)
     #[arg(long, value_name = "NII")]
@@ -316,6 +322,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         do_relaxation: true,
         noise_variance: cli.noise,
         partial_fourier: 0.75,  // HBCD
+        // Fiberfox's rule, so shipped behaviour is unchanged. Note it is not exactly 6/8: on an
+        // even matrix it preserves line zero, e.g. 25/32 = 78.1%. Use PartialFourierMode::
+        // Contiguous for scanner-like PF when benchmarking PF-aware reconstruction.
+        pf_mode: PartialFourierMode::FiberfoxCompatible,
         ghost_offset: 0.015,    // subtle residual Nyquist ghost
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,
@@ -358,10 +368,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             * scheme.len() as f64 * 3.0 * 4.0 / 1e9;
         if est_gb > 8.0 {
             eprintln!(
-                "WARNING: the signal stage holds roughly {est_gb:.1} GB on grid {:?} ({} volumes). \
-                 In-plane memory scales as o^2, so halving --oversample quarters it. On limited \
-                 RAM use --oversample 2 (residual rises from ~4.5% to ~15.6% of the artifact).",
-                sig_grid.dims, scheme.len());
+                "WARNING: the signal stage holds roughly {est_gb:.1} GB of f32 compartment images \
+                 on grid {:?} ({} volumes), and its f64 accumulator is about {:.1} GB per buffer \
+                 with a pair live during the parallel reduction. In-plane memory scales as o^2, so \
+                 halving --oversample quarters it. A measured o=4 run peaked at 13.0 GB \
+                 single-threaded.",
+                sig_grid.dims, scheme.len(),
+                sig_grid.dims.iter().product::<usize>() as f64 * scheme.len() as f64 * 8.0 / 1e9);
         }
         println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
                  cli.oversample, cli.phase_model);
@@ -372,7 +385,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \
              matrix, so the transforms are an exact round trip: the output will contain NO Gibbs \
-             ringing and no object phase. Use --oversample 4 for a realistic acquisition.");
+             ringing and no object phase. Use --oversample 2 (default) or 4 for a realistic \
+             acquisition.");
         simulate_acquisition_legacy(
             grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients)
     };
