@@ -796,8 +796,22 @@ more elaborate simulator.
   streaming, which is natural because Stage B is already per-slice and z is not oversampled. Measured
   at the start of phase 1; built in phase 10 if it bites. Per 5.1, `--oversample 1` is a debugging
   aid, not a shipping configuration.
-- **Runtime, ~3.3x** in the k-space stage. Acceptable given the stage is already parallel over
-  volumes; phase 10 (FFT) is the answer if it is not.
+- **Runtime: measured, and phase 10 is not needed.** Release build, 108x152 in-plane, a 104-slice
+  75-volume acquisition:
+
+  | `o` | ms/slice | full acquisition, 1 thread | on 8 cores | sim slice buffer |
+  |---|---|---|---|---|
+  | 1 | 110 | 0.24 h | 0.03 h | 0.1 MB |
+  | 2 | 243 | 0.53 h | 0.07 h | 0.3 MB |
+  | **4 (default)** | **714** | **1.55 h** | **0.19 h** | **1.1 MB** |
+
+  Eleven minutes on 8 cores at the production factor. The phase-10 FFT path and z-slab streaming
+  are therefore **not implemented**: spec 6 defers both until measurement demands them, and the
+  measurement does not. Revisit only if the acquired matrix or oversampling factor grows
+  substantially.
+
+  Note this measures **Stage B**. Stage A's 4x memory (below) is a separate question and remains
+  unmeasured end-to-end, since it needs a full pipeline run against sim-grid maps.
 - **Motion path: cost.** `apply_multiband_motion` and `generate_compartments_moving` operate on
   `comp.images` at the grid dims and inherit both the 4x memory and the 4x rasterization cost. No
   logic change needed; cost only.
