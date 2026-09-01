@@ -4,7 +4,7 @@ The criterion is that varying partial Fourier, phase, noise and windowing produc
 and physically consistent changes in method behaviour -- NOT that methods achieve a predetermined
 ranking. Relative quality between methods is recorded in the results table and never asserted.
 
-**Partial Fourier is now covered by **, a frequency-agnostic complex metric
+**Partial Fourier is now covered by `residual_alignment_pe` and `residual_energy_pe`**, , a frequency-agnostic complex metric
 that measures how much of the simulator's own control artifact survives a method's output. The
 Nyquist projection remains as a specialised full-Fourier measure; PF ringing does not sit at
 Nyquist, so that one alone could not see it. RPG is still absent, so the PF-*aware method*

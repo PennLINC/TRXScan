@@ -258,24 +258,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // computed this immediately before Stage B -- i.e. after generate_mixture had already
     // allocated -- so an allocation failure happened before the warning could ever print.
     //
-    // The dominant allocation differs by path:
-    //   no motion: generate_mixture's dense nvox * 321 f64 orientation histogram + f32 ODF copy
-    //   motion:    generate_compartments' nvox * ngrad f64 accumulator (x2 live under `par`)
-    // plus the f32 compartment images in both cases.
+    // The dominant allocation differs by path, and each is modelled from what the code actually
+    // does rather than from a guess:
+    //
+    //   no motion: generate_mixture's dense nvox * 321 f64 orientation histogram + its f32 ODF
+    //              copy, plus the f32 compartment images.
+    //   motion:    generate_compartments_moving has NO nvox*ngrad f64 accumulator. It works per
+    //              volume (four nvox f32 resampled tissue arrays, two nvox f64, three nvox f32
+    //              outputs), COLLECTS the three f32 outputs for every volume into `vols`
+    //              (3*nvox*ngrad*4 bytes), and then allocates three more nvox*ngrad f32 arrays and
+    //              copies into them. Both are live during that copy, so the floor is
+    //              24 * nvox * ngrad bytes -- not the 20 an earlier version estimated -- plus a
+    //              per-worker allowance, which `par` multiplies.
     {
         let nvox = sig_grid.dims.iter().product::<usize>() as f64;
         let ngrad = scheme.len() as f64;
         let images_gb = nvox * ngrad * 3.0 * 4.0 / 1e9;
+        let workers = if cfg!(feature = "par") {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64
+        } else {
+            1.0
+        };
         let (dominant_gb, what) = if cli.motion.is_some() {
-            (nvox * ngrad * 8.0 / 1e9, "f64 signal accumulator (x2 live under --features par)")
+            // collected per-volume outputs + final arrays, both live during the copy, plus each
+            // in-flight worker's own nvox f32/f64 working set.
+            let per_worker = nvox * (4.0 * 4.0 + 2.0 * 8.0 + 3.0 * 4.0) / 1e9;
+            (nvox * ngrad * 24.0 / 1e9 + workers * per_worker,
+             "collected per-volume outputs + final images, plus per-worker arrays")
         } else {
             (nvox * 321.0 * 12.0 / 1e9, "dense orientation histogram + ODF")
         };
-        let bound = dominant_gb + images_gb;
+        // The motion path's figure already includes the images; the mixture path's does not.
+        let bound = if cli.motion.is_some() { dominant_gb } else { dominant_gb + images_gb };
         if bound > 8.0 {
             eprintln!(
                 "WARNING: signal stage upper bound about {bound:.1} GB on grid {:?} \
-                 ({dominant_gb:.1} GB {what}, {images_gb:.1} GB compartment images, {} volumes).\n\
+                 ({dominant_gb:.1} GB {what}; compartment images {images_gb:.1} GB; {} volumes).\n\
                  \x20        Committed memory is DATA-DEPENDENT and usually lower -- the histogram \
                  faults in only where streamlines deposit, and an o=2 run of this size measured \
                  11.5 GB against a 25.9 GB bound. Treat 16 GB as tight, not safe. In-plane memory \

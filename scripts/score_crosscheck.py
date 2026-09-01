@@ -17,18 +17,28 @@ __all__ = ["naive_oscillatory", "naive_alignment", "naive_energy_ratio",
 
 
 def _peak_indices(grad, thr_frac=0.35):
-    """Local maxima of a gradient profile above a fraction of its max. Independent of the primary."""
+    """One index per PHYSICAL edge: contiguous above-threshold runs collapsed to their centroid.
+
+    Independent of the primary, same definition. A half-voxel edge yields two adjacent
+    above-threshold gradient samples, and treating each as its own peak reported the benchmark
+    box's two edges per axis as four.
+    """
     if not grad or max(grad) <= 0:
         return []
     thr = thr_frac * max(grad)
-    out = []
-    for i in range(len(grad)):
+    out, i, n = [], 0, len(grad)
+    while i < n:
         if grad[i] < thr:
+            i += 1
             continue
-        lo, hi = max(0, i - 2), min(len(grad), i + 3)
-        if grad[i] >= max(grad[lo:hi]):
-            out.append(i)
-    return out or [max(range(len(grad)), key=lambda i: grad[i])]
+        j = i
+        while j + 1 < n and grad[j + 1] >= thr:
+            j += 1
+        w = grad[i:j + 1]
+        tot = sum(w)
+        out.append(int(round(sum(k * w[k - i] for k in range(i, j + 1)) / tot)))
+        i = j + 1
+    return out or [max(range(n), key=lambda i: grad[i])]
 
 
 def _bright_sidelobe_indices(ref_profile, guard=2, half_width=10, bright=0.0, peaks=None):

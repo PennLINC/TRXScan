@@ -114,3 +114,49 @@ def test_residual_alignment_flags_amplification():
     ref, ctl = _complex_edge(), _complex_edge(ring=0.09)
     worse = ref + 1.5 * (ctl - ref)
     assert residual_alignment(worse, ref, ctl) > 1.0
+
+
+def _complex_ringing_edge(n=64):
+    """A step whose complex Gibbs sidelobes alternate on BOTH sides of the edge."""
+    x = np.arange(n)
+    ref = (x >= n // 2 + 0.5).astype(float).astype(complex)
+    lobes = 0.09 * ((-1.0) ** x) * np.exp(-np.abs(x - n // 2) / 6.0)
+    return np.tile(ref, (n, 1)), np.tile(ref + lobes, (n, 1))
+
+
+def test_dark_side_ringing_is_scored_not_discarded():
+    """The exact round-4 defect: bright-side-only masking discarded half the artifact.
+
+    The independent cross-check cannot protect against this -- both scorers used the bright-only
+    interpretation and AGREED WITH EACH OTHER WHILE BOTH WERE WRONG. This pins the physical
+    property instead: a method that removes only the bright-side sidelobes has NOT removed the
+    artifact, and the primary complex score must say so.
+    """
+    from score_unringing import residual_energy_ratio, PHASE_ENCODE_AXIS
+    ref, ctl = _complex_ringing_edge()
+    n = ref.shape[-1]
+    bright = np.abs(ref) > 0.5 * np.abs(ref).max()
+
+    # Fix only where the reference is bright; leave the dark side exactly as acquired.
+    est = ctl.copy()
+    est[bright] = ref[bright]
+
+    full = residual_energy_ratio(est, ref, ctl, axis=PHASE_ENCODE_AXIS)
+    bright_only = residual_energy_ratio(est, ref, ctl, axis=PHASE_ENCODE_AXIS, bright=0.5)
+
+    assert bright_only < 0.05, (
+        f"a bright-side-only fix should look perfect to the bright-only metric, got {bright_only:.3f}")
+    assert full > 0.5, (
+        f"the primary metric must still see the untouched dark-side ringing, got {full:.3f}")
+
+
+def test_dark_side_alternation_survives_the_complex_reconstruction():
+    """Why the bright-only mask was wrong: magnitude rectifies, complex does not."""
+    ref, ctl = _complex_ringing_edge()
+    row = ref.shape[0] // 2
+    n = ref.shape[-1]
+    dark = slice(n // 2 - 9, n // 2 - 2)
+    mag_resid = (np.abs(ctl) - np.abs(ref))[row, dark]
+    cpx_resid = (ctl - ref).real[row, dark]
+    assert np.all(mag_resid > 0), "magnitude rectifies the dark side"
+    assert np.any(np.diff(np.sign(cpx_resid)) != 0), "complex must retain the alternation"

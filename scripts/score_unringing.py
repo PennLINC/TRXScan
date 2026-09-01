@@ -116,6 +116,37 @@ def _nyquist_amplitude(diff, ref, half_width=10, guard=2, bright=0.0):
 
 
 
+def physical_edges(grad_profile, thr_frac=0.35):
+    """Centroids of the PHYSICAL edges in a gradient profile, one per edge.
+
+    Adjacent high-gradient samples are a single boundary, not several. The benchmark places its
+    edges at half-voxel positions, so after block averaging a profile reads `0, 0.5, 1` and its
+    gradient reads `0.5, 0.5` -- two samples that BOTH satisfy `>= local max`. A naive local-maximum
+    test therefore reported the box's two edges per axis as four, which widened and duplicated the
+    guard regions in `_sidelobe_indices` and made `_edge_shifts` return four values for two edges.
+
+    Clusters of contiguous above-threshold samples are collapsed to their gradient-weighted
+    centroid.
+    """
+    g = np.asarray(grad_profile, float)
+    if g.size == 0 or g.max() <= 0:
+        return []
+    above = g >= thr_frac * g.max()
+    edges, i = [], 0
+    while i < g.size:
+        if not above[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < g.size and above[j + 1]:
+            j += 1
+        w = g[i:j + 1]
+        idx = np.arange(i, j + 1)
+        edges.append(float((w * idx).sum() / w.sum()))
+        i = j + 1
+    return edges or [float(np.argmax(g))]
+
+
 def _sidelobe_indices(grad_profile, n, half_width, guard):
     """Sidelobe indices around EVERY significant edge, not just the strongest.
 
@@ -124,20 +155,9 @@ def _sidelobe_indices(grad_profile, n, half_width, guard):
     two phase-encode edges need not have equivalent sidelobes -- so measuring one of them measures
     half the artifact.
     """
-    g = np.asarray(grad_profile, float)
-    if g.size == 0 or g.max() <= 0:
-        return np.arange(0)
-    peaks = []
-    thr = 0.35 * g.max()
-    for i in range(g.size):
-        if g[i] < thr:
-            continue
-        lo = max(0, i - 2)
-        hi = min(g.size, i + 3)
-        if g[i] >= g[lo:hi].max():          # local maximum above threshold
-            peaks.append(i)
+    peaks = [int(round(c)) for c in physical_edges(grad_profile)]
     if not peaks:
-        peaks = [int(np.argmax(g))]
+        return np.arange(0)
     keep = np.zeros(n, bool)
     for p in peaks:
         lo, hi = max(0, p - half_width), min(n, p + half_width + 1)
@@ -170,13 +190,9 @@ def _edge_shifts(est, ref, half_width=8):
     if dr.size == 0 or dr.max() <= 0:
         return []
     x = np.arange(dr.shape[-1]) + 0.5
-    summed = dr.sum(axis=0)
-    thr = 0.35 * summed.max()
-    peaks = [i for i in range(summed.size)
-             if summed[i] >= thr
-             and summed[i] >= summed[max(0, i - 2):min(summed.size, i + 3)].max()]
+    peaks = [int(round(c)) for c in physical_edges(dr.sum(axis=0))]
     if not peaks:
-        peaks = [int(np.argmax(summed))]
+        return []
     out = []
     for p in peaks:
         lo, hi = max(0, p - half_width), min(dr.shape[-1], p + half_width + 1)
@@ -193,12 +209,24 @@ def _edge_shifts(est, ref, half_width=8):
 
 
 def _edge_shift(est, ref, half_width=8):
-    """Mean sub-voxel edge displacement over ALL edges. See `_edge_shifts` for the per-edge detail.
+    """RMS sub-voxel edge displacement over all edges -- a NON-CANCELLING geometric error.
+
+    The signed mean is the wrong scalar for the error decomposition: under contiguous 6/8 the two
+    PE edges move in opposite directions, so a signed mean reports "no bias" while every edge has
+    moved substantially. RMS answers the question the benchmark actually asks -- how far are edges
+    from where they belong -- while `_edge_shifts` retains the signed per-edge values and
+    `_edge_shift_signed` the global-translation quantity.
 
     Windowed around each REFERENCE edge, not taken over the whole profile: a whole-profile centroid
     is pulled arbitrarily far by any second structural edge -- including a periodic image's
     wrap-around -- which once reported a +2 voxel shift as -14.
     """
+    vals = [v for v in _edge_shifts(est, ref, half_width) if v == v]
+    return float(np.sqrt(np.mean(np.square(vals)))) if vals else float("nan")
+
+
+def _edge_shift_signed(est, ref, half_width=8):
+    """Signed mean displacement: global translation, which CAN legitimately cancel."""
     vals = [v for v in _edge_shifts(est, ref, half_width) if v == v]
     return float(np.mean(vals)) if vals else float("nan")
 
@@ -395,6 +423,8 @@ def score(est_mag, est_phase, ref_mag, ref_phase, mag_threshold=0.1, axis=None,
                 _edge_shift(em, rm_) if rs > 0 else float("nan"))
             per_axis[f"edge_location_bias_{name}_per_edge"] = (
                 _edge_shifts(em, rm_) if rs > 0 else [])
+            per_axis[f"edge_location_shift_{name}_signed"] = (
+                _edge_shift_signed(em, rm_) if rs > 0 else float("nan"))
         # Unsuffixed key keeps the auto-selected axis, for 1D fixtures and general use. The
         # _ro / _pe pair is what the benchmark must consult, because auto-selection is undefined
         # on a symmetric phantom.

@@ -816,12 +816,19 @@ more elaborate simulator.
   6.72 M here. The bound is what a fully-covered volume would need; 11.46 GB is what this tractogram
   actually costs.
 
-  `o = 2` therefore fits a 16 GB machine, with little headroom. `o = 4` is not attempted: its bound
+  **`o = 2` on 16 GB is tight and data-dependent, not safe.** The 11.46 GB measurement is one
+  tractogram and one mask against a 25.9 GB bound; the gap is sparse page commitment, and a denser
+  tractogram or a larger mask moves the figure toward the bound. `o = 4` is not attempted: its bound
   is 104 GB and even a sparsely-covered run would be far beyond ordinary hardware.
 
-  **Under `--features par` it is worse still.** The `generate_compartments` motion path uses an f64
-  accumulator, `nvox * ngrad * 8` = 16.1 GB per buffer at `o = 4`, with a pair live during
-  `reduce_with`; `compartments.rs` already warns against `fold` for that reason.
+  **The motion path is different again, and an earlier draft described it wrongly.**
+  `generate_compartments_moving` has **no** `nvox * ngrad` f64 accumulator. It works per volume
+  (four `nvox` f32 resampled tissue arrays, two `nvox` f64, three `nvox` f32 outputs), **collects**
+  the three f32 outputs for every volume into `vols`, then allocates three more `nvox * ngrad` f32
+  arrays and copies into them. Both are live during the copy, so the floor is
+  **`24 * nvox * ngrad` bytes** -- 12.1 GB at `o = 2` HBCD-sized, against the 10.1 GB an earlier
+  20-byte estimate gave -- plus one working set per in-flight worker, which `par` multiplies.
+  Writing each volume directly into the final arrays would remove the duplication.
 
   **Mitigations, all now warranted rather than deferred:** z-slab streaming (Stage B is already
   per-slice and z is never oversampled); sparse or masked-voxel orientation storage instead of the

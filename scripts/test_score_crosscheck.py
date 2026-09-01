@@ -147,3 +147,19 @@ def test_partial_fourier_box_cross_checks_on_both_axes():
     for axis in (0, 1):
         ok, detail = compare_scorers(est, ref, ctl, axis=axis)
         assert ok, f"axis {axis}: {detail}"
+
+
+def test_the_box_has_exactly_two_edges_per_axis():
+    """A rectangle has two boundaries per axis. Detecting four means plateaus are being split.
+
+    The benchmark places its edges at half-voxel positions, so a block-averaged profile reads
+    0, 0.5, 1 and its gradient reads 0.5, 0.5 -- two adjacent samples that both pass a naive
+    local-maximum test. That reported four PE edges for two, and widened the sidelobe guard bands.
+    """
+    from score_crosscheck import _peak_indices
+    from score_unringing import physical_edges
+    box = np.abs(_box(ring=False))
+    for axis in (0, 1):
+        g = np.abs(np.diff(box, axis=axis)).sum(axis=1 - axis)
+        assert len(physical_edges(g)) == 2, f"primary, axis {axis}: {physical_edges(g)}"
+        assert len(_peak_indices(list(g))) == 2, f"naive, axis {axis}: {_peak_indices(list(g))}"
