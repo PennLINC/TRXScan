@@ -164,10 +164,22 @@ pub struct Acquisition {
     pub seed: u64,            // mixed into every derived per-slice seed; 0 reproduces legacy output
 }
 
-/// Spatial sensitivity of `coil` (of `n_coils` arranged in a ring) at pixel `(x,y)`. Uniform for a
-/// single coil; otherwise a Gaussian falloff from the coil position (distinct per coil — the
-/// spatial diversity GRAPPA/SENSE need). Not normalized; RSS combine handles the overall scale.
-fn coil_sensitivity(coil: usize, n_coils: usize, x: usize, y: usize, nx: usize, ny: usize) -> f64 {
+/// Spatial sensitivity of `coil` (of `n_coils` arranged in a ring) at continuous position
+/// `(x, y)` in ACQUIRED-voxel units, on an `nx` x `ny` acquired matrix. Uniform for a single coil;
+/// otherwise a Gaussian falloff from the coil position (distinct per coil — the spatial diversity
+/// GRAPPA/SENSE need). Not normalized; the Roemer combine handles the overall scale.
+///
+/// The coordinates are continuous and acquired-voxel-based on purpose. This function is called
+/// from two places that walk DIFFERENT grids — the forward model walks the oversampled simulation
+/// grid, the Roemer combine walks the acquired matrix — and it must describe the same physical
+/// field to both, or the combine divides by sensitivities the signal was never multiplied by.
+/// Taking `(x: usize, nx: usize)` and centring on `nx/2` did not: at oversampling `o` the forward
+/// model's field was displaced by `(o-1)/(2o)` acquired voxels relative to the combine's, because
+/// the sim cells composing an acquired voxel are centred on it (`xoff = (o-1)/2`) rather than
+/// starting at it. Sub-voxel and negligible for these very smooth Gaussians — and exactly zero for
+/// the canonical Gibbs benchmark, which forces `n_coils = 1` — but wrong, and it would stop being
+/// negligible the moment anyone supplied a sharper sensitivity map.
+fn coil_sensitivity(coil: usize, n_coils: usize, x: f64, y: f64, nx: usize, ny: usize) -> f64 {
     if n_coils <= 1 {
         return 1.0;
     }
@@ -175,7 +187,7 @@ fn coil_sensitivity(coil: usize, n_coils: usize, x: usize, y: usize, nx: usize, 
     let r = 0.6 * nx.max(ny) as f64;
     let ang = TAU * coil as f64 / n_coils as f64;
     let (px, py) = (cx + r * ang.cos(), cy + r * ang.sin());
-    let d2 = (x as f64 - px).powi(2) + (y as f64 - py).powi(2);
+    let d2 = (x - px).powi(2) + (y - py).powi(2);
     let sigma = 0.9 * nx.max(ny) as f64;
     (-d2 / (2.0 * sigma * sigma)).exp() + 0.15
 }
@@ -205,14 +217,6 @@ impl Default for Acquisition {
             acs_lines: 24,
             seed: 0,
         }
-    }
-}
-
-impl Acquisition {
-    /// Defaults for a given acquired matrix. `Default::default()` is retained for callers that
-    /// do not care about the matrix.
-    pub fn default_for(_nx: usize, _ny: usize) -> Self {
-        Acquisition::default()
     }
 }
 
@@ -425,20 +429,22 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
                     }
                     f_real += v;
                 }
-                // sensitivity is evaluated on the sim grid; the profile is scale-invariant, so
-                // the same physical field is sampled at any oversampling factor
-                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, x, y, snx, sny);
+                // This sim cell's position in ACQUIRED voxel units, half-cell registered exactly
+                // as the object is (`xoff = (o-1)/2`). Everything downstream that has to agree
+                // with a quantity defined on the acquired matrix — coil sensitivities, eddy
+                // polynomials — is expressed in these coordinates rather than in sim indices.
+                let (xc, yc) = (
+                    (x as f64 - sxs as f64 - xoff) / ox as f64,
+                    (y as f64 - sys as f64 - yoff) / oy as f64,
+                );
+                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xc, yc, nx, ny);
                 let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
                 if do_eddy {
                     // gradient-dependent field growing through the readout: linear (g·pos) plus a
                     // quadratic (g·pos²) term — the polynomial forms eddy/TORTOISE fit.
-                    // centre on the sim grid, then express in ACQUIRED voxel units so that
                     // eddy_strength/eddy_quad keep their meaning independent of oversampling
-                    let (xc, yc, zc) = (
-                        (x as f64 - sxs as f64 - xoff) / ox as f64,
-                        (y as f64 - sys as f64 - yoff) / oy as f64,
-                        z as f64 - zs as f64,
-                    );
+                    // because `xc`/`yc` above are already in acquired-voxel units.
+                    let zc = z as f64 - zs as f64;
                     let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
                     let quad =
                         gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
@@ -611,7 +617,7 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
         let img = inverse_2d(ks, nx, ny, xs, ys);
         for y in 0..ny {
             for x in 0..nx {
-                let s = coil_sensitivity(coil, ncoils, x, y, nx, ny);
+                let s = coil_sensitivity(coil, ncoils, x as f64, y as f64, nx, ny);
                 let i = kat(x, y);
                 wsum[i] = wsum[i].add(img[i].scale(s));
                 ssum[i] += s * s;
@@ -1183,6 +1189,88 @@ mod tests {
         assert!(center > 0.1 && center > corner, "RSS should recover the brain: center {center} corner {corner}");
     }
 
+    /// The forward model and the Roemer combine must sample ONE physical sensitivity field.
+    ///
+    /// They walk different grids: the forward model the oversampled sim grid, the combine the
+    /// acquired matrix. Before the fix, the forward model passed sim indices against `(snx, sny)`
+    /// and so centred the coil ring on `snx/2`, which in acquired-voxel terms is `nx/2 -
+    /// (o-1)/(2o)` — displaced from the combine's `nx/2` by a quarter voxel at o = 2. This test
+    /// pins the property that made it wrong: the `o` sim cells composing acquired voxel `v` are
+    /// centred ON `v`, so their sensitivities average to the value the combine uses there.
+    #[test]
+    fn coil_sensitivity_is_registered_identically_on_both_grids() {
+        let (nx, ny, ncoils) = (32usize, 32usize, 4usize);
+        for o in [1usize, 2, 3, 4, 8] {
+            let (xoff, yoff) = ((o as f64 - 1.0) / 2.0, (o as f64 - 1.0) / 2.0);
+            for coil in 0..ncoils {
+                for v in [0usize, 1, 7, nx / 2, nx - 1] {
+                    // Mean over the sim cells of acquired voxel (v, v), in acquired-voxel units.
+                    let mut acc = 0.0;
+                    for i in 0..o {
+                        for j in 0..o {
+                            let xc = (v * o + i) as f64 / o as f64 - xoff / o as f64;
+                            let yc = (v * o + j) as f64 / o as f64 - yoff / o as f64;
+                            acc += coil_sensitivity(coil, ncoils, xc, yc, nx, ny);
+                        }
+                    }
+                    let sim_mean = acc / (o * o) as f64;
+                    let combined = coil_sensitivity(coil, ncoils, v as f64, v as f64, nx, ny);
+                    // A Gaussian is not linear, so the block mean is not EXACTLY the centre
+                    // value. Its curvature over one acquired voxel puts the residual at most
+                    // 7.9e-5 across this sweep; the tolerance sits an order of magnitude above
+                    // that and two below the unregistered error asserted just below, so the test
+                    // separates the two rather than merely accepting the current numbers.
+                    assert!(
+                        (sim_mean - combined).abs() < 1e-3,
+                        "o={o} coil={coil} v={v}: sim-grid mean {sim_mean} vs combine {combined}"
+                    );
+
+                    // The OLD convention, reconstructed here so the test cannot pass vacuously:
+                    // sim index against `(snx, sny)`. Every length in `coil_sensitivity` scales
+                    // with the matrix, so that is exactly this field evaluated at `x / o` — i.e.
+                    // displaced by `xoff / o = (o-1)/(2o)` acquired voxels. Worst case over this
+                    // sweep is 1.15e-2, 146x the registered residual.
+                    let mut old = 0.0;
+                    for i in 0..o {
+                        for j in 0..o {
+                            old += coil_sensitivity(
+                                coil, ncoils,
+                                (v * o + i) as f64 / o as f64,
+                                (v * o + j) as f64 / o as f64,
+                                nx, ny,
+                            );
+                        }
+                    }
+                    let old_mean = old / (o * o) as f64;
+                    if o > 1 && v != nx / 2 {
+                        assert!(
+                            (old_mean - combined).abs() > (sim_mean - combined).abs(),
+                            "o={o} coil={coil} v={v}: unregistered sampling was no worse \
+                             ({old_mean} vs registered {sim_mean}, combine {combined})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The half-cell registration itself, stated as arithmetic: the sim cells of acquired voxel
+    /// `v` have centroid exactly `v` in acquired-voxel units, at every oversampling factor. This
+    /// is the invariant every acquired-grid quantity evaluated on the sim grid depends on.
+    #[test]
+    fn sim_cells_of_an_acquired_voxel_are_centred_on_it() {
+        for o in [1usize, 2, 3, 4, 8, 16] {
+            let xoff = (o as f64 - 1.0) / 2.0;
+            for v in 0..5usize {
+                let mean: f64 = (0..o)
+                    .map(|i| ((v * o + i) as f64 - xoff) / o as f64)
+                    .sum::<f64>()
+                    / o as f64;
+                assert!((mean - v as f64).abs() < 1e-12, "o={o} v={v}: centroid {mean}");
+            }
+        }
+    }
+
     #[test]
     fn grappa_unfolds_undersampled_multicoil_data() {
         let (nx, ny) = (32, 32);
@@ -1201,7 +1289,7 @@ mod tests {
     use crate::analytic::truncated_step_profile;
 
     /// Acquisition with every artifact off: pure finite-Fourier acquisition.
-    fn clean(nx: usize, ny: usize) -> Acquisition {
+    fn clean() -> Acquisition {
         Acquisition {
             signal_scale: 1.0,
             do_distortions: false,
@@ -1213,7 +1301,7 @@ mod tests {
             eddy_strength: 0.0,
             n_coils: 1,
             accel: 1,
-            ..Acquisition::default_for(nx, ny)
+            ..Acquisition::default()
         }
     }
 
@@ -1236,7 +1324,7 @@ mod tests {
         // The original defect (finding 2.5): noise populated k-space that was never acquired,
         // so the signal was band-limited while the noise stayed white to the full Nyquist.
         let (nx, ny) = (24usize, 24usize);
-        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean(nx, ny) };
+        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean() };
         let mask = sampling_mask(nx, ny, &acq);
         assert!(mask.iter().any(|b| !b), "pf=0.75 must leave some samples unacquired");
         let empty = vec![0.0f32; nx * ny];
@@ -1264,7 +1352,7 @@ mod tests {
         // sampling, so the full-sampling SD is sqrt(noise_variance) = 1.0 here.
         let (nx, ny) = (32usize, 32usize);
         let sd_at = |pf: f64| -> f64 {
-            let acq = Acquisition { partial_fourier: pf, noise_variance: 1.0, ..clean(nx, ny) };
+            let acq = Acquisition { partial_fourier: pf, noise_variance: 1.0, ..clean() };
             let empty = vec![0.0f32; nx * ny];
             let fmap = vec![0.0f32; nx * ny];
             let comps: [&[f32]; 1] = [&empty];
@@ -1282,7 +1370,7 @@ mod tests {
         let full = sd_at(1.0);
         assert!((full - 1.0).abs() < 0.15, "full-sampling per-component SD {full:.3}, expected ~1.0");
         let frac = |pf: f64| {
-            let acq = Acquisition { partial_fourier: pf, ..clean(nx, ny) };
+            let acq = Acquisition { partial_fourier: pf, ..clean() };
             let m = sampling_mask(nx, ny, &acq);
             m.iter().filter(|b| **b).count() as f64 / (nx * ny) as f64
         };
@@ -1302,7 +1390,7 @@ mod tests {
         // Spec 4.1.7a, scoped to GRAPPA disabled and window None: for white noise on mask M, the
         // reconstructed image noise autocovariance is the inverse DFT of M, up to scale.
         let (nx, ny) = (16usize, 16usize);
-        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean(nx, ny) };
+        let acq = Acquisition { partial_fourier: 0.75, noise_variance: 1.0, ..clean() };
         let mask = sampling_mask(nx, ny, &acq);
         let empty = vec![0.0f32; nx * ny];
         let fmap = vec![0.0f32; nx * ny];
@@ -1384,7 +1472,7 @@ mod tests {
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
                 },
-                &Acquisition { partial_fourier: pf, ..clean(nx, ny) },
+                &Acquisition { partial_fourier: pf, ..clean() },
             )
         };
         let col = nx / 2;
@@ -1424,7 +1512,7 @@ mod tests {
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
-        let out = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &clean(nx, ny));
+        let out = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &clean());
         let mr = out.iter().map(|p| p.0.abs()).fold(0.0f32, f32::max);
         let mi = out.iter().map(|p| p.1.abs()).fold(0.0f32, f32::max);
         let residual = (mi / mr) as f64;
@@ -1447,7 +1535,7 @@ mod tests {
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
                 },
-                &Acquisition { noise_variance: 1.0, window: w, ..clean(nx, ny) },
+                &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
             (out.iter().map(|p| (p.0 as f64).powi(2)).sum::<f64>() / (nx * ny) as f64).sqrt()
         };
@@ -1470,7 +1558,7 @@ mod tests {
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
                 },
-                &Acquisition { window: w, ..clean(nx, ny) },
+                &Acquisition { window: w, ..clean() },
             );
             (nx / 2 + 1..nx).map(|x| out[x + nx * (ny / 2)].0 as f64).fold(f64::MIN, f64::max)
         };
@@ -1489,7 +1577,7 @@ mod tests {
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
-        let acq = clean(nx, ny);
+        let acq = clean();
         let base = simulate_slice(&step_input(&comps, &fmap, None, snx, sny, nx, ny), &acq);
         let alpha = 0.7f64;
         let field = vec![alpha; snx * sny];
@@ -1515,7 +1603,7 @@ mod tests {
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
-        let acq = clean(nx, ny);
+        let acq = clean();
         let ratio = |v: &Vec<(f32, f32)>| {
             let mr = v.iter().map(|p| p.0.abs()).fold(0.0f32, f32::max);
             let mi = v.iter().map(|p| p.1.abs()).fold(0.0f32, f32::max);
@@ -1542,7 +1630,7 @@ mod tests {
         let (nx, ny, o) = (32usize, 32usize, 8usize);
         let (snx, sny) = (nx * o, ny * o);
         let fmap = vec![0.0f32; snx * sny];
-        let acq = clean(nx, ny);
+        let acq = clean();
 
         for i in 0..16 {
             let delta = i as f64 / 16.0;
@@ -1587,7 +1675,7 @@ mod tests {
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
             bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
         };
-        let out = simulate_slice(&inp, &clean(nx, ny));
+        let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
         let peak = (nx / 2 + 1..nx).map(|x| out[x + nx * row].0 as f64).fold(f64::MIN, f64::max);
         assert!(peak > 1.05, "expected intrinsic overshoot, got peak {peak:.4}");
@@ -1598,7 +1686,7 @@ mod tests {
         // Spec 4.1.6: adequacy is convergence of the ACQUIRED coefficients, not smoothness of the
         // object. A sharp edge is deliberately not band-limited; that is not a defect.
         let (nx, ny) = (16usize, 16usize);
-        let acq = clean(nx, ny);
+        let acq = clean();
         let k_at = |o: usize| -> Vec<(f64, f64)> {
             let (snx, sny) = (nx * o, ny * o);
             let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.37) * o as f64);

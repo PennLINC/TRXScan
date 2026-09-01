@@ -118,3 +118,40 @@ def test_correctability_degrades_as_the_old_mechanism_moves_the_cutoff():
 
 def test_available_methods_always_includes_the_control():
     assert "none" in available_methods(), "the no-op control is not optional"
+
+
+def test_old_dipy_fallback_does_not_mutate_the_callers_array(monkeypatch):
+    """Emulate a pre-`inplace` DIPY and assert `run_method` still hands back an intact input.
+
+    Runs with or without DIPY installed: the module is faked outright, so the test pins the
+    harness's contract rather than any particular DIPY version. The fake rejects the `inplace`
+    and `num_processes` kwargs exactly as the old signatures did, which forces `_run_dipy` down
+    the fallback branch, and then overwrites its argument the way `inplace=True` does.
+    """
+    import sys
+    import types
+
+    import run_unringing
+
+    def old_gibbs_removal(vol, *a, **kw):
+        if a or kw:
+            raise TypeError("gibbs_removal() got unexpected arguments")
+        vol *= 0.0                       # in-place, as DIPY's default has always been
+        vol += 7.0
+        return vol
+
+    mod = types.ModuleType("dipy.denoise.gibbs")
+    mod.gibbs_removal = old_gibbs_removal
+    monkeypatch.setitem(sys.modules, "dipy", types.ModuleType("dipy"))
+    monkeypatch.setitem(sys.modules, "dipy.denoise", types.ModuleType("dipy.denoise"))
+    monkeypatch.setitem(sys.modules, "dipy.denoise.gibbs", mod)
+    monkeypatch.setattr(run_unringing, "available_methods", lambda: ["none", "dipy"])
+
+    # float64 so `np.asarray(mag, float)` in run_method returns the SAME object, which is the
+    # condition under which the mutation would reach the caller.
+    mag = np.arange(16, dtype=float).reshape(4, 4)
+    before = mag.copy()
+    out, _ = run_unringing.run_method("dipy", mag, np.zeros_like(mag))
+
+    assert np.array_equal(mag, before), "old-DIPY fallback overwrote the caller's magnitude"
+    assert np.allclose(out, 7.0), "the fake correction did not reach the caller"

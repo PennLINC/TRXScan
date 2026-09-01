@@ -6,6 +6,11 @@ Resamples the WM/GM/CSF probsegs and the fieldmap onto an isotropic acquisition 
 phase-encode (y) axis so EPI distortion cannot wrap around the FOV. Optionally writes a
 geometric myelination map (EDT depth x posterior->anterior ramp) for the infant preset.
 
+`--voxel` is in millimetres and is resolved against the source affine's zooms, so any
+anatomical grid works; the bundled inputs happen to be 1 mm isotropic, but nothing here
+assumes it. `--pad` remains in TARGET voxels, which is what the EPI wrap-around argument
+is actually about.
+
 Needs: python3 with nibabel and scipy.
 
 Example (from the bundle root):
@@ -28,7 +33,10 @@ def main():
                          "<prefix>_desc-atlas_fieldmap.nii.gz")
     ap.add_argument("--prefix", required=True, help="e.g. sub-0001a_space-ACPC")
     ap.add_argument("--out", required=True, type=Path, help="output directory")
-    ap.add_argument("--voxel", type=float, default=1.7, help="acquisition voxel size, mm iso")
+    ap.add_argument("--voxel", type=float, default=1.7,
+                    help="acquisition voxel size, mm isotropic. Resolved against the SOURCE "
+                         "affine's zooms, so it means millimetres for any input grid, not only "
+                         "for a 1 mm anatomical.")
     ap.add_argument("--oversample", type=int, default=1, metavar="N",
                     help="also write a simulation grid at voxel/N in-plane (same FOV, same "
                          "slice thickness) into <out>/sim. N must be a positive integer: the "
@@ -53,13 +61,30 @@ def main():
     VOX, PAD = a.voxel, np.array(a.pad)
     nz = np.argwhere(tissue > 0.3)
     lo, hi = nz.min(0), nz.max(0) + 1
-    shape = tuple(int(np.ceil(s / VOX)) + 2 * p for s, p in zip(hi - lo, PAD))
     A = probs["WM"].affine
+    # `--voxel` is millimetres, so the index-space scale factor is VOX / (source zoom) PER AXIS.
+    # Hardcoding `diag([VOX] * 3)` made the whole geometry -- target spacing, matrix size and the
+    # `(VOX - 1) / 2` centring term alike -- silently assume a 1 mm isotropic source, which the
+    # bundled anatomicals happen to be. On anything else the output was VOX * zoom mm per voxel
+    # while the header claimed otherwise.
+    zooms = np.asarray(probs["WM"].header.get_zooms()[:3], float)
+    if not np.all(zooms > 0):
+        raise SystemExit(f"source has a non-positive voxel size {tuple(zooms)}")
+    step = VOX / zooms                       # target voxels expressed in source voxel indices
+    shape = tuple(int(np.ceil(s / k)) + 2 * p for s, k, p in zip(hi - lo, step, PAD))
     M = np.eye(4)
-    M[:3, :3] = np.diag([VOX] * 3)
-    M[:3, 3] = lo + (VOX - 1) / 2.0 - VOX * PAD
+    M[:3, :3] = np.diag(step)
+    # Half-voxel centring: a target voxel spans `step` source voxels, so its centre sits
+    # `(step - 1) / 2` source-voxel indices past the first source voxel it covers.
+    M[:3, 3] = lo + (step - 1) / 2.0 - step * PAD
     affine = A @ M
     target = (shape, affine)
+    got = np.linalg.norm(affine[:3, :3], axis=0)
+    if not np.allclose(got, VOX, rtol=1e-6, atol=1e-6):
+        raise SystemExit(
+            f"internal error: target spacing {tuple(np.round(got, 6))} mm != requested {VOX} mm "
+            f"(source zooms {tuple(zooms)}); a sheared source affine is not supported"
+        )
 
     for t, key in [("WM", "wm"), ("GM", "gm"), ("CSF", "csf")]:
         r = resample_from_to(probs[t], target, order=1)
@@ -100,7 +125,7 @@ def main():
                              - 0.5 * affine[:3, 1] * (1 - 1.0 / n))
         sim_target = (sim_shape, sim_affine)
         # Resample from the ANATOMICAL source, never from the acquisition grid written above.
-        # The 1 mm source carries frequencies well above the acquisition Nyquist, and those are
+        # The source carries frequencies well above the acquisition Nyquist, and those are
         # exactly what generates Gibbs ringing when the acquired band is selected. Upsampling the
         # already-downsampled maps adds no k-space content, so cropping back would return them
         # unchanged and produce no ringing at all (spec 3.1, "On the 1 mm source").

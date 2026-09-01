@@ -10,6 +10,7 @@ Nyquist projection remains as a specialised full-Fourier measure; PF ringing doe
 Nyquist, so that one alone could not see it. RPG is still absent, so the PF-*aware method*
 comparison remains unavailable -- but the PF *axis* is no longer unmeasured.
 """
+import statistics
 from collections import defaultdict
 
 __all__ = ["check_consistency", "SHARPNESS_FLOOR"]
@@ -28,6 +29,18 @@ def _by(rows, **eq):
     return [r for r in rows if all(r.get(k) == v for k, v in eq.items())]
 
 
+def _unapodized(row):
+    """One definition of "no reconstruction window", used by every rule and every report.
+
+    The fixture writer serialises `KspaceWindow::None` as the string `"None"`, hand-written rows
+    tend to use `None` or `"none"`, and rule (b) used to spell the test `row.get("window") not in
+    (None, "None")` while rules (a) and (c) spelled it `str(...) in ("None", "none")`. The two
+    forms disagree on a lowercase `"none"`, which would have put a row inside rule (b) and outside
+    (a) and (c) at the same time.
+    """
+    return str(row.get("window")) in ("None", "none")
+
+
 def check_consistency(rows):
     """Return (ok, reasons). Each reason names a physically implausible behaviour."""
     reasons = []
@@ -39,16 +52,19 @@ def check_consistency(rows):
     # Hann controls into a floor used only on full-Fourier clean unapodized rows made the
     # "negligible artifact" exemption depend on conditions the rule never sees.
     def _median(vals):
+        # A real median, not `v[len(v) // 2]`. Both control populations below are EVEN -- rule (a)
+        # sees four (one per phase condition) and rule (b) twelve (three PF x four phase) -- so
+        # the upper-middle sample was being used in every actual run, not just hypothetically.
         v = sorted(x for x in vals if x is not None and x == x)
-        return v[len(v) // 2] if v else 0.0
+        return statistics.median(v) if v else 0.0
 
     in_domain_a = [r for r in rows if r["method"] == "none" and r["pf"] >= 1.0
-                   and not r.get("noisy", False) and str(r.get("window")) in ("None", "none")]
+                   and not r.get("noisy", False) and _unapodized(r)]
     floor = NEGLIGIBLE_RINGING_FRACTION * _median(r["oscillatory_residual"] for r in in_domain_a)
     # Gate on the ABSOLUTE artifact size, not a ratio: residual_energy for the control is
     # identically 1 (its residual IS R0), so a ratio-based gate can never skip anything.
     in_domain_b = [r for r in rows if r["method"] == "none" and not r.get("noisy", False)
-                   and str(r.get("window")) in ("None", "none")]
+                   and _unapodized(r)]
     pe_floor = NEGLIGIBLE_RINGING_FRACTION * _median(
         r.get("artifact_norm_pe") for r in in_domain_b)
 
@@ -61,7 +77,7 @@ def check_consistency(rows):
             if r["pf"] < 1.0 or r.get("noisy", False):
                 continue          # Gibbs-removal rules run on CLEAN rows; the paired noisy rows
                                   # are for noise-amplification and robustness reporting.
-            if str(r.get("window")) not in ("None", "none"):
+            if not _unapodized(r):
                 continue          # apodized input is out of domain for ALL method-performance
                                   # rules, not just (b) -- see the module docstring. An earlier
                                   # version skipped it only in (b), so
@@ -102,7 +118,7 @@ def check_consistency(rows):
             cpe = ctrl[0].get("artifact_norm_pe")
             if cpe is None or cpe != cpe or cpe < pe_floor:
                 continue                        # nothing to remove on this axis
-            if r.get("window") not in (None, "None"):
+            if not _unapodized(r):
                 # OUT OF DOMAIN, reported not asserted. Kellner's sub-voxel shift assumes an
                 # unapodized rectangular window -- MRtrix says as much, recommending scanner
                 # filtering be disabled for best mrdegibbs performance. Measured here, mrdegibbs
@@ -145,7 +161,7 @@ def check_consistency(rows):
         for r in _by(rows, method=m):
             if r.get("noisy", False):
                 continue                      # clean rows only, as in (a) and (b)
-            if str(r.get("window")) not in ("None", "none"):
+            if not _unapodized(r):
                 continue                      # apodization legitimately softens edges
             for ax in ("ro", "pe"):
                 # Worst physical edge, not the profile maximum: the latter is dominated by the
@@ -268,7 +284,7 @@ def main(argv=None):
     # filtering for best mrdegibbs performance -- so how these methods behave on apodized input is
     # a real result worth tabulating, not a reason to fail the suite.
     apod = [r for r in rows
-            if r["method"] != "none" and str(r.get("window")) not in ("None", "none")
+            if r["method"] != "none" and not _unapodized(r)
             and r.get("residual_alignment_pe") == r.get("residual_alignment_pe")]
     if apod:
         by = defaultdict(list)

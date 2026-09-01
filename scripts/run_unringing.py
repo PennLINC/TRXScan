@@ -86,7 +86,13 @@ def _run_dipy(mag):
     try:
         return gibbs_removal(mag, inplace=False, num_processes=1)
     except TypeError:                       # older signatures lack these kwargs
-        return gibbs_removal(mag)
+        # `.copy()` is load-bearing, not defensive. DIPY's `gibbs_removal` defaults to
+        # `inplace=True`, and the `inplace` keyword only exists on versions new enough to take
+        # the branch above -- so on exactly the versions that land here, the input array is
+        # overwritten. `run_method` does `np.asarray(mag, float)`, which does NOT copy a float
+        # ndarray, so that would be the CALLER's array: `run_suite` reuses one `acq_m` across
+        # every method, and a mutation here would silently corrupt whichever methods run after.
+        return gibbs_removal(mag.copy())
 
 
 def run_method(name, mag, phase):

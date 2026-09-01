@@ -13,19 +13,55 @@ use trxscan::io;
 use trxscan::kspace::{box_hires, Acquisition, PartialFourierMode};
 use trxscan::raster::Grid;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let a: Vec<String> = std::env::args().collect();
-    if a.len() < 2 {
-        eprintln!(
-            "usage: trxscan-benchmark <out_dir> [matrix=64] [oversample=4] [slices=1] [only=<label>]"
-        );
+const USAGE: &str = "usage: trxscan-benchmark <out_dir> \
+[matrix=<n>] [oversample=<n>] [slices=<n>] [only=<label>]\n\
+  defaults: matrix=64 oversample=4 slices=1, all fixture sets\n\
+  arguments after <out_dir> are key=value and may appear in any order";
+
+fn die(msg: &str) -> ! {
+    eprintln!("trxscan-benchmark: {msg}\n{USAGE}");
+    std::process::exit(2);
+}
+
+/// Parse `key=value` arguments.
+///
+/// The previous version took bare positionals while the usage string documented `key=value`, and
+/// swallowed parse failures with `.parse().ok().unwrap_or(default)`. Following the documented
+/// interface therefore ran a DIFFERENT configuration than requested -- `matrix=128` became 64,
+/// `oversample=8` became 4 -- and printed nothing about it. For a tool whose only job is emitting
+/// carefully controlled scientific fixtures, silently substituting the defaults is the worst
+/// available failure mode, so every malformed input is now fatal.
+fn parse_args(a: &[String]) -> (PathBuf, usize, usize, usize, Option<String>) {
+    if a.len() < 2 || a[1] == "-h" || a[1] == "--help" {
+        eprintln!("{USAGE}");
         std::process::exit(2);
     }
     let out = PathBuf::from(&a[1]);
-    let n: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(64);
-    let o: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
-    let nz: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let only = a.get(5).cloned();
+    let (mut n, mut o, mut nz, mut only) = (64usize, 4usize, 1usize, None);
+    for arg in &a[2..] {
+        let Some((key, val)) = arg.split_once('=') else {
+            die(&format!("expected key=value, got {arg:?}"));
+        };
+        let num = |what: &str| -> usize {
+            match val.parse::<usize>() {
+                Ok(v) if v > 0 => v,
+                _ => die(&format!("{what} must be a positive integer, got {val:?}")),
+            }
+        };
+        match key {
+            "matrix" => n = num("matrix"),
+            "oversample" => o = num("oversample"),
+            "slices" => nz = num("slices"),
+            "only" => only = Some(val.to_string()),
+            _ => die(&format!("unknown argument {key:?}")),
+        }
+    }
+    (out, n, o, nz, only)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let a: Vec<String> = std::env::args().collect();
+    let (out, n, o, nz, only) = parse_args(&a);
 
     let (snx, sny) = (n * o, n * o);
     // A centred rectangle with sub-voxel-positioned edges on ALL FOUR sides. Edges along both
@@ -106,6 +142,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         written += 1;
     }
+    // A filter that matches nothing used to print "wrote 0 fixture set(s)" and exit 0, so a
+    // typo in `only=` was indistinguishable from a successful run in any script that checks
+    // only the exit status.
+    if written == 0 {
+        let labels: Vec<&str> = grid_points.iter().map(|p| p.label.as_str()).collect();
+        die(&format!(
+            "only={:?} matched none of the {} fixture labels: {}",
+            only.unwrap_or_default(),
+            labels.len(),
+            labels.join(", ")
+        ));
+    }
     println!("wrote {written} fixture set(s) under {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("trxscan-benchmark".to_string())
+            .chain(std::iter::once("/tmp/out".to_string()))
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn documented_key_value_syntax_is_the_syntax_that_is_accepted() {
+        let (out, n, o, nz, only) =
+            parse_args(&args(&["matrix=128", "oversample=8", "slices=3", "only=pf68_diff_nowin"]));
+        assert_eq!(out.to_str(), Some("/tmp/out"));
+        assert_eq!((n, o, nz), (128, 8, 3));
+        assert_eq!(only.as_deref(), Some("pf68_diff_nowin"));
+    }
+
+    #[test]
+    fn order_does_not_matter_and_omitted_keys_keep_their_defaults() {
+        let (_, n, o, nz, only) = parse_args(&args(&["slices=2", "matrix=32"]));
+        assert_eq!((n, o, nz), (32, 4, 2));
+        assert!(only.is_none());
+    }
 }

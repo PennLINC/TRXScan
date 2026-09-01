@@ -70,9 +70,13 @@ struct Cli {
     /// FSL b-vectors
     #[arg(long, value_name = "BVEC")]
     bvec: PathBuf,
-    /// Off-resonance fieldmap in Hz (NIfTI, same grid as the tissue maps)
+    /// Off-resonance fieldmap in Hz, on the ACQUISITION grid. Required only for the legacy
+    /// `--oversample 1` path; the default oversampled path takes `--sim-fmap` instead.
+    ///
+    /// It used to be unconditionally required, which meant a default run could fail on a missing
+    /// or mis-gridded file whose values never reached the output.
     #[arg(long, value_name = "NII")]
-    fmap: PathBuf,
+    fmap: Option<PathBuf>,
     /// Output BIDS stem, e.g. out/sub-01_dir-AP_run-01
     #[arg(short, long, value_name = "PREFIX")]
     out: String,
@@ -218,26 +222,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // simulation grid; the acquisition grid still defines the output matrix. Building the nominal
     // `comp` and then discarding it would silently drop motion, SIFT2 weights, kappa, myelin and
     // dropout -- and waste a full Stage A -- which is exactly what an earlier version did.
+    let need_sim = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
+        o.clone().ok_or_else(|| format!(
+            "--oversample {} requires --{n}; generate the simulation grid with \
+             scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
+             acquisition-grid maps would add no k-space content and produce no ringing.",
+            cli.oversample, cli.oversample))
+    };
     let (sig_tissue, sig_grid, sig_fmap_path) = if cli.oversample > 1 {
-        let need = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
-            o.clone().ok_or_else(|| format!(
-                "--oversample {} requires --{n}; generate the simulation grid with \
-                 scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
-                 acquisition-grid maps would add no k-space content and produce no ringing.",
-                cli.oversample, cli.oversample))
-        };
         let (st, sg) = io::load_tissue(
-            &need(&cli.sim_wm, "sim-wm")?, &need(&cli.sim_gm, "sim-gm")?,
-            &need(&cli.sim_csf, "sim-csf")?, &need(&cli.sim_mask, "sim-mask")?)?;
+            &need_sim(&cli.sim_wm, "sim-wm")?, &need_sim(&cli.sim_gm, "sim-gm")?,
+            &need_sim(&cli.sim_csf, "sim-csf")?, &need_sim(&cli.sim_mask, "sim-mask")?)?;
         let o = cli.oversample;
         if sg.dims != [grid.dims[0] * o, grid.dims[1] * o, grid.dims[2]] {
             return Err(format!(
                 "simulation grid {:?} is not {o}x the acquisition grid {:?} in-plane \
                  (z is never oversampled)", sg.dims, grid.dims).into());
         }
-        (st, sg, need(&cli.sim_fmap, "sim-fmap")?)
+        (st, sg, need_sim(&cli.sim_fmap, "sim-fmap")?)
     } else {
-        (tissue, grid.clone(), cli.fmap.clone())
+        // `--fmap` is required HERE and only here: the legacy path is the only one that uses it.
+        (tissue, grid.clone(), cli.fmap.clone().ok_or(
+            "--oversample 1 (the legacy path) requires --fmap, the acquisition-grid fieldmap. \
+             The default oversampled path takes --sim-fmap instead and ignores --fmap.")?)
     };
     let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
@@ -246,9 +253,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::subsample_streamlines(positions, offsets, weights, n, cli.seed);
     }
     let scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
-    let (fmap, fgrid) = io::load_volume(&cli.fmap)?;
-    if fgrid.dims != grid.dims {
-        return Err(format!("fieldmap grid {:?} != tissue grid {:?}", fgrid.dims, grid.dims).into());
+    // ONE fieldmap load, on whichever grid the signal stage runs on -- `--sim-fmap` when
+    // oversampling, `--fmap` on the legacy path. Loading and grid-checking `--fmap` here as well
+    // made a default run depend on a file whose values could not influence its output.
+    let (fmap, fgrid) = io::load_volume(&sig_fmap_path)?;
+    if fgrid.dims != sig_grid.dims {
+        return Err(format!("fieldmap grid {:?} != signal grid {:?}",
+                           fgrid.dims, sig_grid.dims).into());
     }
     println!("acquisition grid {:?}  signal grid {:?}  {} streamlines  {} volumes  shells {:?}",
         grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
@@ -430,16 +441,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mag, phase) = if cli.oversample > 1 {
         // `comp` was already built on the simulation grid above, so motion, SIFT2 weights, kappa,
         // myelin and dropout all apply here exactly as they do on the nominal path.
-        let (sim_fmap, sim_fgrid) = io::load_volume(&sig_fmap_path)?;
-        if sim_fgrid.dims != sig_grid.dims {
-            return Err(format!("sim fieldmap grid {:?} != simulation grid {:?}",
-                               sim_fgrid.dims, sig_grid.dims).into());
-        }
         println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
                  cli.oversample, cli.phase_model);
         simulate_acquisition_oversampled(
             sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &sim_fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
+            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
     } else {
         eprintln!(
             "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \

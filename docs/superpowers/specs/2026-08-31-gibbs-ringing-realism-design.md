@@ -886,7 +886,17 @@ more elaborate simulator.
   (`kspace.rs:97`, `kspace.rs:320-335`). Real per-coil phase would make the multi-coil and GRAPPA
   simulation more faithful, but it is a coil-model change, not a phase-model change, and is out of
   scope here. Until it lands, 3.2 term 2 must be described as *pre-readout object phase* and never as
-  coil phase.
+  coil phase. The sensitivity's *spatial registration* is not deferred: it now takes continuous
+  acquired-voxel coordinates so the forward model and the Roemer combine sample one field at any
+  oversampling factor (pinned by `coil_sensitivity_is_registered_identically_on_both_grids`).
+- **Deferred: the FORCE/DIPY moment oracle.** `matches_dipy_closed_forms_on_fixtures`
+  (`src/microstructure.rs`) needs `tests/fixtures/force_moments.txt`, and neither the fixture nor
+  the `tools/gen_force_fixtures.py` its old panic message named has ever been tracked in this
+  repository. This branch changed a hard failure on every fresh clone into an explicit skip, which
+  is what made CI possible at all; it did not restore the oracle. Committing the generator means
+  reconstructing a DIPY-derived fixture set for the microstructure module, which is untouched by
+  the Gibbs work and shares no code with it, so it belongs in a microstructure change rather than
+  here. Until then that test is decorative in CI and must not be counted as coverage.
 - **Integer ratio.** An implementation restriction, not a mathematical one (see 3.1). The prep script
   enforces it for voxel-subdivision clarity and parity safety; relaxing it later is legitimate.
 

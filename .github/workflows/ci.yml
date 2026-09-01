@@ -43,14 +43,19 @@ jobs:
       # `default = []` and every bin has required-features = ["cli"], so the two steps above
       # compile NO binary at all. Both major regressions in this PR's review history were in
       # src/bin/trxscan.rs wiring, which a green pure-std job never touched.
-      - name: Check the production binaries
-        run: |
-          cargo check --features cli --bin trxscan
-          cargo check --features cli --bin trxscan-benchmark
+      #
+      # This step RUNS the feature-gated tests rather than merely compiling them. `cli` implies
+      # `io`, and src/lib.rs gates the whole `io` module on that feature, so with default features
+      # every unit test in src/io.rs -- including the `hires_grid` geometry tests that pin the
+      # benchmark affine this branch depends on -- executed in no CI step at all. `--all-targets`
+      # also builds the binaries, so it subsumes the `cargo check --bin` it replaces.
+      - name: Test the feature-gated code and the production binaries
+        run: cargo test --features cli --all-targets --verbose
         working-directory: TRXScan
-      # The parallel signal stage has materially different memory and code behaviour.
-      - name: Check the parallel path
-        run: cargo check --features cli,par --bin trxscan
+      # The parallel signal stage has materially different memory and code behaviour. Tested, not
+      # merely checked, for the same reason as above.
+      - name: Test the parallel path
+        run: cargo test --features cli,par --all-targets --verbose
         working-directory: TRXScan
 
       # Reported, not enforced: most findings are pre-existing in modules this branch does not
