@@ -70,6 +70,21 @@ def main():
     zooms = np.asarray(probs["WM"].header.get_zooms()[:3], float)
     if not np.all(zooms > 0):
         raise SystemExit(f"source has a non-positive voxel size {tuple(zooms)}")
+    # Reject SHEAR before scaling. Scaling column i by VOX / zoom_i forces its norm to VOX
+    # whatever the angles between columns, because `zoom_i` IS that column's norm -- so a check on
+    # the resulting column norms is tautological with respect to shear and can only ever catch a
+    # units regression. Orthogonality has to be tested on the SOURCE directions instead: normalise
+    # the three spatial columns and compare their Gram matrix to the identity. This accepts any
+    # rotation or obliquity (an orthonormal basis in any orientation) and rejects only genuine
+    # shear, where "VOX mm isotropic" would describe a parallelepiped rather than a cube.
+    directions = A[:3, :3] / zooms
+    gram = directions.T @ directions
+    if not np.allclose(gram, np.eye(3), atol=1e-6):
+        off = np.max(np.abs(gram - np.eye(3)))
+        raise SystemExit(
+            f"source affine is sheared (worst off-diagonal {off:.4g} in the direction-cosine "
+            f"Gram matrix); an isotropic target voxel is not well defined on a sheared grid"
+        )
     step = VOX / zooms                       # target voxels expressed in source voxel indices
     shape = tuple(int(np.ceil(s / k)) + 2 * p for s, k, p in zip(hi - lo, step, PAD))
     M = np.eye(4)
@@ -79,11 +94,14 @@ def main():
     M[:3, 3] = lo + (step - 1) / 2.0 - step * PAD
     affine = A @ M
     target = (shape, affine)
+    # Units regression guard, NOT a shear check -- shear is rejected above, on the source. With
+    # orthogonal source columns this is exact by construction, so it fires only if `step` stops
+    # being `VOX / zooms`: the pre-fix `diag([VOX] * 3)` trips it at 3.4 mm on a 2 mm source.
     got = np.linalg.norm(affine[:3, :3], axis=0)
     if not np.allclose(got, VOX, rtol=1e-6, atol=1e-6):
         raise SystemExit(
             f"internal error: target spacing {tuple(np.round(got, 6))} mm != requested {VOX} mm "
-            f"(source zooms {tuple(zooms)}); a sheared source affine is not supported"
+            f"(source zooms {tuple(zooms)})"
         )
 
     for t, key in [("WM", "wm"), ("GM", "gm"), ("CSF", "csf")]:

@@ -32,7 +32,7 @@ def test_sim_grid_is_integer_refinement(tmp_path):
                    - acq.shape[i] * acq.header.get_zooms()[i]) < 1e-3
 
 
-def _synthetic_source(tmp_path, zoom):
+def _synthetic_source(tmp_path, zoom, affine=None):
     """Write a probseg/fieldmap set on a `zoom` mm isotropic grid.
 
     Deliberately not 1 mm: `--voxel` used to be applied as an index-space scale factor, which
@@ -46,7 +46,7 @@ def _synthetic_source(tmp_path, zoom):
     # source spacings and only the sampling changes. A ball defined in voxels would grow with the
     # spacing and the extent check below would be measuring the fixture, not the script.
     n = int(round(96.0 / zoom))
-    aff = np.diag([zoom, zoom, zoom, 1.0])
+    aff = np.diag([zoom, zoom, zoom, 1.0]) if affine is None else affine
     xx, yy, zz = np.meshgrid(*[np.arange(n)] * 3, indexing="ij")
     c = (n - 1) / 2.0
     r = np.sqrt((xx - c) ** 2 + (yy - c) ** 2 + (zz - c) ** 2) * zoom
@@ -78,3 +78,52 @@ def test_voxel_is_millimetres_regardless_of_source_spacing(tmp_path, zoom):
     expected = 32.0 + 2 * np.array([4, 14, 2]) * 1.7
     extent = np.array(img.shape) * 1.7
     assert np.all(np.abs(extent - expected) <= 2 * 1.7), (extent, expected)
+
+
+def test_a_rotated_source_is_accepted():
+    """Obliquity is not shear. An orthonormal basis in any orientation must still work."""
+    import numpy as np
+    import subprocess as sp
+    import tempfile
+    here = pathlib.Path(__file__).parent
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        th = np.deg2rad(23.0)
+        R = np.array([[np.cos(th), -np.sin(th), 0.0],
+                      [np.sin(th), np.cos(th), 0.0],
+                      [0.0, 0.0, 1.0]])
+        aff = np.eye(4)
+        aff[:3, :3] = R * 1.0                       # 1 mm isotropic, rotated 23 degrees
+        src = _synthetic_source(td, 1.0, affine=aff)
+        out = td / "out"
+        sp.run([sys.executable, str(here / "prepare_acquisition_grid.py"),
+                "--anat-dir", str(src), "--prefix", "synth",
+                "--out", str(out), "--voxel", "1.7"], check=True)
+        img = nib.load(out / "wm.nii.gz")
+        assert np.allclose(np.linalg.norm(img.affine[:3, :3], axis=0), 1.7, atol=1e-5)
+
+
+def test_a_sheared_source_is_rejected():
+    """The claim "a sheared source affine is not supported" has to be enforceable.
+
+    It previously was not: the guard compared the TARGET column norms to `--voxel`, and scaling
+    column i by `VOX / zoom_i` forces that norm to VOX whatever the angles between columns,
+    because `zoom_i` is exactly that column's norm. The check was tautological with respect to
+    shear. This affine has a 0.447 direction-cosine off-diagonal and used to sail through.
+    """
+    import numpy as np
+    import subprocess as sp
+    import tempfile
+    here = pathlib.Path(__file__).parent
+    with tempfile.TemporaryDirectory() as td:
+        td = pathlib.Path(td)
+        aff = np.eye(4)
+        aff[:3, :3] = np.array([[1.0, 0.5, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        src = _synthetic_source(td, 1.0, affine=aff)
+        out = td / "out"
+        r = sp.run([sys.executable, str(here / "prepare_acquisition_grid.py"),
+                    "--anat-dir", str(src), "--prefix", "synth",
+                    "--out", str(out), "--voxel", "1.7"],
+                   capture_output=True, text=True)
+        assert r.returncode != 0, "a sheared source affine must be rejected, not silently accepted"
+        assert "sheared" in r.stderr, r.stderr

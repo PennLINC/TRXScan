@@ -429,22 +429,39 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
                     }
                     f_real += v;
                 }
-                // This sim cell's position in ACQUIRED voxel units, half-cell registered exactly
-                // as the object is (`xoff = (o-1)/2`). Everything downstream that has to agree
-                // with a quantity defined on the acquired matrix — coil sensitivities, eddy
-                // polynomials — is expressed in these coordinates rather than in sim indices.
-                let (xc, yc) = (
-                    (x as f64 - sxs as f64 - xoff) / ox as f64,
-                    (y as f64 - sys as f64 - yoff) / oy as f64,
+                // TWO coordinate frames, named apart on purpose. Both are in acquired-voxel
+                // UNITS and both carry the half-cell registration (`xoff = (o-1)/2`), but they
+                // have DIFFERENT ORIGINS, and a quantity evaluated in the wrong one is wrong by
+                // half a FOV rather than by a sub-voxel amount:
+                //
+                //   xa — ABSOLUTE on the acquired grid, 0 .. nx-1, averaging to exactly `v` over
+                //        the o sim cells of acquired voxel `v`. This is the frame the Roemer
+                //        combine walks (`x in 0..nx`), so anything the combine must agree with —
+                //        `coil_sensitivity`, whose coil ring is centred on nx/2 — uses it.
+                //   xc — CENTRED on the acquired image, -nx/2 .. nx/2-1. The eddy polynomial is
+                //        an expansion about the image centre and needs this one.
+                //
+                // Conflating them is not hypothetical: an earlier revision passed `xc` to
+                // `coil_sensitivity`, which put the forward model's sensitivity field half a FOV
+                // from the combine's at EVERY oversampling factor, o = 1 included (28% of peak).
+                // Pinned end-to-end by
+                // `multicoil_roemer_reproduces_the_single_coil_image_at_every_oversampling`.
+                let (xa, ya) = (
+                    (x as f64 - xoff) / ox as f64,
+                    (y as f64 - yoff) / oy as f64,
                 );
-                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xc, yc, nx, ny);
+                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
                 let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
                 if do_eddy {
                     // gradient-dependent field growing through the readout: linear (g·pos) plus a
                     // quadratic (g·pos²) term — the polynomial forms eddy/TORTOISE fit.
+                    // centre on the sim grid, then express in ACQUIRED voxel units so that
                     // eddy_strength/eddy_quad keep their meaning independent of oversampling
-                    // because `xc`/`yc` above are already in acquired-voxel units.
-                    let zc = z as f64 - zs as f64;
+                    let (xc, yc, zc) = (
+                        (x as f64 - sxs as f64 - xoff) / ox as f64,
+                        (y as f64 - sys as f64 - yoff) / oy as f64,
+                        z as f64 - zs as f64,
+                    );
                     let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
                     let quad =
                         gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
@@ -1189,14 +1206,73 @@ mod tests {
         assert!(center > 0.1 && center > corner, "RSS should recover the brain: center {center} corner {corner}");
     }
 
-    /// The forward model and the Roemer combine must sample ONE physical sensitivity field.
+    /// END-TO-END: a Roemer combine of N coils must reproduce the single-coil image, at every
+    /// oversampling factor.
     ///
-    /// They walk different grids: the forward model the oversampled sim grid, the combine the
-    /// acquired matrix. Before the fix, the forward model passed sim indices against `(snx, sny)`
-    /// and so centred the coil ring on `snx/2`, which in acquired-voxel terms is `nx/2 -
-    /// (o-1)/(2o)` — displaced from the combine's `nx/2` by a quarter voxel at o = 2. This test
-    /// pins the property that made it wrong: the `o` sim cells composing acquired voxel `v` are
-    /// centred ON `v`, so their sensitivities average to the value the combine uses there.
+    /// This is the test that actually exercises the production coordinate transform. The
+    /// helper-level test below checks the arithmetic of the transform the forward model OUGHT to
+    /// use; only this one goes through `build_coil_kspace` and `simulate_slice`, so only this one
+    /// can catch the forward model passing a coordinate in the wrong frame.
+    ///
+    /// It exists because that is exactly what happened: the coil call was given the eddy
+    /// polynomial's CENTRED coordinate (`(x - sxs - xoff)/o`, spanning [-nx/2, nx/2)) while the
+    /// combine passed absolute indices (0..nx) into a function whose coil ring is centred on
+    /// nx/2. A half-FOV origin error, present even at o = 1, which every existing multi-coil test
+    /// missed because they only assert broad properties like "centre brighter than corner".
+    ///
+    /// The combine is exact only for sensitivities band-limited within the acquired band; these
+    /// Gaussians (sigma = 0.9 max(nx,ny)) are very smooth but not exactly so, hence a tolerance
+    /// rather than equality. Measured: 0.0 at o = 1 (the two grids coincide, so the combine
+    /// divides out exactly), 1.1e-3 at o = 2 and 1.0e-3 at o = 4 — against 0.28 unregistered.
+    #[test]
+    fn multicoil_roemer_reproduces_the_single_coil_image_at_every_oversampling() {
+        let (nx, ny) = (32usize, 32usize);
+        for o in [1usize, 2, 4] {
+            let (snx, sny) = (nx * o, ny * o);
+            // Edges off the voxel grid so the object is not accidentally band-limited.
+            let q = nx as f64 / 4.0;
+            let img = box_hires(
+                snx, sny,
+                (q + 0.5) * o as f64, (3.0 * q + 0.5) * o as f64,
+                (q + 0.5) * o as f64, (3.0 * q + 0.5) * o as f64,
+            );
+            let fmap = vec![0.0f32; snx * sny];
+            let comps: [&[f32]; 1] = [&img];
+            let inp = step_input(&comps, &fmap, None, snx, sny, nx, ny);
+
+            let one = simulate_slice(&inp, &Acquisition { n_coils: 1, ..clean() });
+            let many = simulate_slice(&inp, &Acquisition { n_coils: 6, ..clean() });
+
+            let peak = one.iter().map(|&(r, i)| (r * r + i * i).sqrt()).fold(0.0f32, f32::max);
+            assert!(peak > 0.5, "o={o}: degenerate reference, peak {peak}");
+            let worst = one
+                .iter()
+                .zip(&many)
+                .map(|(&(ar, ai), &(br, bi))| ((ar - br).powi(2) + (ai - bi).powi(2)).sqrt())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst / peak < 0.02,
+                "o={o}: 6-coil Roemer combine differs from single coil by {:.4} of peak \
+                 -- the forward model and the combine are not sampling one sensitivity field",
+                worst / peak
+            );
+        }
+    }
+
+    /// The SUB-VOXEL half of the registration, at helper level.
+    ///
+    /// Scope, stated explicitly because getting this wrong is what let a half-FOV origin error
+    /// ship: this test evaluates `coil_sensitivity` directly on the coordinate expression
+    /// `(v*o + i - xoff)/o`. It therefore pins that expression's arithmetic — that the `o` sim
+    /// cells of acquired voxel `v` are centred ON `v`, so their sensitivities average to the
+    /// value the combine uses there — and NOT that the forward model passes that expression.
+    /// A test that evaluates the transform it wishes the caller used cannot catch the caller
+    /// using a different one. `multicoil_roemer_reproduces_the_single_coil_image_at_every_
+    /// oversampling` above covers that, through the production call path.
+    ///
+    /// The sub-voxel error this one is about: the original code passed sim indices against
+    /// `(snx, sny)`, centring the ring on `snx/2` = `nx/2 - (o-1)/(2o)` in acquired-voxel terms,
+    /// a quarter voxel from the combine's `nx/2` at o = 2.
     #[test]
     fn coil_sensitivity_is_registered_identically_on_both_grids() {
         let (nx, ny, ncoils) = (32usize, 32usize, 4usize);
