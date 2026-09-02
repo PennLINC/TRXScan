@@ -1,0 +1,42 @@
+{
+  "source": "NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices",
+  "shells": [
+    500.0,
+    1000.0,
+    2000.0,
+    3000.0
+  ],
+  "circular_sd": [
+    1.0786050409891643,
+    1.3481070150252976,
+    1.8559059741025008,
+    2.3108977511115176
+  ],
+  "snr": [
+    337.1479963570127,
+    224.6835154826958,
+    115.12765634486946,
+    65.96787262106652
+  ],
+  "model_note": "DiffusionPhase hardcodes p=0.5 via sqrt(b); only the amplitude is free",
+  "c_q_sigma_dx_product": 0.042510315409723554,
+  "p_free_fit_for_validation_only": 0.445,
+  "p_measurement_spread": "0.27-0.66 across datasets and estimators; theory 0.5",
+  "snr_handling": "thermal floor fitted as 1/SNR in quadrature; circular statistics",
+  "phase_provenance": {
+    "stored_dtype": "uint16 (nifti datatype 512, bitpix 16)",
+    "scl_slope": "NaN",
+    "scl_inter": "NaN",
+    "unscaled_range": [
+      0,
+      4095
+    ],
+    "nibabel_scaled_range": [
+      -4096,
+      4094
+    ],
+    "nibabel_applies": "slope 2, inter -4096",
+    "conversion_used": "rad = nibabel_scaled * pi/4096  (equivalently unscaled*2pi/4096 - pi)",
+    "verified_on": "NIBS sub-60515"
+  }
+}

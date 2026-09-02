@@ -1,0 +1,10 @@
+# Every tracked file in this repository is text. Windows checkouts under WSL were producing CRLF
+# working-tree copies of LF blobs, so `git status` reported 18 source files as wholly rewritten
+# (3,248 insertions / 3,248 deletions) with no substantive change, and each commit risked sweeping
+# that churn in. Normalising on checkout and on add keeps it out.
+#
+# A dozen review documents under docs/superpowers/ were themselves committed with CRLF blobs
+# (pasted from Windows). They are deliberately NOT renormalised here: doing so would add ~3,400
+# lines of pure line-ending diff to a branch that is already large, for prose that nothing reads
+# programmatically. They will normalise on their own the next time one of them is edited.
+* text=auto eol=lf

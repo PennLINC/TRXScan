@@ -30,6 +30,9 @@ pub type Vec3 = [f64; 3];
 /// std-only 3×3 / vector helpers, keeping the pure-math core dependency-free and testable offline.
 pub mod mat;
 
+/// Analytic Fourier references used as test oracles (spec 4.1).
+pub mod analytic;
+
 // --- signal stage ---
 pub mod scheme;
 pub mod raster;
@@ -42,8 +45,12 @@ pub mod mixture;
 pub mod microstructure;
 
 // --- acquisition stage ---
+/// Object phase model (spec 3.2).
+pub mod phase;
 pub mod readout;
 pub mod kspace;
+/// Scoreable benchmark outputs (spec 3.5).
+pub mod benchmark;
 pub mod noise;
 
 // --- cross-cutting ---
