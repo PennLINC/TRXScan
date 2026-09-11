@@ -9,7 +9,11 @@ use trxscan::compartments::{
     generate_compartments_moving, generate_mixture, signal_from_mixture, CompartmentParams,
 };
 use trxscan::io;
-use trxscan::kspace::{simulate_acquisition, Acquisition};
+use trxscan::kspace::{
+    simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
+    PartialFourierMode,
+};
+use trxscan::phase::PhaseModel;
 use trxscan::motion;
 use trxscan::orient::Reorient;
 use trxscan::scheme::GradientScheme;
@@ -67,12 +71,58 @@ struct Cli {
     /// FSL b-vectors
     #[arg(long, value_name = "BVEC")]
     bvec: PathBuf,
-    /// Off-resonance fieldmap in Hz (NIfTI, same grid as the tissue maps)
+    /// Off-resonance fieldmap in Hz, on the ACQUISITION grid. Required only for the legacy
+    /// `--oversample 1` path; the default oversampled path takes `--sim-fmap` instead.
+    ///
+    /// It used to be unconditionally required, which meant a default run could fail on a missing
+    /// or mis-gridded file whose values never reached the output.
     #[arg(long, value_name = "NII")]
-    fmap: PathBuf,
+    fmap: Option<PathBuf>,
     /// Output BIDS stem, e.g. out/sub-01_dir-AP_run-01
     #[arg(short, long, value_name = "PREFIX")]
     out: String,
+
+    /// In-plane oversampling factor for the simulation grid.
+    ///
+    /// This is what makes Gibbs ringing INTRINSIC to the acquisition: the object is simulated
+    /// finer than the acquisition matrix and only the nominal k-space band is acquired. With
+    /// `--oversample 1` the object sits on the reconstruction matrix, the transforms are an exact
+    /// round trip, and the output has NO ringing and no object phase (the legacy path).
+    ///
+    /// Requires `--sim-*` inputs at `voxel/N`, from
+    /// `scripts/prepare_acquisition_grid.py --oversample N`. Upsampling the acquisition-grid maps
+    /// instead would add no k-space content and produce no ringing.
+    /// **Default 2, not 4.** o=4 is the accuracy target (residual ~4.5% of the artifact against
+    /// ~15.6% at o=2) but is not viable on ordinary hardware. In-plane voxels scale as o^2, and on
+    /// the default no-motion path the dominant allocation is a dense nvox x 321 f64 orientation
+    /// histogram plus an f32 ODF copy: for an HBCD-sized grid that bound is ~26 GB at o=2 and
+    /// ~104 GB at o=4. A measured o=2 run peaked at 11.5 GB -- well under its bound, because the
+    /// histogram commits lazily, but that is data-dependent. Treat 16 GB as tight, not safe.
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    oversample: usize,
+    /// Simulation-grid white-matter map (from prepare_acquisition_grid.py --oversample)
+    #[arg(long, value_name = "NII")]
+    sim_wm: Option<PathBuf>,
+    /// Simulation-grid grey-matter map
+    #[arg(long, value_name = "NII")]
+    sim_gm: Option<PathBuf>,
+    /// Simulation-grid CSF map
+    #[arg(long, value_name = "NII")]
+    sim_csf: Option<PathBuf>,
+    /// Simulation-grid brain mask
+    #[arg(long, value_name = "NII")]
+    sim_mask: Option<PathBuf>,
+    /// Simulation-grid fieldmap (Hz)
+    #[arg(long, value_name = "NII")]
+    sim_fmap: Option<PathBuf>,
+    /// Object phase model: "hbcd" (calibrated), or "none" for a real-valued object
+    #[arg(long, value_name = "MODEL", default_value = "hbcd")]
+    phase_model: String,
+    /// Partial-Fourier line-dropping rule: "contiguous" (scanner-like, exactly round(ny*pf)
+    /// consecutive lines) or "fiberfox" (the ported rule, which preserves line zero on even
+    /// matrices and so keeps ~78% at a nominal 6/8).
+    #[arg(long, value_name = "MODE", default_value = "contiguous")]
+    pf_mode: String,
 
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
     #[arg(long)]
@@ -82,7 +132,10 @@ struct Cli {
     /// PhaseEncodingDirection matching the baked-in distortion (no reorientation surprises).
     #[arg(long)]
     fsl_orientation: bool,
-    /// Complex k-space noise variance (→ Rician magnitude)
+    /// Noise level: the PER-COMPONENT variance of the reconstructed complex image at full
+    /// sampling, single coil, pre-combination -- so Var(Re) = Var(Im) = this, and E[|n|^2] is
+    /// twice it. The per-k-space-sample variance is derived from the reconstruction
+    /// normalization; multi-coil combination lowers the final variance by sum_c s_c^2.
     #[arg(long, default_value_t = 0.0, value_name = "VAR")]
     noise: f64,
     /// Linear eddy-current strength (DWI volumes only; b0 exempt)
@@ -170,6 +223,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kappa = cli.kappa.filter(|k| *k > 0.0);
 
     let (tissue, mut grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
+
+    // The signal stage runs on ONE grid, chosen here. With --oversample > 1 that is the finer
+    // simulation grid; the acquisition grid still defines the output matrix. Building the nominal
+    // `comp` and then discarding it would silently drop motion, SIFT2 weights, kappa, myelin and
+    // dropout -- and waste a full Stage A -- which is exactly what an earlier version did.
+    let need_sim = |o: &Option<PathBuf>, n: &str| -> Result<PathBuf, String> {
+        o.clone().ok_or_else(|| format!(
+            "--oversample {} requires --{n}; generate the simulation grid with \
+             scripts/prepare_acquisition_grid.py --oversample {}. Upsampling the \
+             acquisition-grid maps would add no k-space content and produce no ringing.",
+            cli.oversample, cli.oversample))
+    };
+    let (sig_tissue, sig_grid, sig_fmap_path) = if cli.oversample > 1 {
+        let (st, sg) = io::load_tissue(
+            &need_sim(&cli.sim_wm, "sim-wm")?, &need_sim(&cli.sim_gm, "sim-gm")?,
+            &need_sim(&cli.sim_csf, "sim-csf")?, &need_sim(&cli.sim_mask, "sim-mask")?)?;
+        let o = cli.oversample;
+        if sg.dims != [grid.dims[0] * o, grid.dims[1] * o, grid.dims[2]] {
+            return Err(format!(
+                "simulation grid {:?} is not {o}x the acquisition grid {:?} in-plane \
+                 (z is never oversampled)", sg.dims, grid.dims).into());
+        }
+        (st, sg, need_sim(&cli.sim_fmap, "sim-fmap")?)
+    } else {
+        // `--fmap` is required HERE and only here: the legacy path is the only one that uses it.
+        (tissue, grid.clone(), cli.fmap.clone().ok_or(
+            "--oversample 1 (the legacy path) requires --fmap, the acquisition-grid fieldmap. \
+             The default oversampled path takes --sim-fmap instead and ignores --fmap.")?)
+    };
     let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
     if let Some(n) = cli.subsample {
@@ -177,12 +259,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             io::subsample_streamlines(positions, offsets, weights, n, cli.seed);
     }
     let mut scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
-    let (fmap, fgrid) = io::load_volume(&cli.fmap)?;
-    if fgrid.dims != grid.dims {
-        return Err(format!("fieldmap grid {:?} != tissue grid {:?}", fgrid.dims, grid.dims).into());
+    // ONE fieldmap load, on whichever grid the signal stage runs on -- `--sim-fmap` when
+    // oversampling, `--fmap` on the legacy path. Loading and grid-checking `--fmap` here as well
+    // made a default run depend on a file whose values could not influence its output.
+    let (fmap, fgrid) = io::load_volume(&sig_fmap_path)?;
+    if fgrid.dims != sig_grid.dims {
+        return Err(format!("fieldmap grid {:?} != signal grid {:?}",
+                           fgrid.dims, sig_grid.dims).into());
     }
-    println!("grid {:?}  {} streamlines  {} volumes  shells {:?}", grid.dims,
-        offsets.len().saturating_sub(1), scheme.len(), scheme.shells(50.0));
+    println!("acquisition grid {:?}  signal grid {:?}  {} streamlines  {} volumes  shells {:?}",
+        grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
+        scheme.shells(50.0));
+
+    // Pre-flight memory estimate, BEFORE the signal stage allocates anything. An earlier version
+    // computed this immediately before Stage B -- i.e. after generate_mixture had already
+    // allocated -- so an allocation failure happened before the warning could ever print.
+    //
+    // The dominant allocation differs by path, and each is modelled from what the code actually
+    // does rather than from a guess:
+    //
+    //   no motion: generate_mixture's dense nvox * 321 f64 orientation histogram + its f32 ODF
+    //              copy, plus the f32 compartment images.
+    //   motion:    generate_compartments_moving has NO nvox*ngrad f64 accumulator. It works per
+    //              volume (four nvox f32 resampled tissue arrays, two nvox f64, three nvox f32
+    //              outputs), COLLECTS the three f32 outputs for every volume into `vols`
+    //              (3*nvox*ngrad*4 bytes), and then allocates three more nvox*ngrad f32 arrays and
+    //              copies into them. Both are live during that copy, so the floor is
+    //              24 * nvox * ngrad bytes -- not the 20 an earlier version estimated -- plus a
+    //              per-worker allowance, which `par` multiplies.
+    {
+        let nvox = sig_grid.dims.iter().product::<usize>() as f64;
+        let ngrad = scheme.len() as f64;
+        let images_gb = nvox * ngrad * 3.0 * 4.0 / 1e9;
+        // Rayon's actual pool size when it is running the show, since RAYON_NUM_THREADS may
+        // differ from the machine's parallelism; available_parallelism is only the fallback.
+        let workers = if cfg!(feature = "par") {
+            std::env::var("RAYON_NUM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+                .unwrap_or(1) as f64
+        } else {
+            1.0
+        };
+        let (dominant_gb, what) = if cli.motion.is_some() {
+            // collected per-volume outputs + final arrays, both live during the copy, plus each
+            // in-flight worker's own nvox f32/f64 working set.
+            let per_worker = nvox * (4.0 * 4.0 + 2.0 * 8.0 + 3.0 * 4.0) / 1e9;
+            (nvox * ngrad * 24.0 / 1e9 + workers * per_worker,
+             "collected per-volume outputs + final images, plus per-worker arrays")
+        } else {
+            (nvox * 321.0 * 12.0 / 1e9, "dense orientation histogram + ODF")
+        };
+        // The motion path's figure already includes the images; the mixture path's does not.
+        let bound = if cli.motion.is_some() { dominant_gb } else { dominant_gb + images_gb };
+        if bound > 8.0 {
+            // The caveat differs by path and must not be copied across: only the mixture path's
+            // dense histogram commits lazily.
+            let caveat = if cli.motion.is_some() {
+                "These arrays are densely written, so committed memory tracks the bound closely -- \
+                 unlike the no-motion histogram, this does not benefit from sparse page commitment."
+            } else {
+                "Committed memory is DATA-DEPENDENT and usually lower: the histogram faults in \
+                 only where streamlines deposit, and an o=2 run of this size measured 11.5 GB \
+                 against a 25.9 GB bound. Treat 16 GB as tight, not safe."
+            };
+            eprintln!(
+                "WARNING: signal stage upper bound about {bound:.1} GB on grid {:?} \
+                 ({dominant_gb:.1} GB {what}; compartment images {images_gb:.1} GB; {} volumes).\n\
+                 \x20        {caveat} In-plane memory scales as o^2.",
+                sig_grid.dims, scheme.len());
+        }
+    }
 
     let base = cli.params.params();
     println!("compartment params: {}  T2 fiber/gm/csf {}/{}/{} ms",
@@ -201,16 +349,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let moved = poses.iter().filter(|p| **p != motion::Pose::IDENTITY).count();
         println!("Motion (faithful re-simulation): {} poses, {} moved, from {}",
             poses.len(), moved, tsv.display());
-        generate_compartments_moving(&grid, &positions, &offsets, &tissue, &scheme, &params, &poses)
+        generate_compartments_moving(
+            &sig_grid, &positions, &offsets, &sig_tissue, &scheme, &params, &poses)
     } else {
         let mut mix = generate_mixture(
-            &grid, &positions, &offsets, weights.as_deref(), &tissue, &params, kappa,
+            &sig_grid, &positions, &offsets, weights.as_deref(), &sig_tissue, &params, kappa,
             HemiSphere::icosphere(3),
         );
         if let Some(mp) = &cli.myelin {
             let (my, mgrid) = io::load_volume(mp)?;
-            if mgrid.dims != grid.dims {
-                return Err(format!("myelin grid {:?} != tissue grid {:?}", mgrid.dims, grid.dims).into());
+            if mgrid.dims != sig_grid.dims {
+                return Err(format!(
+                    "myelin grid {:?} != signal grid {:?}. With --oversample > 1 the myelin map \
+                     must be on the SIMULATION grid.", mgrid.dims, sig_grid.dims).into());
             }
             println!("myelin map: {} (per-voxel lerp to adult endpoint)", mp.display());
             mix.myelin = Some(my);
@@ -229,11 +380,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
     if cli.mb > 1 && cli.dropout_rate > 0.0 {
-        let n_shots = (grid.dims[2] / cli.mb).max(1);
+        let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
         let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate,
             0xB10C_5EED ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let gt = motion::apply_multiband_motion(
-            &mut comp.images, grid.dims, comp.ngrad, grid.voxel_to_world,
+            &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world,
             cli.mb, true, &scheme.bvals, scheme.b_max, &events);
         let mut tsv = String::from("volume\tshot\tslices\tattenuation\n");
         for d in &gt {
@@ -258,13 +409,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         do_relaxation: true,
         noise_variance: cli.noise,
         partial_fourier: 0.75,  // HBCD
+        // Defaults to CONTIGUOUS: this CLI describes itself as HBCD-like, and a scanner produces
+        // contiguous PF. The Fiberfox rule keeps ~78% at a nominal 6/8 because it preserves line
+        // zero on even matrices; it stays available via --pf-mode fiberfox.
+        pf_mode: match cli.pf_mode.as_str() {
+            "contiguous" => PartialFourierMode::Contiguous,
+            "fiberfox" => PartialFourierMode::FiberfoxCompatible,
+            o => return Err(format!("unknown --pf-mode {o:?}; expected contiguous or fiberfox").into()),
+        },
         ghost_offset: 0.015,    // subtle residual Nyquist ghost
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,
         eddy_tau: 70.0,
         n_spikes: 0,            // spikes are rare/aggressive; left off (available)
         spike_amplitude: 1.0,
-        zero_ringing: 6.0,      // mild Gibbs
+        window: KspaceWindow::None,  // unapodized; ringing comes from the crop when --oversample > 1
         n_coils: cli.coils,
         accel: cli.accel,
         acs_lines: 24,
@@ -278,13 +437,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t = Instant::now();
-    let (mut mag, mut phase) =
-        simulate_acquisition(grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients);
-    println!("Acquisition stage (distortion+T2*{}{}{}): {:?}",
-        if cli.noise > 0.0 { "+noise" } else { "" },
-        if cli.eddy > 0.0 { "+eddy" } else { "" },
-        if cli.accel > 1 { "+GRAPPA" } else { "" },
-        t.elapsed());
+
+    let phase_model = match cli.phase_model.as_str() {
+        "hbcd" => PhaseModel::hbcd_like(),
+        "none" => PhaseModel::none(),
+        other => return Err(format!("unknown --phase-model {other:?}; expected hbcd or none").into()),
+    };
+
+    let (mut mag, mut phase) = if cli.oversample > 1 {
+        // `comp` was already built on the simulation grid above, so motion, SIFT2 weights, kappa,
+        // myelin and dropout all apply here exactly as they do on the nominal path.
+        println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
+                 cli.oversample, cli.phase_model);
+        simulate_acquisition_oversampled(
+            sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
+            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
+    } else {
+        eprintln!(
+            "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \
+             matrix, so the transforms are an exact round trip: the output will contain NO Gibbs \
+             ringing and no object phase. Use --oversample 2 (default) or 4 for a realistic \
+             acquisition.");
+        simulate_acquisition_legacy(
+            grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients)
+    };
+    println!("Stage B: {:?}", t.elapsed());
 
     // Resolve the output orientation + PhaseEncodingDirection. PE is the grid y/j axis; a positive
     // off-resonance field displaces signal toward −grid-j on the forward scan (the Fiberfox k-space
@@ -318,6 +495,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         accel: cli.accel,
         mb: cli.mb,
     };
+
     io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
     Ok(())

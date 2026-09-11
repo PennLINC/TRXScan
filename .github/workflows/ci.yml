@@ -1,0 +1,82 @@
+name: CI
+
+# Added after a PR review noted that a large number of implementation defects were found only by
+# execution, never by reading.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (pure std, no features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: TRXScan
+
+      # Cargo resolves OPTIONAL path dependencies too, so `../rust/trx-rs` and `../odx-rs` must
+      # exist even for the default feature set (which is pure std and uses neither). Without them
+      # the build fails at manifest resolution:
+      #   failed to read /home/runner/work/TRXScan/odx-rs/Cargo.toml
+      # Cloning the real crates rather than stubbing them keeps the dependency graph honest.
+      - name: Check out sibling path dependencies
+        run: |
+          git clone --depth 1 https://github.com/tee-ar-ex/trx-rs.git rust/trx-rs
+          git clone --depth 1 https://github.com/PennLINC/odx-rs.git odx-rs
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: TRXScan
+
+      - name: Build (default features)
+        run: cargo build --verbose
+        working-directory: TRXScan
+      - name: Test (default features)
+        run: cargo test --verbose
+        working-directory: TRXScan
+
+      # `default = []` and every bin has required-features = ["cli"], so the two steps above
+      # compile NO binary at all. Both major regressions in this PR's review history were in
+      # src/bin/trxscan.rs wiring, which a green pure-std job never touched.
+      #
+      # This step RUNS the feature-gated tests rather than merely compiling them. `cli` implies
+      # `io`, and src/lib.rs gates the whole `io` module on that feature, so with default features
+      # every unit test in src/io.rs -- including the `hires_grid` geometry tests that pin the
+      # benchmark affine this branch depends on -- executed in no CI step at all. `--all-targets`
+      # also builds the binaries, so it subsumes the `cargo check --bin` it replaces.
+      - name: Test the feature-gated code and the production binaries
+        run: cargo test --features cli --all-targets --verbose
+        working-directory: TRXScan
+      # The parallel signal stage has materially different memory and code behaviour. Tested, not
+      # merely checked, for the same reason as above.
+      - name: Test the parallel path
+        run: cargo test --features cli,par --all-targets --verbose
+        working-directory: TRXScan
+
+      # Reported, not enforced: most findings are pre-existing in modules this branch does not
+      # touch (microstructure, mixture, sphere). Making it a gate is a separate cleanup.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
+        working-directory: TRXScan
+        continue-on-error: true
+
+  python:
+    name: Python scorer and calibration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Deliberately NOT installing nibabel, MRtrix or DIPY: the scorer, its independent
+      # cross-check and the calibration maths must stand on numpy/scipy alone. Tests needing more
+      # skip themselves via pytest.importorskip, so this run proves the core is self-contained.
+      - name: Install
+        run: python -m pip install --quiet numpy scipy pytest
+      - name: Test
+        run: python -m pytest scripts -q

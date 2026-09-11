@@ -32,6 +32,9 @@ pub mod mat;
 /// std-only voxel-axis reorientation to the FSL/dcm2niix (radiological LAS) convention.
 pub mod orient;
 
+/// Analytic Fourier references used as test oracles (spec 4.1).
+pub mod analytic;
+
 // --- signal stage ---
 pub mod scheme;
 pub mod raster;
@@ -44,8 +47,12 @@ pub mod mixture;
 pub mod microstructure;
 
 // --- acquisition stage ---
+/// Object phase model (spec 3.2).
+pub mod phase;
 pub mod readout;
 pub mod kspace;
+/// Scoreable benchmark outputs (spec 3.5).
+pub mod benchmark;
 pub mod noise;
 
 // --- cross-cutting ---
