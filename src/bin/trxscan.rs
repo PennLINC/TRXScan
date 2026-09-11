@@ -11,6 +11,7 @@ use trxscan::compartments::{
 use trxscan::io;
 use trxscan::kspace::{simulate_acquisition, Acquisition};
 use trxscan::motion;
+use trxscan::orient::Reorient;
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
 
@@ -76,6 +77,11 @@ struct Cli {
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
     #[arg(long)]
     reverse_pe: bool,
+    /// Write the DWI in FSL / dcm2niix orientation (radiological LAS) instead of the input grid's
+    /// orientation. eddy/topup/fugue and qsiprep then consume it directly, with the
+    /// PhaseEncodingDirection matching the baked-in distortion (no reorientation surprises).
+    #[arg(long)]
+    fsl_orientation: bool,
     /// Complex k-space noise variance (→ Rician magnitude)
     #[arg(long, default_value_t = 0.0, value_name = "VAR")]
     noise: f64,
@@ -163,14 +169,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let kappa = cli.kappa.filter(|k| *k > 0.0);
 
-    let (tissue, grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
+    let (tissue, mut grid) = io::load_tissue(&cli.wm, &cli.gm, &cli.csf, &cli.mask)?;
     let (mut positions, mut offsets, mut weights) =
         io::load_streamlines_spec(&cli.streamlines, cli.weights.as_deref())?;
     if let Some(n) = cli.subsample {
         (positions, offsets, weights) =
             io::subsample_streamlines(positions, offsets, weights, n, cli.seed);
     }
-    let scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
+    let mut scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
     let (fmap, fgrid) = io::load_volume(&cli.fmap)?;
     if fgrid.dims != grid.dims {
         return Err(format!("fieldmap grid {:?} != tissue grid {:?}", fgrid.dims, grid.dims).into());
@@ -272,7 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let t = Instant::now();
-    let (mag, phase) =
+    let (mut mag, mut phase) =
         simulate_acquisition(grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients);
     println!("Acquisition stage (distortion+T2*{}{}{}): {:?}",
         if cli.noise > 0.0 { "+noise" } else { "" },
@@ -280,9 +286,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.accel > 1 { "+GRAPPA" } else { "" },
         t.elapsed());
 
+    // Resolve the output orientation + PhaseEncodingDirection. PE is the grid y/j axis; a positive
+    // off-resonance field displaces signal toward −grid-j on the forward scan (the Fiberfox k-space
+    // convention this port preserves), +grid-j with --reverse-pe. `Reorient` carries that physics
+    // into whatever frame we write, so the PED always describes the baked-in distortion — LAS
+    // (radiological, dcm2niix/FSL) with --fsl-orientation, else the native grid frame.
+    let total_readout_time = acq.t_line * grid.dims[1] as f64 / 1000.0; // PE-axis, before reindex
+    let in_pe_sign = if cli.reverse_pe { 1 } else { -1 };
+    let reo = if cli.fsl_orientation {
+        Reorient::to_las(&grid.voxel_to_world, grid.dims)
+    } else {
+        Reorient::identity(grid.dims)
+    };
+    let phase_encoding_direction = reo.out_ped(1, in_pe_sign);
+    if cli.fsl_orientation {
+        mag = reo.apply_volume(&mag, comp.ngrad);
+        phase = reo.apply_volume(&phase, comp.ngrad);
+        grid.voxel_to_world = reo.apply_affine(&grid.voxel_to_world);
+        grid.dims = reo.out_dims;
+        for b in scheme.bvecs.iter_mut() {
+            *b = reo.apply_bvec(*b);
+        }
+        println!("Reoriented output to FSL/dcm2niix (LAS), PhaseEncodingDirection={phase_encoding_direction}");
+    }
+
     let sidecar = io::SidecarInfo {
-        reverse_pe: cli.reverse_pe,
-        total_readout_time: acq.t_line * grid.dims[1] as f64 / 1000.0,
+        phase_encoding_direction,
+        total_readout_time,
         echo_time: acq.t_echo / 1000.0,
         partial_fourier: acq.partial_fourier,
         accel: cli.accel,

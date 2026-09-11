@@ -316,7 +316,9 @@ pub fn write_dwi(out_prefix: &Path, dwi: &CleanDwi, grid: &Grid, scheme: &Gradie
 /// Acquisition facts the BIDS JSON sidecars record. A plain struct (not
 /// `kspace::Acquisition`) so `io` stays usable without the `kspace` feature.
 pub struct SidecarInfo {
-    pub reverse_pe: bool,
+    /// BIDS PhaseEncodingDirection ("j", "j-", …) already resolved for the *written* voxel frame
+    /// (see `orient` + the caller): a +off-resonance field displaces signal toward +this-axis.
+    pub phase_encoding_direction: String,
     pub total_readout_time: f64, // s
     pub echo_time: f64,          // s
     pub partial_fourier: f64,
@@ -338,10 +340,11 @@ pub fn write_complex_dwi(
     write_4d(&p("_part-mag_dwi.nii.gz"), dims, ngrad, mag, grid)?;
     write_4d(&p("_part-phase_dwi.nii.gz"), dims, ngrad, phase, grid)?;
     write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)?;
-    // The simulated PE axis is y; forward polarity is "j", --reverse-pe is "j-",
-    // and the two distort in opposite directions (topup/DRBUDDI-ready).
-    let ped = if info.reverse_pe { "j-" } else { "j" };
-    let ees = info.total_readout_time / dims[1].saturating_sub(1).max(1) as f64;
+    // PED is resolved by the caller for the written frame (native grid, or reoriented to LAS with
+    // --fsl-orientation). EffectiveEchoSpacing is per the PE axis the code names, not a fixed axis.
+    let ped = info.phase_encoding_direction.as_str();
+    let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
+    let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
     let common = format!(
         "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
          \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \

@@ -29,6 +29,8 @@ pub type Vec3 = [f64; 3];
 
 /// std-only 3×3 / vector helpers, keeping the pure-math core dependency-free and testable offline.
 pub mod mat;
+/// std-only voxel-axis reorientation to the FSL/dcm2niix (radiological LAS) convention.
+pub mod orient;
 
 // --- signal stage ---
 pub mod scheme;
