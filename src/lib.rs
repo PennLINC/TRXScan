@@ -57,6 +57,8 @@ pub mod noise;
 
 // --- cross-cutting ---
 pub mod motion;
+/// Gradient nonlinearity: coefficient model, field cache, image warp, graddev export.
+pub mod gnl;
 
 // --- feature-gated I/O + config (reference their deps) ---
 #[cfg(feature = "io")]

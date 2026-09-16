@@ -350,7 +350,7 @@ pub fn write_benchmark(
     Ok(())
 }
 
-fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
+pub fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
     let [nx, ny, nz] = dims;
     let arr = Array4::from_shape_fn((nx, ny, nz, ngrad), |(x, y, z, g)| {
         data[(x + nx * (y + ny * z)) * ngrad + g]
@@ -361,7 +361,17 @@ fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Gr
 }
 
 /// Write one 3D scalar volume (layout `x + nx*(y + ny*z)`) as NIfTI-1 with the given affine.
-fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
+pub fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
+    let [nx, ny, nz] = dims;
+    let arr =
+        ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
+    let hdr = header_for_grid(grid.voxel_to_world);
+    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
+    Ok(())
+}
+
+/// Write one 3D volume as int16 (Siemens-style phase images are stored as integers 0..4095).
+pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) -> R<()> {
     let [nx, ny, nz] = dims;
     let arr =
         ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);

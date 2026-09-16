@@ -462,6 +462,102 @@ pub fn generate_mixture(
 /// As everywhere in the signal stage, the caller is expected to have built the mixture with
 /// `params.b_value = scheme.b_max` (what the binaries pass): the per-volume b-value rides in the
 /// gradient norm, so `scheme` here must be the *same* scheme that set `b_max`.
+/// [`signal_from_mixture`] with a per-voxel gradient-nonlinearity field: every voxel sees the
+/// gradient the coils actually produced there, `J(x)ᵀ g` ([`crate::gnl::GnlField`]), so both the
+/// b-vector and (through the norm) the b-value deviate per voxel. The global vertex×gradient
+/// response table cannot be shared any more, so each voxel evaluates its nonzero histogram bins
+/// directly — the same shape as the myelin branch of [`signal_from_mixture`]. A `None` field
+/// reproduces [`signal_from_mixture`] bit for bit through the same code path.
+pub fn signal_from_mixture_gnl(
+    mix: &crate::mixture::MixtureField,
+    scheme: &GradientScheme,
+    field: Option<&crate::gnl::GnlField>,
+) -> Compartments {
+    let Some(field) = field else { return signal_from_mixture(mix, scheme) };
+    assert_eq!(field.dims, mix.dims, "GNL field is not on the mixture grid");
+    let ngrad = scheme.len();
+    let nvox = mix.nvox();
+    let p = mix.params;
+    let t2 = vec![p.t2_fiber, p.t2_gm, p.t2_csf];
+    if ngrad == 0 {
+        return Compartments { dims: mix.dims, ngrad, images: vec![Vec::new(); 3], t2 };
+    }
+    let grads = scheme.fiberfox_gradients();
+    let gm = Ball { b_value: p.b_value, diffusivity: p.d_gm };
+    let csf = Ball { b_value: p.b_value, diffusivity: p.d_csf };
+    let soma = Ball { b_value: p.b_value, diffusivity: p.d_soma };
+    let adult = CompartmentParams::adult();
+    let md = mix.md_fallback();
+
+    let voxel = |vox: usize, fib: &mut [f32], gmo: &mut [f32], cso: &mut [f32]| {
+        if !mix.is_masked(vox) {
+            return;
+        }
+        let (wf, gf, cf) = (mix.wm[vox] as f64, mix.gm[vox] as f64, mix.csf[vox] as f64);
+        let row = mix.odf_row(vox);
+        let nz: Vec<(usize, f64)> =
+            row.iter().enumerate().filter(|(_, &w)| w != 0.0).map(|(v, &w)| (v, w as f64)).collect();
+        let tot: f64 = nz.iter().map(|&(_, w)| w).sum();
+        let m = mix.myelin.as_ref().map(|mm| mm[vox] as f64).unwrap_or(0.0);
+        let li = |a: f64, b: f64| a + (b - a) * m;
+        let stick_m = Stick { b_value: p.b_value, diffusivity: li(p.d_intra, adult.d_intra) };
+        let extra_m = Tensor {
+            b_value: p.b_value,
+            eigenvalues: (
+                li(p.d_extra.0, adult.d_extra.0),
+                li(p.d_extra.1, adult.d_extra.1),
+                li(p.d_extra.2, adult.d_extra.2),
+            ),
+        };
+        let (fi, fe) = (li(p.intra_frac, adult.intra_frac), li(p.extra_frac, adult.extra_frac));
+        let md_m = if m <= 1e-3 {
+            md
+        } else {
+            (extra_m.eigenvalues.0 + extra_m.eigenvalues.1 + extra_m.eigenvalues.2) / 3.0
+        };
+        for g in 0..ngrad {
+            let gv = field.effective_gradient(vox, grads[g]);
+            let fiber_resp = if tot > 1e-12 {
+                nz.iter()
+                    .map(|&(v, w)| {
+                        let vert = mix.sphere.verts[v];
+                        w * (fi * stick_m.simulate(gv, vert) + fe * extra_m.simulate(gv, vert))
+                    })
+                    .sum::<f64>()
+                    / tot
+            } else {
+                (-p.b_value * mat::dot(gv, gv) * md_m).exp()
+            };
+            fib[g] = (wf * fiber_resp) as f32;
+            gmo[g] = (gf * ((1.0 - p.gm_restricted_frac) * gm.simulate(gv)
+                + p.gm_restricted_frac * soma.simulate(gv))) as f32;
+            cso[g] = (cf * csf.simulate(gv)) as f32;
+        }
+    };
+
+    let mut fiber_img = vec![0.0f32; nvox * ngrad];
+    let mut gm_img = vec![0.0f32; nvox * ngrad];
+    let mut csf_img = vec![0.0f32; nvox * ngrad];
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        fiber_img
+            .par_chunks_mut(ngrad)
+            .zip(gm_img.par_chunks_mut(ngrad))
+            .zip(csf_img.par_chunks_mut(ngrad))
+            .enumerate()
+            .for_each(|(vox, ((f, g), c))| voxel(vox, f, g, c));
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let it = fiber_img.chunks_mut(ngrad).zip(gm_img.chunks_mut(ngrad)).zip(csf_img.chunks_mut(ngrad));
+        for (vox, ((f, g), c)) in it.enumerate() {
+            voxel(vox, f, g, c);
+        }
+    }
+    Compartments { dims: mix.dims, ngrad, images: vec![fiber_img, gm_img, csf_img], t2 }
+}
+
 pub fn signal_from_mixture(mix: &crate::mixture::MixtureField, scheme: &GradientScheme) -> Compartments {
     let ngrad = scheme.len();
     let nvox = mix.nvox();

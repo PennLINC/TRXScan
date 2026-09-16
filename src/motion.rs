@@ -176,7 +176,7 @@ pub fn load_motion_tsv(path: &std::path::Path) -> Result<Vec<Pose>, String> {
 }
 
 #[inline]
-fn trilinear(vol: &[f32], dims: [usize; 3], p: Vec3) -> f32 {
+pub(crate) fn trilinear(vol: &[f32], dims: [usize; 3], p: Vec3) -> f32 {
     let [nx, ny, nz] = dims;
     let (x, y, z) = (p[0], p[1], p[2]);
     if x < 0.0 || y < 0.0 || z < 0.0 || x > (nx - 1) as f64 || y > (ny - 1) as f64 || z > (nz - 1) as f64 {
