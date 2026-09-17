@@ -541,7 +541,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mags[1][v] = (s2.0 * s2.0 + s2.1 * s2.1).sqrt() as f32;
             phasediff.push(((dphi + std::f64::consts::PI) / (2.0 * std::f64::consts::PI) * 4096.0).round().clamp(0.0, 4095.0) as i16);
         }
-        println!("GRE fieldmap: TE {:.2}/{:.2} ms, tissue SNR {} (sigma {:.3})", te1 * 1e3, te2 * 1e3, cli.gre_snr, sigma);
+        let stamped = trxscan::gnl::stamp_phasediff_range(&mut phasediff);
+        println!(
+            "GRE fieldmap: TE {:.2}/{:.2} ms, tissue SNR {} (sigma {:.3}){}",
+            te1 * 1e3, te2 * 1e3, cli.gre_snr, sigma,
+            if stamped { "; corner voxels stamped to 0/4095 so the phasediff spans its full range" } else { "" }
+        );
         gre_outputs = Some((mags, phasediff, te1, te2, gre_prefix.clone()));
     }
 

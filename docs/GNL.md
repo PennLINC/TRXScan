@@ -323,6 +323,14 @@ spans its whole 0–4095 range like a scanner's. That matters downstream: qsipre
 conversion (`workflows/fieldmap/utils.py:siemens2rads`) maps the image's *min/max* onto −π..π,
 so a noiseless phasediff spanning, say, 2020–3140 gets stretched ~3.7× — the first GDC×SDC run
 did exactly that and produced a registered field 3× the truth.
+With `--gre-snr 0` the two corner voxels of the phasediff are stamped to 0 and 4095 instead,
+so the range is full either way.
+
+Found while scoring: on an **odd** acquired matrix the oversampled k-space stage placed the
+image half an acquired voxel off in-plane (`snx/2` is not `o·(nx/2)` when `nx` is odd; one sim
+cell = 1/o voxel). Fixed in `kspace.rs` and pinned by `tests/kspace_alignment.rs`; every
+simulation made before the fix on the 107×151 grid carries a (+0.85, +0.85, 0) mm RAS offset
+that the experiment's `score.py` corrects for.
 
 Scoring: rigidly align truth to each arm's output (ACPC is rigid), then a nonlinear
 registration of the corrected b=0 to the truth b=0; report the residual displacement (p50/p95,

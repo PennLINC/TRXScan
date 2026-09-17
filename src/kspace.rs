@@ -381,8 +381,10 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // which is NOT object phase; see `phase.rs` for that. Pinned by
     // `even_matrix_window_asymmetry_is_intentional`.
     let (xs, ys, zs) = (nx / 2, ny / 2, nz / 2);
-    let (sxs, sys) = (snx / 2, sny / 2);
     let (ox, oy) = (snx / nx, sny / ny); // in-plane oversampling factors
+    // The sim-grid centre is the IMAGE of the acquired centre, o*(n/2), not snx/2: for an odd
+    // acquired matrix those differ by one sim cell, i.e. (1/o) of an acquired voxel in-plane.
+    let (sxs, sys) = (ox * xs, oy * ys);
     // Half-cell alignment. Sim cell `x` covers [x, x+1) in sim units, so its centre is at x+0.5;
     // acquired cell `X` covers o cells and is centred at o*X + o/2. Aligning sample index `x` with
     // `o*X` — as a bare index substitution does — therefore misregisters the object against the

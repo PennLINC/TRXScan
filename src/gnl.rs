@@ -700,3 +700,49 @@ mod tests {
         assert!((gr[vr * 9 + 2] as f64).abs() > 1e-4, "test needs a nonzero xz entry");
     }
 }
+
+
+/// Make a Siemens-style phase-difference image span its whole 0..4095 range.
+///
+/// Consumers that recover radians from the image's own min/max (qsiprep's `siemens2rads`,
+/// which assumes scanner data whose noisy background wraps uniformly) stretch anything
+/// narrower. With noise on the echoes the range is full anyway; without it, two background
+/// voxels -- the first and the last, always outside the object -- are stamped to the extremes.
+pub fn stamp_phasediff_range(phasediff: &mut [i16]) -> bool {
+    if phasediff.len() < 2 {
+        return false;
+    }
+    let (min, max) = phasediff.iter().fold((i16::MAX, i16::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    if min <= 0 && max >= 4095 {
+        return false;
+    }
+    phasediff[0] = 0;
+    let last = phasediff.len() - 1;
+    phasediff[last] = 4095;
+    true
+}
+
+#[cfg(test)]
+mod phasediff_range_tests {
+    use super::stamp_phasediff_range;
+
+    #[test]
+    fn a_partial_range_gets_the_extremes_stamped_on_the_corner_voxels() {
+        let mut v = vec![2048i16; 27];
+        v[13] = 3140;
+        assert!(stamp_phasediff_range(&mut v));
+        assert_eq!((v[0], v[26]), (0, 4095));
+        assert_eq!(v[13], 3140);
+        assert_eq!(v.iter().filter(|&&x| x == 2048).count(), 24);
+    }
+
+    #[test]
+    fn a_full_range_is_left_alone() {
+        let mut v = vec![2048i16; 27];
+        v[1] = 0;
+        v[2] = 4095;
+        let before = v.clone();
+        assert!(!stamp_phasediff_range(&mut v));
+        assert_eq!(v, before);
+    }
+}
