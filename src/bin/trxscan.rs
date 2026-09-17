@@ -213,6 +213,13 @@ struct Cli {
     /// that (it maps the image's min/max onto -pi..pi); a noiseless phasediff gets stretched.
     #[arg(long, default_value_t = 50.0)]
     gre_snr: f64,
+    /// Also write the ground-truth fibre orientations per acquisition voxel: up to three peaks
+    /// of the orientation mixture (aggregated over the oversampled cells, refined to sub-bin
+    /// accuracy), each a unit vector in world RAS scaled by its mass fraction, as a 9-volume
+    /// NIfTI `<out>_desc-truth_peaks.nii.gz`. Unaffected by the GNL warp: the mixture is the
+    /// object in its true frame.
+    #[arg(long)]
+    truth_peaks: bool,
 
     /// Global random seed: selects the noise/dropout realization and drives --subsample.
     /// The default (0) reproduces the historical output for identical inputs.
@@ -429,6 +436,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // by that volume's pose and re-simulate (Fiberfox-style). Otherwise the histogram-first
     // mixture path — SIFT2 weights + Watson κ dispersion, and the same
     // mixture `trxscan-microstructure` computes ground truth from.
+    let mut truth_peaks: Option<Vec<f32>> = None;
     let mut comp = if let Some(tsv) = &cli.motion {
         if weights.is_some() || kappa.is_some() {
             eprintln!("note: weights/kappa are ignored in motion mode (per-segment re-simulation)");
@@ -456,6 +464,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("myelin map: {} (per-voxel lerp to adult endpoint)", mp.display());
             mix.myelin = Some(my);
+        }
+        if cli.truth_peaks {
+            let o = if cli.oversample > 1 { cli.oversample } else { 1 };
+            let (pk, _) = trxscan::truth::truth_peaks(&mix, o, 3);
+            truth_peaks = Some(pk);
         }
         let fb = mix.fallback.iter().filter(|&&f| f == 1).count();
         println!(
@@ -635,10 +648,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         phase = reo.apply_volume(&phase, comp.ngrad);
         grid.voxel_to_world = reo.apply_affine(&grid.voxel_to_world);
         grid.dims = reo.out_dims;
-        for b in scheme.bvecs.iter_mut() {
-            *b = reo.apply_bvec(*b);
-        }
         println!("Reoriented output to FSL/dcm2niix (LAS), PhaseEncodingDirection={phase_encoding_direction}");
+    }
+    // The scheme's directions are world (RAS) -- that is how the signal encoded them and how
+    // the truth peaks are written -- and FSL bvecs are voxel-frame with the determinant rule.
+    for b in scheme.bvecs.iter_mut() {
+        *b = Reorient::fsl_bvec(*b, &grid.voxel_to_world);
     }
 
     let sidecar = io::SidecarInfo {
@@ -670,6 +685,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phasediff (+json)");
     }
 
+    if let Some(pk) = truth_peaks.as_ref() {
+        let vol = reo.apply_volume(pk, 9);
+        io::write_4d(&PathBuf::from(format!("{}_desc-truth_peaks.nii.gz", cli.out)), grid.dims, 9, &vol, &grid)?;
+        std::fs::write(format!("{}_desc-truth_peaks.json", cli.out),
+            "{\n  \"Description\": \"Ground-truth fibre orientations: up to 3 peaks of the orientation mixture per voxel, volumes 3k..3k+2 = peak k as a unit vector in world RAS scaled by its mass fraction (0 = no peak). Object in its true (gradient-nonlinearity-free) frame.\"\n}\n")?;
+        println!("wrote truth peaks {}_desc-truth_peaks.nii.gz", cli.out);
+    }
     if let Some((coef, _, _)) = gnl.as_ref() {
         std::fs::write(format!("{}_desc-gnl_coeff.grad", cli.out), coef.write_siemens())?;
         // Truth on the written (possibly reoriented) grid: the field is world-defined, so it is

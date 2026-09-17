@@ -332,6 +332,14 @@ cell = 1/o voxel). Fixed in `kspace.rs` and pinned by `tests/kspace_alignment.rs
 simulation made before the fix on the 107×151 grid carries a (+0.85, +0.85, 0) mm RAS offset
 that the experiment's `score.py` corrects for.
 
+Also found while scoring fixel orientations: the written `.bvec` was the scheme's RAS-world
+numbers copied through (with the LAS axis negation), not FSL's voxel-frame convention with its
+determinant rule, so under FSL/MRtrix import every orientation came out one axis flip wrong
+(`dwigradcheck` and a tensor fit against `--truth-peaks` both showed it). `Reorient::fsl_bvec`
+now converts for whatever grid is written. Reflections preserve inter-direction angles, so
+HMC/SDC results from before the fix stand; reconstructions from those files need the `.b`
+table's x and y negated.
+
 Scoring: rigidly align truth to each arm's output (ACPC is rigid), then a nonlinear
 registration of the corrected b=0 to the truth b=0; report the residual displacement (p50/p95,
 stratified by distance from isocentre and by |∇ΔB|), plus b=0 RMSE/NMI. Expected: A ≈ C ≈ B'
