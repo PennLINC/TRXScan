@@ -16,8 +16,8 @@ binary emits analytic ground-truth microstructure maps from the same per-voxel m
 cargo test
 ```
 
-The default build is **feature-less and pure std** — 49 unit tests, no network, no system libs
-(`--features cli` — which implies `io` — adds 2 io tests → 51). Every module except `io`/`config`
+The default build is **feature-less and pure std** — ~110 unit tests, no network, no system libs
+(`--features cli` — which implies `io` — adds the io tests). Every module except `io`/`config`
 compiles here, and the tests live as `#[cfg(test)] mod tests` at the bottom of each module;
 `tests/` holds only the dipy fixture data, not test code. Keep it that way.
 
@@ -79,7 +79,7 @@ Module map (`src/`): `scheme` (bval/bvec, shells), `raster` (segment→voxel pat
 per-segment path and the histogram-first `generate_mixture`/`signal_from_mixture` path),
 `sphere` (icosphere hemisphere), `mixture` (the per-voxel orientation-histogram type),
 `microstructure` (FORCE closed-form ground-truth scalars, dipy-fixture-validated), `readout`,
-`kspace` (all of the acquisition stage), `motion`, `mat` (std-only 3×3 helpers), `io` (feature-gated), plus
+`kspace` (all of the acquisition stage), `nufft` (its gridded y-transform, feature `kspace`), `motion`, `mat` (std-only 3×3 helpers), `io` (feature-gated), plus
 `noise`/`config` which are still `todo!()` stubs.
 
 Two binaries (both `--features cli`): `trxscan` (full simulation) and `trxscan-microstructure`
@@ -104,9 +104,17 @@ single ball and SIFT2 weights / κ / myelin are ignored.
   `kspace` can apply per-compartment T2 relaxation. `Compartments::mixed()` collapses them.
 - **Streamlines and tissue maps must share a world (RAS mm) frame.** The rasterizer maps world → the
   DWI grid's own (possibly oblique) affine; nothing re-registers for you.
-- **`kspace` is exact direct DFT (std-only), not FFT.** O(N³) per slice, deliberately: no
-  FFT-convention ambiguity while validating against Fiberfox. The time-segmented-FFT perf path is
-  unwritten.
+- **`kspace` is the exact O(N³) sum, not an approximation of it** — no FFT-convention ambiguity
+  while validating against Fiberfox. It is *organised* for speed without changing a term: static
+  factors hoisted, the affine-in-ky phase (fieldmap, eddy shear, y-DFT kernel) advanced by
+  memoised per-voxel rotors, the eddy polynomial factored per axis, and the per-line x-DFT plus
+  the 2-D reconstruction done by `rustfft` (feature `kspace`) or twiddle-table sums (default).
+  The literal per-line sum lives on in the test module as the oracle
+  (`restructured_forward_matches_the_literal_sum`, 1e-10); keep any further speed-up pinned to it.
+  Under `kspace` the fieldmap y-sum is a type-1 NUFFT (`src/nufft.rs`, ES kernel, ~1e-13) —
+  the fieldmap read as a source warp `y − sny·τ·fmap` — so the whole forward is O(N log N) except
+  the legacy `--eddy` polynomial (non-affine time profile), which keeps the O(N³) rotor path.
+  Production Stage B: ~145 s → 8 s; the default std-only build (twiddle tables, rotors) ~40 s.
 - **Two motion paths, very different fidelity.** `compartments::generate_compartments_moving` is the
   faithful one (re-transforms streamlines per volume and re-simulates, so fiber–gradient angles
   change); `motion::apply_motion` only resamples the finished images and misses the directional
@@ -131,7 +139,8 @@ single ball and SIFT2 weights / κ / myelin are ignored.
 `io`, `config`, and `par` gate code via `#[cfg]`; `cli` gates the binaries (`required-features`, and
 implies `io`). `kspace` and `odx` are declared in `Cargo.toml` for work that isn't written yet —
 notably the **`kspace` module is always compiled and needs no feature**; the `kspace` feature only
-pulls `rustfft` for the unimplemented FFT path. `par` (rayon) parallelizes over streamline groups
+swaps the x-stage and reconstruction to `rustfft` and the fieldmap y-sum to the NUFFT (identical
+numbers, ~5× faster than the default build). `par` (rayon) parallelizes over streamline groups
 in the signal stage and over volumes in the acquisition stage. Path deps assume sibling checkouts: `../rust/trx-rs` and
 `../odx-rs`.
 
@@ -149,6 +158,6 @@ density (SIFT2 / AFD), and fixel dispersion from CONSH.
 
 `noise.rs` and `config.rs` are `todo!()` stubs — k-space noise lives inline in `kspace.rs`, so
 `noise.rs` is dead code, and there is no TOML config (acquisition params are a hard-coded
-`Acquisition` literal in `src/bin/trxscan.rs`). The FFT perf path, ODX ground-truth export, and any
+`Acquisition` literal in `src/bin/trxscan.rs`). ODX ground-truth export, and any
 oracle diff against Fiberfox are unwritten. Per-fixel κ from CONSH fixels (vs the current global κ)
 and the disp(κ) LUT are future work (docs/FORCE.md §4c).

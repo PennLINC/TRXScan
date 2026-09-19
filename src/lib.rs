@@ -51,6 +51,8 @@ pub mod microstructure;
 pub mod phase;
 pub mod readout;
 pub mod kspace;
+/// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
+pub mod nufft;
 /// Scoreable benchmark outputs (spec 3.5).
 pub mod benchmark;
 pub mod noise;
