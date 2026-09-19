@@ -5,6 +5,10 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// Echo time (ms) of the simulated HBCD-like acquisition; also the TE at which measured
+/// relaxometry maps (`--s0-map/--t2-map`) are evaluated.
+const TE_MS: f64 = 88.0;
 use trxscan::compartments::{
     generate_compartments_moving, generate_mixture, signal_from_mixture_gnl, CompartmentParams,
 };
@@ -198,6 +202,16 @@ struct Cli {
     /// TR/T1 saturation (long-T1 CSF is not fully relaxed at a finite TR).
     #[arg(long, value_name = "WM,GM,CSF")]
     tissue_s0: Option<String>,
+    /// Measured relaxometry S0 map (proton density x T1 saturation, any units; e.g. the MESE fit
+    /// of scripts/fit_mese_t2.py), on the SIGNAL grid. With --t2-map, imposes the measured
+    /// per-voxel b0 pattern S0(r)·exp(-TE/T2(r)) on the fiber+GM compartments (pattern only:
+    /// normalised to median 1 over pure WM, so the preset / --tissue-s0 keep the level; S(b)/S0
+    /// is untouched). CSF keeps the preset T2 (not measurable at TE <= 100 ms).
+    #[arg(long, requires = "t2_map", value_name = "NIFTI")]
+    s0_map: Option<PathBuf>,
+    /// Measured T2 map (ms) on the SIGNAL grid; see --s0-map.
+    #[arg(long, requires = "s0_map", value_name = "NIFTI")]
+    t2_map: Option<PathBuf>,
     /// Scale each compartment's diffusivities "wm,gm,csf" to tune the S(b)/S0 decay to a real
     /// acquisition (WM intra+extra + soma, GM ball, CSF ball). Default: no change.
     #[arg(long, value_name = "WM,GM,CSF")]
@@ -550,6 +564,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(s0) = tissue_s0 {
         comp.apply_s0(s0);
     }
+    if let (Some(s0p), Some(t2p)) = (&cli.s0_map, &cli.t2_map) {
+        let (s0m, g0) = io::load_volume(s0p)?;
+        let (t2m, g2) = io::load_volume(t2p)?;
+        if g0.dims != sig_grid.dims || g2.dims != sig_grid.dims {
+            return Err(format!(
+                "--s0-map {:?} / --t2-map {:?} grids != signal grid {:?}. With --oversample > 1 \
+                 they must be on the SIMULATION grid.", g0.dims, g2.dims, sig_grid.dims).into());
+        }
+        let b0 = (0..scheme.len()).find(|&i| scheme.is_b0(i))
+            .ok_or("--s0-map/--t2-map need a b=0 volume in the scheme")?;
+        let pure_wm: Vec<bool> = sig_tissue.wm.iter().map(|&w| w > 0.9).collect();
+        let (n, med, lo, hi) = comp.apply_intensity_map(
+            &s0m, &t2m, TE_MS as f32, b0, [true, true, false], &pure_wm);
+        println!("intensity map: {} voxels rescaled to S0·exp(-TE/T2) (fiber+GM), scale median {:.3} \
+                  p5 {:.3} p95 {:.3} (pure WM = 1)", n, med, lo, hi);
+    }
 
     // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
@@ -638,7 +668,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // distortion shift = fmap · ny · t_line, so t_line = 91.7 ms / ny.
     let acq = Acquisition {
         t_line: 91.7 / grid.dims[1] as f64,
-        t_echo: 88.0,
+        t_echo: TE_MS,
         t_inhom: 50.0,
         signal_scale: 100.0,
         reverse_phase: cli.reverse_pe,

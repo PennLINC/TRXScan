@@ -87,9 +87,13 @@ impl Default for CompartmentParams {
 }
 
 impl CompartmentParams {
-    /// Adult 3T parameter set. T2s per relaxometry literature (Stanisz 2005 / Wansapura 1999:
-    /// WM ≈ 70 ms, cortical GM ≈ 100 ms at 3T) — at TE ~88 ms these give the familiar
-    /// GM-brighter-than-WM b0/low-b contrast that the neonatal set lacks. Diffusivities:
+    /// Adult 3T parameter set. T2s from a spin-echo EPI relaxometry fit on the NIBS reference
+    /// subject (sub-60501, 4-echo MESE, TE 15–100 ms; `scripts/fit_mese_t2.py`): WM 67.7
+    /// [63–72] ms, cortical GM 75.7 [71–81] ms. The literature values first used here (Stanisz
+    /// 2005 / Wansapura 1999: 70 / 100 ms) overpredicted GM at TE 88 by 30 % — the real b0
+    /// GM/WM ratio is 1.16, not 1.5 — because the EPI-measured T2 of cortex, with its partial
+    /// volume at 1.7 mm, is well below the pure-tissue literature number. CSF is not measurable
+    /// with TE ≤ 100 ms and keeps the literature 2000 ms. Diffusivities:
     /// intra-axonal axial 1.7e-3 (standard-model range), extra-axonal (1.7, 0.6, 0.6)e-3 —
     /// the 0.55/0.45 mixture lands WM MD ≈ 0.75e-3 — and GM ball 0.85e-3, adult cortical MD.
     pub fn adult() -> Self {
@@ -102,8 +106,8 @@ impl CompartmentParams {
             d_extra: (0.0017, 0.0006, 0.0006),
             d_gm: 0.00085,
             d_csf: 0.003,
-            t2_fiber: 70.0,
-            t2_gm: 100.0,
+            t2_fiber: 68.0,
+            t2_gm: 76.0,
             t2_csf: 2000.0,
             gm_restricted_frac: 0.20,
             d_soma: 0.0003,
@@ -176,6 +180,79 @@ impl Compartments {
                 }
             }
         }
+    }
+
+    /// Impose a MEASURED per-voxel b0 intensity pattern — `S0(r)·exp(−TE/T2(r))` from
+    /// relaxometry maps (e.g. the MESE fit of `scripts/fit_mese_t2.py`) — on the selected
+    /// compartments (`which`, normally fiber + GM: CSF T2 is not measurable at TE ≤ 100 ms).
+    ///
+    /// The maps describe the WHOLE voxel, so the target for the selected compartments is the
+    /// prediction minus the model's own signal in the unselected ones (CSF, with the preset T2),
+    /// both at the echo: `s = (P̃ − Σ_{c∉which} comp_c·e^{−TE/T2_c}) / Σ_{c∈which} comp_c·e^{−TE/T2_c}`,
+    /// where `P̃` is the prediction put on the model's scale by one factor — the median ratio over
+    /// `ref_mask` (pure WM, where the unselected term vanishes) — so the maps supply the spatial
+    /// pattern (within-tissue T2/proton-density variation, deep-GM darkening, partial volume) while
+    /// the preset and `--tissue-s0` keep the absolute level. The scale multiplies every gradient
+    /// volume, so S(b)/S0 (the diffusion contrast) is untouched. Voxels where either map is ≤ 0,
+    /// or where the selected compartments are under a tenth of the model's b0 signal (CSF-dominated:
+    /// the subtraction would be noise), keep scale 1; otherwise it is clamped to [0.25, 4].
+    ///
+    /// Returns (voxels scaled, median, 5th and 95th percentile of the applied scale).
+    pub fn apply_intensity_map(
+        &mut self,
+        s0map: &[f32],
+        t2map: &[f32],
+        te_ms: f32,
+        b0: usize,
+        which: [bool; 3],
+        ref_mask: &[bool],
+    ) -> (usize, f32, f32, f32) {
+        let nvox = self.dims.iter().product::<usize>();
+        assert_eq!(s0map.len(), nvox);
+        assert_eq!(t2map.len(), nvox);
+        assert_eq!(ref_mask.len(), nvox);
+        let ng = self.ngrad;
+        let decay: Vec<f32> = self.t2.iter().map(|t| (-te_ms / t).exp()).collect();
+        // model b0 signal at the echo in the selected / unselected compartments, and the map
+        // prediction, per voxel
+        let (mut m_sel, mut m_rest, mut pred) = (vec![0.0f32; nvox], vec![0.0f32; nvox], vec![0.0f32; nvox]);
+        for v in 0..nvox {
+            for (img, (&d, &w)) in self.images.iter().zip(decay.iter().zip(which.iter())) {
+                let x = img[v * ng + b0] * d;
+                if w { m_sel[v] += x } else { m_rest[v] += x }
+            }
+            if s0map[v] > 0.0 && t2map[v] > 0.0 {
+                pred[v] = s0map[v] * (-te_ms / t2map[v]).exp();
+            }
+        }
+        let usable = |v: usize| pred[v] > 0.0 && m_sel[v] > 0.0 && m_sel[v] >= 0.1 * (m_sel[v] + m_rest[v]);
+        let mut refv: Vec<f32> = (0..nvox).filter(|&v| ref_mask[v] && usable(v)).map(|v| pred[v] / m_sel[v]).collect();
+        if refv.is_empty() {
+            refv = (0..nvox).filter(|&v| usable(v)).map(|v| pred[v] / m_sel[v]).collect();
+        }
+        if refv.is_empty() {
+            return (0, 1.0, 1.0, 1.0);
+        }
+        refv.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let norm = refv[refv.len() / 2];
+        let mut applied: Vec<f32> = Vec::new();
+        for v in 0..nvox {
+            if !usable(v) {
+                continue;
+            }
+            let s = ((pred[v] / norm - m_rest[v]) / m_sel[v]).clamp(0.25, 4.0);
+            applied.push(s);
+            for (img, &w) in self.images.iter_mut().zip(which.iter()) {
+                if w {
+                    for g in 0..ng {
+                        img[v * ng + g] *= s;
+                    }
+                }
+            }
+        }
+        applied.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |f: f64| applied[((applied.len() - 1) as f64 * f).round() as usize];
+        (applied.len(), q(0.5), q(0.05), q(0.95))
     }
 }
 
@@ -995,7 +1072,7 @@ mod tests {
             dims: [1, 1, 1],
             ngrad: 1,
             images: vec![vec![2.0f32], vec![3.0f32], vec![5.0f32]],
-            t2: vec![70.0, 100.0, 2000.0],
+            t2: vec![68.0, 76.0, 2000.0],
         };
         c.apply_s0([1.0, 0.5, 0.0]);
         assert_eq!(c.images[0][0], 2.0); // fiber unchanged (factor 1.0)
@@ -1003,5 +1080,66 @@ mod tests {
         assert_eq!(c.images[2][0], 0.0); // csf zeroed
         // the mixed signal is the sum of the scaled compartments
         assert_eq!(c.mixed().data[0], 3.5);
+    }
+
+    #[test]
+    fn intensity_map_imposes_the_measured_pattern_and_keeps_the_decay() {
+        // 3 voxels, 2 gradients (b0, dwi). Voxel 0 = pure WM (reference), 1 = WM+GM, 2 = CSF only.
+        let te = 88.0f32;
+        let mut c = Compartments {
+            dims: [3, 1, 1],
+            ngrad: 2,
+            images: vec![
+                vec![1.0, 0.5, 0.5, 0.25, 0.0, 0.0], // fiber: b0, dwi per voxel
+                vec![0.0, 0.0, 0.5, 0.4, 0.0, 0.0],  // gm
+                vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.9],  // csf
+            ],
+            t2: vec![68.0, 76.0, 2000.0],
+        };
+        let before = c.images.clone();
+        // measured maps: voxel 1 is 30% darker than the model predicts, voxel 2 (CSF) irrelevant
+        let d = |t2: f32| (-te / t2).exp();
+        let model1 = 0.5 * d(68.0) + 0.5 * d(76.0);
+        // voxel 0's maps reproduce the model exactly (S0 1, T2 68 → the normalisation is 1)
+        let s0map = [1.0f32, 0.7 * model1, 3.0];
+        let t2map = [68.0f32, 1e9, 500.0]; // exp(-TE/T2) = 1 for voxel 1
+        let (n, med, lo, hi) = c.apply_intensity_map(&s0map, &t2map, te, 0, [true, true, false], &[true, false, false]);
+        assert_eq!(n, 2, "CSF-only voxel has no fiber/GM signal to scale");
+        // voxel 0 (the reference) is scaled by exactly 1, voxel 1 by 0.7
+        let r0 = c.images[0][0] / before[0][0];
+        let r1 = c.images[0][2] / before[0][2];
+        assert!((r0 - 1.0).abs() < 1e-6, "reference voxel scale {r0}");
+        assert!((r1 - 0.7).abs() < 1e-6, "voxel 1 scale {r1}");
+        // S(b)/S0 unchanged in every scaled compartment; CSF untouched
+        assert!((c.images[0][3] / c.images[0][2] - 0.5).abs() < 1e-6);
+        assert!((c.images[1][3] / c.images[1][2] - 0.8).abs() < 1e-6);
+        assert_eq!(c.images[2], before[2]);
+        assert!(lo <= med && med <= hi);
+    }
+
+    #[test]
+    fn intensity_map_subtracts_the_model_csf_and_skips_csf_dominated_voxels() {
+        // voxel 0 pure WM (reference); voxel 1 = 50% WM + CSF with the map agreeing with the
+        // model exactly → scale 1, not (WM+CSF)/WM; voxel 2 = 5% GM in CSF → skipped.
+        let te = 88.0f32;
+        let d = |t2: f32| (-te / t2).exp();
+        let mut c = Compartments {
+            dims: [3, 1, 1],
+            ngrad: 1,
+            images: vec![vec![1.0, 0.5, 0.0], vec![0.0, 0.0, 0.05], vec![0.0, 0.5, 0.95]],
+            t2: vec![68.0, 76.0, 2000.0],
+        };
+        let before = c.images.clone();
+        // maps that reproduce the model's own b0 exactly (T2 huge → exp = 1, S0 = model b0)
+        let s0map = [d(68.0), 0.5 * d(68.0) + 0.5 * d(2000.0), 0.05 * d(76.0) + 0.95 * d(2000.0)];
+        let t2map = [1e9f32; 3];
+        let (n, med, _, _) = c.apply_intensity_map(&s0map, &t2map, te, 0, [true, true, false], &[true, false, false]);
+        assert_eq!(n, 2);
+        assert!((med - 1.0).abs() < 1e-5, "median {med}");
+        for v in 0..2 {
+            assert!((c.images[0][v] - before[0][v]).abs() < 1e-6, "voxel {v}: {} vs {}", c.images[0][v], before[0][v]);
+        }
+        assert_eq!(c.images[1][2], before[1][2], "CSF-dominated voxel untouched");
+        assert_eq!(c.images[2], before[2]);
     }
 }
