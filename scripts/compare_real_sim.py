@@ -102,6 +102,21 @@ def main():
     metrics = {'pe': a.pe, 'global_scale_sim_to_real': scale, 'shells': shells,
                'n_tissue_vox': {k: int(v.sum()) for k, v in tis.items()}, 'per_tissue': {}, 'phase': {}}
 
+    # voxelwise b0 agreement (real vs scaled sim), whole brain and per tissue: Pearson r and the
+    # median absolute percentage error. Tissue-mean metrics cannot see within-tissue structure
+    # (a per-voxel T2/S0 map changes r, not the class means).
+    s_b0s = s_b0 * scale
+    vox = {}
+    for tname, tm in [('brain', mask & (r_b0 > 0))] + list(tis.items()):
+        rr, ss = r_b0[tm].astype(np.float64), s_b0s[tm].astype(np.float64)
+        ok = rr > 0
+        rr, ss = rr[ok], ss[ok]
+        r = float(np.corrcoef(rr, ss)[0, 1]) if rr.size > 2 else float('nan')
+        vox[tname] = {'n': int(rr.size), 'pearson_r': r,
+                      'mdape_pct': float(np.median(np.abs(ss / rr - 1.0)) * 100.0),
+                      'ratio_iqr': [float(np.percentile(ss / rr, 25)), float(np.percentile(ss / rr, 75))]}
+    metrics['b0_voxelwise'] = vox
+
     # per-tissue b0 level (real vs scaled sim) and S(b)/S0 decay
     for tname, tm in tis.items():
         d = {'real_b0_mean': float(r_b0[tm].mean()), 'sim_b0_mean': float((s_b0 * scale)[tm].mean()),
