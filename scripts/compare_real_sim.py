@@ -64,13 +64,14 @@ def main():
     _, sim_ph = load4d(simp)
     sbval = np.loadtxt(simbval)
 
-    # tissue maps + mask on the sim acq grid
+    # tissue maps + mask, put on the SIM OUTPUT grid by affine (never by index: the acquisition-grid
+    # files are LPS while `--fsl-orientation` output is LAS, so index reuse mirrors them along y)
     G = Path(a.grid_dir)
-    wm = nb.load(str(G / 'wm.nii.gz')).get_fdata().astype(np.float32)
-    gm = nb.load(str(G / 'gm.nii.gz')).get_fdata().astype(np.float32)
-    csf = nb.load(str(G / 'csf.nii.gz')).get_fdata().astype(np.float32)
-    mask = nb.load(str(G / 'mask.nii.gz')).get_fdata() > 0.5
-    assert wm.shape == sim_mag.shape[:3], (wm.shape, sim_mag.shape)
+    tgt = (sim_mag.shape[:3], sim_im.affine)
+    def on_sim(name, order=1):
+        return resample_from_to(nb.load(str(G / name)), tgt, order=order).get_fdata().astype(np.float32)
+    wm, gm, csf = on_sim('wm.nii.gz'), on_sim('gm.nii.gz'), on_sim('csf.nii.gz')
+    mask = on_sim('mask.nii.gz', order=0) > 0.5
 
     # real onto sim grid
     rim = nb.load(str(realm)); rdata = rim.get_fdata(dtype=np.float32)

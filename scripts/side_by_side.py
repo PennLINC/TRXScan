@@ -41,10 +41,11 @@ def main():
     sb = np.loadtxt(str(sbp))
     smag = sm.get_fdata(dtype=np.float32); sph = sp.get_fdata(dtype=np.float32)
     rmag = rm.get_fdata(dtype=np.float32); rph = siemens_phase_to_radians(rp.get_fdata(dtype=np.float32))
-    mask = nb.load(str(Path(a.grid_dir) / 'mask.nii.gz')).get_fdata() > 0.5
-    wm = nb.load(str(Path(a.grid_dir) / 'wm.nii.gz')).get_fdata() > 0.7
     tgt = (smag.shape[:3], sm.affine)
     rs = lambda v, im: resample_from_to(nb.Nifti1Image(v, im.affine), tgt, order=1).get_fdata()
+    # grid files are LPS, the output LAS: always go through the affines, never reuse indices
+    mask = resample_from_to(nb.load(str(Path(a.grid_dir) / 'mask.nii.gz')), tgt, order=0).get_fdata() > 0.5
+    wm = resample_from_to(nb.load(str(Path(a.grid_dir) / 'wm.nii.gz')), tgt, order=1).get_fdata() > 0.7
     shells = [0, 1000, 3000]
     real = {b: rs(shell_mean(rmag, rb, b), rm) for b in shells}
     sim = {b: shell_mean(smag, sb, b) for b in shells}

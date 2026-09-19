@@ -182,6 +182,30 @@ impl Compartments {
         }
     }
 
+    /// Multiply ONE compartment by a per-voxel map (every gradient volume, so S(b)/S0 is
+    /// untouched). The general form of [`apply_s0`](Self::apply_s0) for spatial structure the
+    /// tissue fractions cannot express — e.g. ventricular vs sulcal CSF: a probseg calls both
+    /// "CSF", but a 1.7 mm sulcal voxel's CSF is partial-volumed with pia, vessels and dura and
+    /// pulsates, so its b0 signal is well below a ventricle's, and one `--tissue-s0` value fitted
+    /// on sulcal voxels leaves the ventricles muted (real lateral ventricles are ~2.5-2.9x WM
+    /// at b=0, TR 4.8 s). Values <= 0 in the map are treated as 1 (no change).
+    pub fn apply_compartment_scale_map(&mut self, compartment: usize, map: &[f32]) -> usize {
+        let nvox = self.dims.iter().product::<usize>();
+        assert_eq!(map.len(), nvox);
+        let ng = self.ngrad;
+        let img = &mut self.images[compartment];
+        let mut n = 0;
+        for (v, &m) in map.iter().enumerate() {
+            if m > 0.0 && (m - 1.0).abs() > f32::EPSILON {
+                n += 1;
+                for g in 0..ng {
+                    img[v * ng + g] *= m;
+                }
+            }
+        }
+        n
+    }
+
     /// Impose a MEASURED per-voxel b0 intensity pattern — `S0(r)·exp(−TE/T2(r))` from
     /// relaxometry maps (e.g. the MESE fit of `scripts/fit_mese_t2.py`) — on the selected
     /// compartments (`which`, normally fiber + GM: CSF T2 is not measurable at TE ≤ 100 ms).
@@ -1115,6 +1139,23 @@ mod tests {
         assert!((c.images[1][3] / c.images[1][2] - 0.8).abs() < 1e-6);
         assert_eq!(c.images[2], before[2]);
         assert!(lo <= med && med <= hi);
+    }
+
+    #[test]
+    fn compartment_scale_map_touches_one_compartment_and_keeps_the_decay() {
+        let mut c = Compartments {
+            dims: [2, 1, 1],
+            ngrad: 2,
+            images: vec![vec![1.0, 0.5, 1.0, 0.5], vec![0.0; 4], vec![2.0, 1.8, 2.0, 1.8]],
+            t2: vec![68.0, 76.0, 2000.0],
+        };
+        let n = c.apply_compartment_scale_map(2, &[1.5, 0.0]);
+        assert_eq!(n, 1);
+        // voxel 0 scaled, voxel 1 (map 0) untouched
+        for (got, want) in c.images[2].iter().zip([3.0f32, 2.7, 2.0, 1.8]) {
+            assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        }
+        assert_eq!(c.images[0], vec![1.0, 0.5, 1.0, 0.5]); // other compartments untouched
     }
 
     #[test]

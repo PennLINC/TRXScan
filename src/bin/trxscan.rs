@@ -212,6 +212,12 @@ struct Cli {
     /// Measured T2 map (ms) on the SIGNAL grid; see --s0-map.
     #[arg(long, requires = "s0_map", value_name = "NIFTI")]
     t2_map: Option<PathBuf>,
+    /// Per-voxel multiplier for the CSF compartment (SIGNAL grid; 0 or 1 = no change), applied
+    /// after --tissue-s0. Use it to give ventricular CSF its own level: sulcal "CSF" voxels are
+    /// partial-volumed and pulsatile, so the --tissue-s0 CSF value fitted on them leaves the
+    /// ventricles muted (real lateral ventricles ~2.5-2.9x WM at b=0, TR 4.8 s).
+    #[arg(long, value_name = "NIFTI")]
+    csf_scale_map: Option<PathBuf>,
     /// Scale each compartment's diffusivities "wm,gm,csf" to tune the S(b)/S0 decay to a real
     /// acquisition (WM intra+extra + soma, GM ball, CSF ball). Default: no change.
     #[arg(long, value_name = "WM,GM,CSF")]
@@ -563,6 +569,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Signal stage (per-compartment signal): {:?}  T2 {:?}", t.elapsed(), comp.t2);
     if let Some(s0) = tissue_s0 {
         comp.apply_s0(s0);
+    }
+    if let Some(mp) = &cli.csf_scale_map {
+        let (m, g) = io::load_volume(mp)?;
+        if g.dims != sig_grid.dims {
+            return Err(format!("--csf-scale-map grid {:?} != signal grid {:?}", g.dims, sig_grid.dims).into());
+        }
+        let n = comp.apply_compartment_scale_map(2, &m);
+        println!("csf scale map: {} voxels rescaled", n);
     }
     if let (Some(s0p), Some(t2p)) = (&cli.s0_map, &cli.t2_map) {
         let (s0m, g0) = io::load_volume(s0p)?;
