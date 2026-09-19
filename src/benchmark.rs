@@ -94,6 +94,7 @@ pub fn produce_slice(
                 bvec,
                 bval,
                 slice_seed: seed,
+                eddy_lin: None,
             },
             &Acquisition { noise_variance: noise, ..acq.clone() },
         )
@@ -189,6 +190,7 @@ pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
         PhaseKind::Ramp => PhaseModel {
             background: BackgroundPhase {
                 coeffs: [0.0, 0.08, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ..Default::default()
             },
             ..PhaseModel::none()
         },

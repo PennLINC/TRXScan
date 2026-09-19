@@ -145,6 +145,23 @@ struct Cli {
     /// Quadratic eddy-current strength
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy_quad: f64,
+    /// Eddy-current OBJECT-phase ramp strength (rad per unit bvec·bval per acquired voxel). Unlike
+    /// --eddy (which distorts geometry), this imprints a direction- and b-dependent ramp on the
+    /// reconstructed phase, reproducing the per-volume phase variation real DWI shows. ~1.7e-5
+    /// matches the NIBS data. DWI volumes only.
+    #[arg(long, default_value_t = 0.0, value_name = "S")]
+    eddy_phase: f64,
+    /// Replay a real per-volume eddy-current field from a qsiprep/DIFFPREP confounds TSV (its
+    /// diffprep_ec_00/01/02 linear terms) as a geometric PE shift, one row per DWI volume, instead
+    /// of the gradient-model --eddy. Real eddy does not track the diffusion-gradient direction, so
+    /// this reproduces THIS subject's eddy faithfully. The TSV must have one row per scheme volume.
+    #[arg(long, value_name = "TSV")]
+    eddy_trace: Option<PathBuf>,
+    /// Per-voxel noise level (SD) map on the ACQUISITION grid: spatially-varying complex Gaussian
+    /// noise added to the reconstructed image, so magnitude and phase share one realization. Writes
+    /// the SD map as <out>_desc-noise_sigma.nii.gz (ground truth for a denoiser's noise estimate).
+    #[arg(long, value_name = "NII")]
+    noise_map: Option<PathBuf>,
     /// GRAPPA acceleration factor R
     #[arg(long, default_value_t = 1, value_name = "R")]
     accel: usize,
@@ -175,6 +192,31 @@ struct Cli {
     /// Per-voxel myelination map (0..1): lerps the WM compartment toward the adult endpoint
     #[arg(long, value_name = "NII")]
     myelin: Option<PathBuf>,
+
+    /// Per-compartment signal amplitude "wm,gm,csf" (proton density x T1 saturation): scales the
+    /// fiber/GM/CSF b0 levels to match a real acquisition. Default: no change. CSF < 1 mimics
+    /// TR/T1 saturation (long-T1 CSF is not fully relaxed at a finite TR).
+    #[arg(long, value_name = "WM,GM,CSF")]
+    tissue_s0: Option<String>,
+    /// Scale each compartment's diffusivities "wm,gm,csf" to tune the S(b)/S0 decay to a real
+    /// acquisition (WM intra+extra + soma, GM ball, CSF ball). Default: no change.
+    #[arg(long, value_name = "WM,GM,CSF")]
+    diff_scale: Option<String>,
+
+    /// Scale the object phase model's background spatial ramp (src/phase.rs BackgroundPhase) by
+    /// this factor, to match a real acquisition's in-plane phase gradient. Default 1.0.
+    #[arg(long, default_value_t = 1.0, value_name = "S")]
+    phase_bg_scale: f64,
+    /// Additionally scale ONLY the phase-encode-axis (grid y) linear term of the background phase.
+    /// Real object phase ramps along readout, not PE; set this ~0 to remove the diagonal-stripe
+    /// artifact a symmetric x/y ramp produces. Default 1.0 (no extra change).
+    #[arg(long, default_value_t = 1.0, value_name = "S")]
+    phase_pe_ramp: f64,
+    /// Replace the linear background-phase ramp with a SMOOTH low-frequency field of this amplitude
+    /// (rad): a few low-frequency modes give the smooth, blobby, near-flat-interior look of real
+    /// reconstructed phase instead of a wrapping ramp's parallel stripes. 0 = keep the polynomial.
+    #[arg(long, default_value_t = 0.0, value_name = "AMP")]
+    phase_smooth: f64,
 
     /// Gradient nonlinearity: a preset ("whole-body-80", "connectom-300") or a Siemens `.grad`
     /// coefficient file. Adds the spatial encoding warp AND the per-voxel diffusion-encoding
@@ -427,7 +469,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let base = cli.params.params();
+    let mut base = cli.params.params();
+    let parse3 = |spec: &str, name: &str| -> Result<[f64; 3], String> {
+        let v: Vec<f64> = spec.split(',').map(|t| t.trim().parse::<f64>())
+            .collect::<Result<_, _>>().map_err(|_| format!("{name} expects wm,gm,csf, got {spec:?}"))?;
+        if v.len() != 3 {
+            return Err(format!("{name} expects three comma-separated values, got {spec:?}"));
+        }
+        Ok([v[0], v[1], v[2]])
+    };
+    if let Some(spec) = &cli.diff_scale {
+        let s = parse3(spec, "--diff-scale")?;
+        base.d_intra *= s[0];
+        base.d_extra = (base.d_extra.0 * s[0], base.d_extra.1 * s[0], base.d_extra.2 * s[0]);
+        base.d_gm *= s[1];
+        base.d_soma *= s[1];
+        base.d_csf *= s[2];
+        println!("diffusivity scale: wm x{} gm x{} csf x{}", s[0], s[1], s[2]);
+    }
+    let tissue_s0: Option<[f32; 3]> = match &cli.tissue_s0 {
+        Some(spec) => {
+            let s = parse3(spec, "--tissue-s0")?;
+            println!("tissue s0: fiber {} gm {} csf {}", s[0], s[1], s[2]);
+            Some([s[0] as f32, s[1] as f32, s[2] as f32])
+        }
+        None => None,
+    };
     println!("compartment params: {}  T2 fiber/gm/csf {}/{}/{} ms",
         cli.params, base.t2_fiber, base.t2_gm, base.t2_csf);
     let params = CompartmentParams { b_value: scheme.b_max, ..base };
@@ -480,6 +547,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         signal_from_mixture_gnl(&mix, &scheme, gnl_encoding)
     };
     println!("Signal stage (per-compartment signal): {:?}  T2 {:?}", t.elapsed(), comp.t2);
+    if let Some(s0) = tissue_s0 {
+        comp.apply_s0(s0);
+    }
 
     // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
@@ -587,6 +657,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ghost_offset: 0.015,    // subtle residual Nyquist ghost
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,
+        eddy_phase: cli.eddy_phase,
         eddy_tau: 70.0,
         n_spikes: 0,            // spikes are rare/aggressive; left off (available)
         spike_amplitude: 1.0,
@@ -605,11 +676,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let t = Instant::now();
 
+    // Optional per-volume eddy replay from a DIFFPREP confounds TSV (linear terms ec_00/01/02 =
+    // x, y(identity), z coefficients of the phase-encode shift polynomial; shear = [ec00, ec01-1, ec02]).
+    let eddy_trace: Option<Vec<[f64; 3]>> = if let Some(tp) = &cli.eddy_trace {
+        let txt = std::fs::read_to_string(tp)?;
+        let mut lines = txt.lines();
+        let header: Vec<&str> = lines.next().ok_or("empty --eddy-trace TSV")?.split('\t').collect();
+        let col = |name: &str| header.iter().position(|h| *h == name)
+            .ok_or_else(|| format!("--eddy-trace TSV missing column {name}"));
+        let (c0, c1, c2) = (col("diffprep_ec_00")?, col("diffprep_ec_01")?, col("diffprep_ec_02")?);
+        let mut rows: Vec<[f64; 3]> = Vec::new();
+        for line in lines {
+            if line.trim().is_empty() { continue; }
+            let f: Vec<&str> = line.split('\t').collect();
+            let g = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            rows.push([g(c0), g(c1) - 1.0, g(c2)]); // [x-shear, y-residual, z-shear]
+        }
+        if rows.len() != scheme.len() {
+            return Err(format!("--eddy-trace has {} rows but the scheme has {} volumes",
+                rows.len(), scheme.len()).into());
+        }
+        let rms = (rows.iter().map(|r| r[0] * r[0] + r[2] * r[2]).sum::<f64>() / rows.len() as f64).sqrt();
+        println!("eddy trace: {} volumes, RMS linear shear {:.4} (x/z -> PE shift per voxel)", rows.len(), rms);
+        Some(rows)
+    } else {
+        None
+    };
+
+    // Optional spatially-varying noise level map (acquisition grid, per-voxel per-component SD).
+    let noise_sigma: Option<Vec<f32>> = if let Some(nmp) = &cli.noise_map {
+        let (nm, ng) = io::load_volume(nmp)?;
+        if ng.dims != grid.dims {
+            return Err(format!(
+                "--noise-map grid {:?} != acquisition grid {:?}", ng.dims, grid.dims).into());
+        }
+        println!("noise level map: {} (spatially-varying complex noise; ground truth written)",
+            nmp.display());
+        Some(nm)
+    } else {
+        None
+    };
+
     let phase_model = match cli.phase_model.as_str() {
         "hbcd" => PhaseModel::hbcd_like(),
         "none" => PhaseModel::none(),
         other => return Err(format!("unknown --phase-model {other:?}; expected hbcd or none").into()),
     };
+    let mut phase_model = phase_model;
+    if (cli.phase_bg_scale - 1.0).abs() > f64::EPSILON {
+        for c in phase_model.background.coeffs.iter_mut() {
+            *c *= cli.phase_bg_scale;
+        }
+        println!("phase background ramp scaled by {}", cli.phase_bg_scale);
+    }
+    if (cli.phase_pe_ramp - 1.0).abs() > f64::EPSILON {
+        phase_model.background.coeffs[2] *= cli.phase_pe_ramp; // index 2 = y (phase-encode) linear
+        println!("phase PE-axis (y) ramp additionally scaled by {}", cli.phase_pe_ramp);
+    }
+    if cli.phase_smooth > 0.0 {
+        // Replace the in-plane linear ramp with a smooth low-frequency field: 6 modes with fixed,
+        // low spatial frequencies (period ~50-140 voxels) in scattered directions, so the sum is
+        // smooth and blobby (no single wrap line). Deterministic (fixed constants), so the field is
+        // reproducible across runs.
+        phase_model.background.coeffs[1] = 0.0; // drop x linear ramp
+        phase_model.background.coeffs[2] = 0.0; // drop y linear ramp
+        let freqs = [
+            [0.011, 0.007, 0.004], [0.006, 0.013, 0.005], [0.009, -0.008, 0.006],
+            [-0.007, 0.010, 0.003], [0.014, 0.005, -0.004], [0.004, -0.012, 0.007],
+        ];
+        let phases = [0.7, 2.3, 4.1, 1.2, 5.6, 3.4];
+        let amps = [1.0, 0.8, 0.9, 0.7, 0.6, 0.75];
+        for i in 0..6 {
+            phase_model.background.smooth[i] =
+                [freqs[i][0], freqs[i][1], freqs[i][2], cli.phase_smooth * amps[i], phases[i]];
+        }
+        println!("phase background: smooth low-frequency field, amplitude {} rad", cli.phase_smooth);
+    }
 
     let (mut mag, mut phase) = if cli.oversample > 1 {
         // `comp` was already built on the simulation grid above, so motion, SIFT2 weights, kappa,
@@ -618,7 +760,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  cli.oversample, cli.phase_model);
         simulate_acquisition_oversampled(
             sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
+            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed,
+            noise_sigma.as_deref(), eddy_trace.as_deref())
     } else {
         eprintln!(
             "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \
@@ -667,6 +810,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
+    if let Some(ns) = &noise_sigma {
+        let ns_out = if cli.fsl_orientation { reo.apply_volume(ns, 1) } else { ns.clone() };
+        io::write_4d(&PathBuf::from(format!("{}_desc-noise_sigma.nii.gz", cli.out)),
+            grid.dims, 1, &ns_out, &grid)?;
+        println!("wrote noise-level ground truth {}_desc-noise_sigma.nii.gz", cli.out);
+    }
 
     if let Some((mags, phasediff, te1, te2, prefix)) = gre_outputs.take() {
         let p = |s: &str| PathBuf::from(format!("{prefix}{s}"));

@@ -164,6 +164,19 @@ impl Compartments {
         }
         CleanDwi { dims: self.dims, ngrad: self.ngrad, data }
     }
+
+    /// Scale each compartment image by a per-compartment amplitude `[fiber, gm, csf]`
+    /// (proton density x T1 saturation). Lets a caller match a real acquisition's tissue b0
+    /// levels without touching the physics. No-op for an all-ones factor.
+    pub fn apply_s0(&mut self, s0: [f32; 3]) {
+        for (img, &a) in self.images.iter_mut().zip(s0.iter()) {
+            if (a - 1.0).abs() > f32::EPSILON {
+                for v in img.iter_mut() {
+                    *v *= a;
+                }
+            }
+        }
+    }
 }
 
 /// Assemble the signal stage as a mixed S/S₀ signal (compartment sum, no T2).
@@ -975,5 +988,20 @@ mod tests {
         assert!((s[0] - 1.0).abs() < 1e-6, "b0 unattenuated: {}", s[0]);
         assert!((s[1] - s[2]).abs() < 1e-7, "hindered fallback is isotropic: {} vs {}", s[1], s[2]);
         assert!(s[1] < 1.0 && (s[1] - want).abs() < 1e-6, "exp(-b·|g|²·md): {} vs {want}", s[1]);
+    }
+    #[test]
+    fn apply_s0_scales_each_compartment_independently() {
+        let mut c = Compartments {
+            dims: [1, 1, 1],
+            ngrad: 1,
+            images: vec![vec![2.0f32], vec![3.0f32], vec![5.0f32]],
+            t2: vec![70.0, 100.0, 2000.0],
+        };
+        c.apply_s0([1.0, 0.5, 0.0]);
+        assert_eq!(c.images[0][0], 2.0); // fiber unchanged (factor 1.0)
+        assert_eq!(c.images[1][0], 1.5); // gm halved
+        assert_eq!(c.images[2][0], 0.0); // csf zeroed
+        // the mixed signal is the sum of the scaled compartments
+        assert_eq!(c.mixed().data[0], 3.5);
     }
 }

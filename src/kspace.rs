@@ -154,6 +154,8 @@ pub struct Acquisition {
     pub ghost_offset: f64,    // Nyquist ghost: kx offset (±) on odd/even PE lines (0 = off)
     pub eddy_strength: f64,   // linear (in-plane) eddy-current phase scale (0 = off)
     pub eddy_quad: f64,       // quadratic (x²,y²,z²) eddy-current phase scale (0 = off)
+    pub eddy_phase: f64,      // eddy OBJECT-phase ramp: rad per unit (bvec·bval) per acquired voxel;
+                              // direction- and b-dependent, imprints reconstructed phase (0 = off)
     pub eddy_tau: f64,        // eddy-current decay time (ms)
     pub n_spikes: usize,      // random k-space spikes per slice (0 = off) → herringbone
     pub spike_amplitude: f64, // spike magnitude as a fraction of the peak k-space sample
@@ -208,6 +210,7 @@ impl Default for Acquisition {
             ghost_offset: 0.0,
             eddy_strength: 0.0,
             eddy_quad: 0.0,
+            eddy_phase: 0.0,
             eddy_tau: 70.0,
             n_spikes: 0,
             spike_amplitude: 1.0,
@@ -259,6 +262,11 @@ pub struct SliceInput<'a> {
     pub bvec: [f64; 3],
     pub bval: f64,
     pub slice_seed: u64,
+    /// Optional per-volume linear eddy shear `[a_x, a_y, a_z]` (dimensionless: PE shift in acquired
+    /// voxels per acquired voxel of position). Replays a real DIFFPREP/TORTOISE eddy estimate
+    /// (`--eddy-trace`), applied as a geometric PE distortion `shift = a·pos`, INSTEAD of the
+    /// gradient-model `--eddy` — real eddy does not track the diffusion-gradient direction.
+    pub eddy_lin: Option<[f64; 3]>,
 }
 
 /// A rectangle with sub-voxel-positioned edges on all four sides, with exact fractional occupancy
@@ -374,6 +382,9 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
     // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
     let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
+    let do_eddy_phase = acq.eddy_phase != 0.0 && inp.bval.abs() > 1e-9;
+    let do_eddy_trace = inp.eddy_lin.is_some();
+    let trt_s = acq.t_line * ny as f64 / 1000.0; // total readout time (s), for the shift<->phase map
     // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
     // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
     // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
@@ -454,24 +465,44 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
                 );
                 f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
                 let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
-                if do_eddy {
-                    // gradient-dependent field growing through the readout: linear (g·pos) plus a
-                    // quadratic (g·pos²) term — the polynomial forms eddy/TORTOISE fit.
-                    // centre on the sim grid, then express in ACQUIRED voxel units so that
-                    // eddy_strength/eddy_quad keep their meaning independent of oversampling
+                // Pre-readout object phase, already in radians, so it is added outside the TAU
+                // factor that scales the distortion/eddy term.
+                let mut phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
+                if do_eddy || do_eddy_phase || do_eddy_trace {
+                    // centre on the sim grid, then express in ACQUIRED voxel units so that the
+                    // eddy scales keep their meaning independent of oversampling
                     let (xc, yc, zc) = (
                         (x as f64 - sxs as f64 - xoff) / ox as f64,
                         (y as f64 - sys as f64 - yoff) / oy as f64,
                         z as f64 - zs as f64,
                     );
-                    let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
-                    let quad =
-                        gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
-                    phi += (acq.eddy_strength * lin + acq.eddy_quad * quad) * eddy_decay;
+                    if do_eddy {
+                        // gradient-dependent field growing through the readout: linear (g·pos)
+                        // plus a quadratic (g·pos²) term — the polynomial eddy/TORTOISE fit. This
+                        // grows with the readout time (eddy_decay ∝ ky) → geometric DISTORTION.
+                        let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
+                        let quad =
+                            gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
+                        phi += (acq.eddy_strength * lin + acq.eddy_quad * quad) * eddy_decay;
+                    }
+                    if do_eddy_phase {
+                        // Eddy OBJECT-phase ramp: constant across the readout (NOT ∝ ky), so it
+                        // imprints the reconstructed object phase rather than distorting geometry.
+                        // Direction- and b-dependent (∝ gradient = bvec·bval), it reproduces the
+                        // per-volume phase-ramp variation real DWI shows (∝ gradient direction).
+                        // z centred on the volume (zc above is slice-index-from-start, not centred).
+                        let zc_c = z as f64 - (inp.nz as f64 - 1.0) / 2.0;
+                        phi0 += acq.eddy_phase
+                            * (gradient[0] * xc + gradient[1] * yc + gradient[2] * zc_c);
+                    }
+                    if let Some(a) = inp.eddy_lin {
+                        // Replay a real per-volume linear eddy shear as a PE geometric shift: a
+                        // phase (a·pos / TRT)·t behaves like a fieldmap of that value, giving
+                        // shift = a·pos acquired voxels (a is dimensionless shift-per-position).
+                        let shear = a[0] * xc + a[1] * yc + a[2] * zc;
+                        phi += shear * (t / trt_s);
+                    }
                 }
-                // Pre-readout object phase, already in radians, so it is added outside the TAU
-                // factor that scales the distortion/eddy term.
-                let phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
                 modimg[at(x, y)] = C::cis(TAU * phi + phi0).scale(f_real);
             }
         }
@@ -822,6 +853,15 @@ pub fn simulate_acquisition_oversampled(
     bvecs: &[[f64; 3]],
     phase: &PhaseModel,
     seed: u64,
+    // Optional per-voxel per-component noise SD on the ACQUIRED grid (`x + nx*(y + ny*z)`). When
+    // given, complex Gaussian noise of this SD is added to the reconstructed complex image, before
+    // the magnitude/phase split — so magnitude and phase share the SAME noise realization, and the
+    // written SD map is the exact ground truth for a denoiser's estimated noise level. This is the
+    // image-space, spatially-varying counterpart to `Acquisition::noise_variance` (uniform, k-space).
+    noise_sigma: Option<&[f32]>,
+    // Optional per-volume linear eddy shear `[a_x,a_y,a_z]` (one per gradient) to REPLAY a real
+    // DIFFPREP eddy estimate as a geometric PE distortion (see `SliceInput::eddy_lin`).
+    eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
@@ -871,13 +911,26 @@ pub fn simulate_acquisition_oversampled(
                     bvec: bvecs[g],
                     bval: bvals[g],
                     slice_seed,
+                    eddy_lin: eddy_trace.map(|tr| tr[g]),
                 },
                 acq,
             );
             for y in 0..ny {
                 for x in 0..nx {
-                    let (re, im) = out[x + nx * y];
+                    let (mut re, mut im) = out[x + nx * y];
                     let vox = x + nx * (y + ny * z);
+                    if let Some(ns) = noise_sigma {
+                        let sd = ns[vox] as f64;
+                        if sd > 0.0 {
+                            // deterministic per (volume, voxel); parallel-safe (per_vol is over g)
+                            let mut rng = Rng(
+                                seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                    ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
+                            );
+                            re += (rng.gauss() * sd) as f32;
+                            im += (rng.gauss() * sd) as f32;
+                        }
+                    }
                     mag[vox] = (re * re + im * im).sqrt();
                     ph[vox] = im.atan2(re);
                 }
@@ -962,6 +1015,7 @@ pub fn simulate_acquisition_legacy(
                 bvec,
                 bval,
                 slice_seed: seed,
+                eddy_lin: None,
             };
             let out = simulate_slice(&inp, acq);
             for y in 0..ny {
@@ -1037,6 +1091,7 @@ mod tests {
                 bvec,
                 bval,
                 slice_seed,
+                eddy_lin: None,
             },
             acq,
         )
@@ -1393,7 +1448,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2: &[100.0], fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
         }
     }
 
@@ -1412,7 +1467,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9, eddy_lin: None
             },
             &acq,
         );
@@ -1438,7 +1493,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3, eddy_lin: None
                 },
                 &acq,
             );
@@ -1480,7 +1535,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64, eddy_lin: None
                 },
                 &acq,
             );
@@ -1548,7 +1603,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { partial_fourier: pf, ..clean() },
             )
@@ -1611,7 +1666,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5, eddy_lin: None
                 },
                 &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
@@ -1634,7 +1689,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { window: w, ..clean() },
             );
@@ -1728,6 +1783,7 @@ mod tests {
                 bvec: [0.0, 0.0, 0.0],
                 bval: 0.0,
                 slice_seed: 0,
+                eddy_lin: None,
             };
             let out = simulate_slice(&inp, &acq);
 
@@ -1751,7 +1807,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
         };
         let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
@@ -1774,7 +1830,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
                 },
                 &acq,
             )
@@ -1812,6 +1868,8 @@ mod tests {
         let (mag, ph) = simulate_acquisition_oversampled(
             [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
             &[1000.0], &[[1.0, 0.0, 0.0]], &model, 7,
+            None,
+            None,
         );
         let row: Vec<f64> = (nx / 2 + 1..nx).map(|x| mag[(x + nx * (ny / 2)) * 1] as f64).collect();
         let over = row.iter().cloned().fold(f64::MIN, f64::max) - 1.0;
@@ -1883,7 +1941,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5, eddy_lin: None
             },
             &acq,
         );

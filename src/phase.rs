@@ -39,17 +39,30 @@ impl Rng {
 /// phases that GRAPPA and coil combination depend on.
 ///
 /// Coefficient order: `1, x, y, z, x^2, y^2, z^2, xy, xz, yz`, in voxel units from the FOV centre.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BackgroundPhase {
     pub coeffs: [f64; 10],
+    /// Smooth low-frequency modes, each `[kx, ky, kz (cycles/voxel), amplitude (rad), phase]`,
+    /// summed as `amp·sin(2π(k·r) + phase)`. A few low-frequency modes give a smooth, blobby
+    /// background like real reconstructed phase; a single wrapping linear ramp (the `coeffs` part)
+    /// can only make parallel stripes. Default: all zero (unused).
+    pub smooth: [[f64; 5]; 6],
 }
 
 impl BackgroundPhase {
     pub fn at(&self, x: f64, y: f64, z: f64) -> f64 {
         let c = &self.coeffs;
-        c[0] + c[1] * x + c[2] * y + c[3] * z
+        let poly = c[0] + c[1] * x + c[2] * y + c[3] * z
             + c[4] * x * x + c[5] * y * y + c[6] * z * z
-            + c[7] * x * y + c[8] * x * z + c[9] * y * z
+            + c[7] * x * y + c[8] * x * z + c[9] * y * z;
+        let mut smooth = 0.0;
+        for m in &self.smooth {
+            if m[3] != 0.0 {
+                let phase = std::f64::consts::TAU * (m[0] * x + m[1] * y + m[2] * z) + m[4];
+                smooth += m[3] * phase.sin();
+            }
+        }
+        poly + smooth
     }
 }
 
@@ -177,6 +190,7 @@ impl PhaseModel {
             // hypot(0.13, 0.10) = 0.164 rad/voxel, the measured background gradient
             background: BackgroundPhase {
                 coeffs: [0.0, 0.13, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ..Default::default()
             },
             diffusion: DiffusionPhase { c_q: 0.0425, sigma_dx: 1.0, sigma_rot: 2.0e-3 },
         }
@@ -186,7 +200,7 @@ impl PhaseModel {
     pub fn none() -> Self {
         PhaseModel {
             global: 0.0,
-            background: BackgroundPhase { coeffs: [0.0; 10] },
+            background: BackgroundPhase { coeffs: [0.0; 10], ..Default::default() },
             diffusion: DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 },
         }
     }
@@ -244,7 +258,7 @@ mod tests {
 
     #[test]
     fn background_field_is_smooth_and_reproducible() {
-        let bg = BackgroundPhase { coeffs: [0.3, 0.01, -0.02, 0.005, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0] };
+        let bg = BackgroundPhase { coeffs: [0.3, 0.01, -0.02, 0.005, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0], ..Default::default() };
         assert_eq!(bg.at(1.0, 2.0, 3.0), bg.at(1.0, 2.0, 3.0));
         let step = (bg.at(1.1, 2.0, 3.0) - bg.at(1.0, 2.0, 3.0)).abs();
         assert!(step < 0.05, "background phase must vary slowly, got {step} per 0.1 voxel");
