@@ -8,8 +8,14 @@
 
 use crate::mixture::MixtureField;
 
-/// Neighbourhood on the hemisphere: vertices within this angle (sign-free) of a peak vertex.
+/// Neighbourhood on the hemisphere: vertices within this angle (sign-free) of a peak vertex
+/// for the local-maximum test.
 const NEIGHBOUR_DEG: f64 = 14.0;
+/// Neighbourhood for refining a peak direction: the principal axis of the mass-weighted
+/// scatter matrix of the vertices within this angle. Sign-free by construction, and wide
+/// enough that a kernel-spread peak is not truncated to the few bins nearest its vertex
+/// (which biased directions by several degrees on the 9-degree bins).
+const REFINE_DEG: f64 = 30.0;
 /// Two peaks closer than this are one peak.
 const MIN_SEPARATION_DEG: f64 = 25.0;
 /// Peaks carrying less than this fraction of the voxel's mass are dropped.
@@ -51,23 +57,23 @@ pub fn row_peaks(verts: &[[f64; 3]], row: &[f64], npeaks: usize) -> Vec<([f64; 3
         if peaks.len() == npeaks {
             break;
         }
-        // refine: mass-weighted mean of the neighbourhood, sign-aligned with the peak vertex
-        let (mut acc, mut mass) = ([0.0f64; 3], 0.0f64);
+        // refine: principal axis of the mass-weighted scatter matrix of the neighbourhood
+        let cos_r = REFINE_DEG.to_radians().cos();
+        let (mut sc, mut mass) = ([[0.0f64; 3]; 3], 0.0f64);
         for j in 0..verts.len() {
-            let d = dot(verts[i], verts[j]);
-            if d.abs() > cos_n && row[j] > 0.0 {
-                let s = if d < 0.0 { -1.0 } else { 1.0 };
-                for c in 0..3 {
-                    acc[c] += s * verts[j][c] * row[j];
+            if dot(verts[i], verts[j]).abs() > cos_r && row[j] > 0.0 {
+                for a in 0..3 {
+                    for b in 0..3 {
+                        sc[a][b] += row[j] * verts[j][a] * verts[j][b];
+                    }
                 }
                 mass += row[j];
             }
         }
-        let norm = (acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]).sqrt();
-        if norm <= 0.0 || mass / total < MIN_FRACTION {
+        if mass / total < MIN_FRACTION {
             continue;
         }
-        let dir = [acc[0] / norm, acc[1] / norm, acc[2] / norm];
+        let dir = principal_axis(&sc, verts[i]);
         if peaks.iter().any(|(p, _)| dot(*p, dir).abs() > cos_sep) {
             continue;
         }
@@ -87,6 +93,24 @@ pub fn row_peaks(verts: &[[f64; 3]], row: &[f64], npeaks: usize) -> Vec<([f64; 3
     }
     peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     peaks
+}
+
+/// Dominant eigenvector of a symmetric 3x3 matrix by power iteration, started from `seed`.
+fn principal_axis(m: &[[f64; 3]; 3], seed: [f64; 3]) -> [f64; 3] {
+    let mut v = seed;
+    for _ in 0..50 {
+        let w = [
+            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        ];
+        let n = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+        if n <= 0.0 {
+            return seed;
+        }
+        v = [w[0] / n, w[1] / n, w[2] / n];
+    }
+    v
 }
 
 /// Peaks for every acquisition voxel, layout `vox * 3 * npeaks + 3 * k + c` (the `write_4d`
@@ -152,7 +176,7 @@ mod tests {
         let row = watson_row(&s, &[(d, 1.0)], 20.0);
         let peaks = row_peaks(&s.verts, &row, 3);
         assert_eq!(peaks.len(), 1);
-        assert!(angle_deg(peaks[0].0, d) < 1.0, "angle {}", angle_deg(peaks[0].0, d));
+        assert!(angle_deg(peaks[0].0, d) < 0.3, "angle {}", angle_deg(peaks[0].0, d));
         assert!((peaks[0].1 - 1.0).abs() < 1e-9);
     }
 
@@ -164,7 +188,7 @@ mod tests {
         let row = watson_row(&s, &[(d1, 2.0), (d2, 1.0)], 20.0);
         let peaks = row_peaks(&s.verts, &row, 3);
         assert_eq!(peaks.len(), 2);
-        assert!(angle_deg(peaks[0].0, d1) < 1.5 && angle_deg(peaks[1].0, d2) < 1.5);
+        assert!(angle_deg(peaks[0].0, d1) < 1.0 && angle_deg(peaks[1].0, d2) < 1.0, "{} {}", angle_deg(peaks[0].0, d1), angle_deg(peaks[1].0, d2));
         assert!(peaks[0].1 > peaks[1].1);
         assert!((peaks[0].1 + peaks[1].1 - 1.0).abs() < 1e-9);
     }

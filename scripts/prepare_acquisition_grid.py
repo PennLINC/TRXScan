@@ -33,6 +33,11 @@ def main():
                          "<prefix>_desc-atlas_fieldmap.nii.gz")
     ap.add_argument("--prefix", required=True, help="e.g. sub-0001a_space-ACPC")
     ap.add_argument("--out", required=True, type=Path, help="output directory")
+    ap.add_argument("--fieldmap", type=Path, default=None,
+                    help="Hz off-resonance field to resample onto the acquisition (and sim) "
+                         "grid, overriding <anat-dir>/<prefix>_desc-atlas_fieldmap.nii.gz. Use a "
+                         "subject-specific field (e.g. qsiprep's DRBUDDI _space-ACPC_fieldmap) "
+                         "here; it must share the anatomical world frame of the probsegs.")
     ap.add_argument("--voxel", type=float, default=1.7,
                     help="acquisition voxel size, mm isotropic. Resolved against the SOURCE "
                          "affine's zooms, so it means millimetres for any input grid, not only "
@@ -112,7 +117,8 @@ def main():
     mask = ((w + g + c) > 0.3).astype(np.float32)
     nib.save(nib.Nifti1Image(mask, affine), a.out / "mask.nii.gz")
 
-    fmap_src = a.anat_dir / f"{a.prefix}_desc-atlas_fieldmap.nii.gz"
+    fmap_src = a.fieldmap if a.fieldmap is not None else \
+        a.anat_dir / f"{a.prefix}_desc-atlas_fieldmap.nii.gz"
     r = resample_from_to(nib.load(fmap_src), target, order=1)
     nib.save(nib.Nifti1Image(r.get_fdata(dtype=np.float32), affine), a.out / "fmap_hz.nii.gz")
 
