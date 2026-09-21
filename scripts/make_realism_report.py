@@ -51,7 +51,7 @@ for label,d in cmps.items():
     if label in monts and monts[label]:
         sec.append(f'<img src="data:image/png;base64,{monts[label]}" alt="{label} montage">')
 
-page=f"""<!doctype html><html><head><meta charset=utf-8><title>TRXScan realism — sub-60501</title>
+page=f"""<!doctype html><html><head><meta charset=utf-8><title>TRXScan realism report</title>
 <style>
 body{{font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;max-width:1050px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}}
 h1{{font-size:1.7rem;margin:.2rem 0}} h2{{margin-top:2rem;border-bottom:2px solid #eee;padding-bottom:.3rem}}
@@ -63,7 +63,7 @@ img{{max-width:100%;border:1px solid #ddd;border-radius:4px;margin:.5rem 0}}
 code,pre{{background:#f4f4f4;border-radius:4px}} pre{{padding:.7rem;overflow-x:auto;font-size:.82em}}
 .key{{background:#f0f7ff;border-left:3px solid #3b82f6;padding:.6rem .9rem;margin:.8rem 0}}
 </style></head><body>
-<h1>TRXScan realism vs a real acquisition — sub-60501 ses-01</h1>
+<h1>TRXScan realism vs a real acquisition</h1>
 <p class=sub>Simulated in the scanner frame with the subject's own DRBUDDI field; compared voxelwise to the raw {a.pe} complex DWI (HBCD75, Prisma 3T, TE 88 ms, TR 4.8 s).</p>
 <div class=key><b>Distortion convention verified:</b> a uniform ±field test shows the forward path shifts +field→+j (+9 vox) and reverse shifts +field→−j, both matching the real PED labels (NCC 0.996). The sim distortion is correct; the field is causal and is used with its natural sign.</div>
 <h2>Metrics: real vs sim</h2>

@@ -7,7 +7,7 @@ three isotropic compartments), runs the dipy FORCE closed forms
 plain-text fixture consumed by `cargo test` (pure std parsing, no serde).
 
 Run with the fork's env:
-    /home/matt/miniforge3/envs/force/bin/python tools/gen_force_fixtures.py
+    python tools/gen_force_fixtures.py   # inside the crash_force dipy-fork env
 
 Cases avoid near-degenerate mean-tensor eigenvalues (relative gaps >= 5%):
 eigenvector-dependent scalars (AK, RTAP/RTPP axis, NGpar/NGperp) are unstable

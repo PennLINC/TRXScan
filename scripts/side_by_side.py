@@ -27,7 +27,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--real-dir', required=True); ap.add_argument('--sim-dir', required=True)
     ap.add_argument('--grid-dir', required=True); ap.add_argument('--pe', default='PA')
-    ap.add_argument('--real-stem', default='sub-60501_ses-01_acq-HBCD75_rec-norm_dir-{pe}_run-01_part-{part}_dwi')
+    ap.add_argument('--real-stem', required=True, help='BIDS stem of the real DWI with {pe}/{part} placeholders')
     ap.add_argument('--sim-stem', required=True); ap.add_argument('--out', required=True)
     ap.add_argument('--label', default='sim')
     a = ap.parse_args()

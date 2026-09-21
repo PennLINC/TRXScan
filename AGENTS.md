@@ -25,7 +25,7 @@ The `microstructure` fixture test reads `tests/fixtures/force_moments.txt`, rege
 the closed forms or sampling change) with:
 
 ```bash
-/home/matt/miniforge3/envs/force/bin/python tools/gen_force_fixtures.py
+python tools/gen_force_fixtures.py   # run inside the crash_force dipy-fork env
 ```
 
 That conda env has the crash_force dipy fork installed in dev mode — the oracle the Rust closed

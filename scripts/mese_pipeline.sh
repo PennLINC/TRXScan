@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MESE -> voxelwise T2/S0 -> predicted diffusion b0 pipeline (NIBS sub-60501 defaults).
+# MESE -> voxelwise T2/S0 -> predicted diffusion b0 pipeline (set SUB/SES + the BIDS_ANAT/QSIPREP/KIT dirs for your data).
 #
 # Stages (each skipped when its outputs already exist; pass FORCE=1 to redo):
 #   topup     FSL topup on AP echo-1 + PA echo-1, applytopup (jacobian) to the 4 AP echoes
@@ -17,17 +17,17 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PY=${PY:-/home/matt/miniforge3/envs/qsiprep/bin/python}
+PY=${PY:-python}
 IMAGE=${IMAGE:-pennlinc/qsiprep:unstable}
 NTHR=${NTHR:-12}
 
-SUB=${SUB:-sub-60501}; SES=${SES:-ses-01}
-BIDS_ANAT=${BIDS_ANAT:-/media/matt/5TB/nibs/BIDS/$SUB/$SES/anat}
-QSIPREP=${QSIPREP:-/media/matt/5TB/nibs/derivatives/qsiprep-drbuddi/$SUB/$SES}
-KIT=${KIT:-/media/matt/5TB/nibs/derivatives/trxscan-inputs/$SUB/$SES}
+SUB=${SUB:-sub-01}; SES=${SES:-ses-01}   # override for your subject/session
+BIDS_ANAT=${BIDS_ANAT:?set BIDS_ANAT to the subject anat dir (multi-echo GRE/SE-EPI source)}
+QSIPREP=${QSIPREP:?set QSIPREP to the qsiprep derivatives dir for the subject}
+KIT=${KIT:?set KIT to the TRXScan scanner-frame inputs for the subject}
 QMRI=${QMRI:-$KIT/qmri}
 WORK=${WORK:-$QMRI/work}
-REPORT=${REPORT:-/home/matt/projects/qsiprep-testdata/outputs/nibs-exp/realism/mese}
+REPORT=${REPORT:-./realism/mese}
 
 P="${SUB}_${SES}"
 MESE_AP() { echo "$BIDS_ANAT/${P}_dir-AP_run-01_echo-$1_MESE.nii.gz"; }
