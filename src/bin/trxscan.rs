@@ -21,10 +21,23 @@ use trxscan::kspace::{
 use trxscan::phase::PhaseModel;
 use trxscan::motion;
 use trxscan::orient::Reorient;
+use trxscan::raster::Grid;
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
 
 /// Compartment parameter preset (diffusivities + T2 relaxation times).
+/// What phase representation the GRE fieldmap writes.
+#[derive(Copy, Clone, Debug, PartialEq, ValueEnum)]
+enum GreOutput {
+    /// Single phase-difference image (`phasediff`): the receiver phase cancels, so it is smooth
+    /// (few wraps) — the compact BIDS GRE fieldmap.
+    Phasediff,
+    /// Both individual echo phases (`phase1`/`phase2`): each carries the smooth receiver phase φ₀
+    /// plus 2π·f·TE, so they show the fringe wrapping a raw GRE phase image has (what PRELUDE
+    /// unwraps). φ₀ cancels when qsiprep differences them, so the field is identical.
+    Phase,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Preset {
     /// Fiberfox ffp legacy values (weak GM/WM contrast at low b by design)
@@ -275,6 +288,34 @@ struct Cli {
     /// that (it maps the image's min/max onto -pi..pi); a noiseless phasediff gets stretched.
     #[arg(long, default_value_t = 50.0)]
     gre_snr: f64,
+    /// GRE fieldmap output resolution (isotropic mm). Default: the DWI acquisition grid. With a
+    /// value, the GRE is generated at that resolution by complex-averaging the fine-grid signal
+    /// onto the coarser grid, so steep-field voxels dephase within the voxel (the intravoxel
+    /// dephasing a real low-resolution fieldmap shows) instead of sampling the field pointwise.
+    #[arg(long, value_name = "MM")]
+    gre_res: Option<f64>,
+    /// B0 field identifier label for the GRE fieldmap (modern BIDS `B0FieldIdentifier`, which
+    /// replaces the deprecated `IntendedFor`). The DWI written in the same run carries the matching
+    /// `B0FieldSource`, so qsiprep links them automatically.
+    #[arg(long, default_value = "b0gre", value_name = "LABEL")]
+    gre_b0field: String,
+    /// How the GRE SNR scales with voxel volume relative to the DWI acquisition resolution, so a
+    /// coarser fieldmap is less noisy than a fine one: SNR ∝ V^exp, i.e. σ ∝ (V_dwi / V_gre)^exp.
+    /// 1.0 (default) = fixed total scan time and FOV (the textbook SNR ∝ voxel-volume relation);
+    /// 0.5 = fixed number of averages (scan time grows with resolution); 0 = constant σ at all
+    /// resolutions. `--gre-snr` is the SNR at the DWI acquisition voxel, so the default GRE grid is
+    /// unaffected.
+    #[arg(long, default_value_t = 1.0, value_name = "EXP")]
+    gre_snr_vol_exp: f64,
+    /// GRE phase representation: `phasediff` (default, smooth single image) or `phase` (the two
+    /// individual echo phases `phase1`/`phase2`, which show the receiver-phase fringe wrapping of a
+    /// raw GRE and go through qsiprep's two-phase route).
+    #[arg(long, value_enum, default_value_t = GreOutput::Phasediff)]
+    gre_output: GreOutput,
+    /// Peak amplitude (rad) of the smooth receiver/transmit phase φ₀ added to the individual echo
+    /// phases (`--gre-output phase`). Larger → more fringes. Cancels in the phase difference.
+    #[arg(long, default_value_t = 6.0, value_name = "RAD")]
+    gre_rx_phase: f64,
     /// Also write the ground-truth fibre orientations per acquisition voxel: up to three peaks
     /// of the orientation mixture (aggregated over the oversampled cells, refined to sub-bin
     /// accuracy), each a unit vector in world RAS scaled by its mass fraction, as a 9-volume
@@ -614,7 +655,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.mb, gt.len(), cli.out);
     }
 
-    let mut gre_outputs: Option<(Vec<Vec<f32>>, Vec<i16>, f64, f64, String)> = None;
+    let mut gre_outputs: Option<(Vec<Vec<f32>>, Vec<Vec<i16>>, f64, f64, String, Grid, bool)> = None;
 
     // Gradient nonlinearity, spatial part: the scanner encodes tissue at φ(r), so every
     // compartment image and the off-resonance field move to the apparent frame before k-space
@@ -630,13 +671,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Dual-echo GRE fieldmap from the same object: magnitudes from the tissue mixture with the
-    // compartment T2s, phase difference from the (already warped) off-resonance field.
+    // compartment T2s, phase difference from the (already warped) off-resonance field. Written on
+    // the DWI acquisition grid by default, or at an independent isotropic resolution (--gre-res)
+    // by complex-averaging the fine-grid signal (intravoxel dephasing).
     if let Some(gre_prefix) = &cli.gre_out {
         let o = if cli.oversample > 1 { cli.oversample } else { 1 };
         let (te1, te2) = (4.92e-3, 7.38e-3); // s, the Siemens gre_field_mapping defaults
+        let pi = std::f64::consts::PI;
+        let tau = 2.0 * pi;
         let nvox_sig = sig_grid.dims.iter().product::<usize>();
         let fractions = [&sig_tissue.wm, &sig_tissue.gm, &sig_tissue.csf];
-        let mut mags = Vec::new();
+        // per-echo magnitude on the fine signal grid (compartment-T2 decay + the same GNL warp)
+        let mut fine_mag: Vec<Vec<f32>> = Vec::new();
         for te in [te1, te2] {
             let mut m = vec![0.0f32; nvox_sig];
             for v in 0..nvox_sig {
@@ -649,32 +695,129 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((_, field_sig, _)) = gnl.as_ref().filter(|_| !cli.gnl_no_warp) {
                 m = field_sig.warp_volume(&m, !cli.gnl_no_jacobian_modulation);
             }
-            mags.push(downsample_inplane(&m, sig_grid.dims, o));
+            fine_mag.push(m);
         }
-        let fmap_acq = downsample_inplane(&fmap, sig_grid.dims, o);
-        // Complex noise on each echo: the magnitudes become Rician and the phase difference
-        // wraps uniformly wherever there is no signal.
-        let sigma = if cli.gre_snr > 0.0 { acq_signal_scale() / cli.gre_snr } else { 0.0 };
+        // With --gre-output phase, each echo carries a smooth receiver phase φ₀ on top of the field
+        // term (2π·f·TE), producing the fringe wrapping of a raw GRE phase image. φ₀ cancels in the
+        // phase difference, so the recovered field is unchanged.
+        let phase_mode = cli.gre_output == GreOutput::Phase;
+        let phi0 = if phase_mode { smooth_rx_phase(&sig_grid, cli.gre_rx_phase) } else { Vec::new() };
+        let phase_of = |v: usize, te: f64| -> f64 {
+            (if phase_mode { phi0[v] as f64 } else { 0.0 }) + tau * fmap[v] as f64 * te
+        };
+        // Pre-noise complex echoes (real, imag) on the GRE grid.
+        let (gre_grid, s1re, s1im, s2re, s2im) = if let Some(res) = cli.gre_res {
+            // Independent isotropic grid: box-average the fine COMPLEX signal, each echo carrying
+            // its own phase 2*pi*f*TE, so a coarse voxel spanning a steep gradient loses magnitude
+            // and gets an averaged phase — the intravoxel dephasing a real low-res fieldmap shows.
+            let tg = gre_target_grid(&sig_grid, res);
+            let nt = tg.dims.iter().product::<usize>();
+            let m = &sig_grid.voxel_to_world;
+            let sp = |c: usize| (m[0][c] * m[0][c] + m[1][c] * m[1][c] + m[2][c] * m[2][c]).sqrt();
+            let ratio = [sp(0) / res, sp(1) / res, sp(2) / res];
+            let (mut a1r, mut a1i, mut a2r, mut a2i, mut cnt) =
+                (vec![0.0f64; nt], vec![0.0f64; nt], vec![0.0f64; nt], vec![0.0f64; nt], vec![0.0f64; nt]);
+            let (sx, sy, sz) = (sig_grid.dims[0], sig_grid.dims[1], sig_grid.dims[2]);
+            let map = |idx: usize, r: f64, n: usize| (((idx as f64 + 0.5) * r - 0.5).round() as isize).clamp(0, n as isize - 1) as usize;
+            for k in 0..sz {
+                for j in 0..sy {
+                    for i in 0..sx {
+                        let vf = i + sx * (j + sy * k);
+                        let vt = map(i, ratio[0], tg.dims[0]) + tg.dims[0] * (map(j, ratio[1], tg.dims[1]) + tg.dims[1] * map(k, ratio[2], tg.dims[2]));
+                        let (p1, p2) = (phase_of(vf, te1), phase_of(vf, te2));
+                        a1r[vt] += fine_mag[0][vf] as f64 * p1.cos();
+                        a1i[vt] += fine_mag[0][vf] as f64 * p1.sin();
+                        a2r[vt] += fine_mag[1][vf] as f64 * p2.cos();
+                        a2i[vt] += fine_mag[1][vf] as f64 * p2.sin();
+                        cnt[vt] += 1.0;
+                    }
+                }
+            }
+            let norm = |a: &[f64]| -> Vec<f32> { a.iter().zip(&cnt).map(|(&x, &n)| if n > 0.0 { (x / n) as f32 } else { 0.0 }).collect() };
+            (tg, norm(&a1r), norm(&a1i), norm(&a2r), norm(&a2i))
+        } else if phase_mode {
+            // Phase mode on the DWI acquisition grid: build each echo's full complex signal
+            // (φ₀ + 2π·f·TE) on the fine grid, then in-plane block-average the real/imag parts
+            // (complex intravoxel dephasing), same grid as the default phasediff output.
+            let build = |mag: &[f32], te: f64| -> (Vec<f32>, Vec<f32>) {
+                let (mut re, mut im) = (vec![0.0f32; nvox_sig], vec![0.0f32; nvox_sig]);
+                for v in 0..nvox_sig {
+                    let ph = phase_of(v, te);
+                    re[v] = (mag[v] as f64 * ph.cos()) as f32;
+                    im[v] = (mag[v] as f64 * ph.sin()) as f32;
+                }
+                (downsample_inplane(&re, sig_grid.dims, o), downsample_inplane(&im, sig_grid.dims, o))
+            };
+            let (r1, i1) = build(&fine_mag[0], te1);
+            let (r2, i2) = build(&fine_mag[1], te2);
+            (grid.clone(), r1, i1, r2, i2)
+        } else {
+            // Default: the DWI acquisition grid. Echo 1 carries no phase and echo 2 the whole phase
+            // difference (2*pi*f*dTE) evaluated on the downsampled field — the original behaviour,
+            // preserved byte-for-byte.
+            let m1 = downsample_inplane(&fine_mag[0], sig_grid.dims, o);
+            let m2 = downsample_inplane(&fine_mag[1], sig_grid.dims, o);
+            let fmap_acq = downsample_inplane(&fmap, sig_grid.dims, o);
+            let n = m1.len();
+            let (mut s2re, mut s2im) = (vec![0.0f32; n], vec![0.0f32; n]);
+            for v in 0..n {
+                let phi = tau * fmap_acq[v] as f64 * (te2 - te1);
+                s2re[v] = (m2[v] as f64 * phi.cos()) as f32;
+                s2im[v] = (m2[v] as f64 * phi.sin()) as f32;
+            }
+            (grid.clone(), m1, vec![0.0f32; n], s2re, s2im)
+        };
+        // Complex noise on each echo: the magnitudes become Rician and the phase difference wraps
+        // uniformly wherever there is no signal. (RNG draw order matches the original code.) The
+        // per-voxel signal is a mean of the fine grid (resolution-independent), so cross-resolution
+        // SNR realism comes from scaling σ: a larger GRE voxel collects proportionally more signal,
+        // so SNR ∝ V^exp ⇒ σ ∝ (V_dwi / V_gre)^exp, referenced to the DWI acquisition voxel (that
+        // reference keeps the default acq-grid output unchanged: V_gre == V_dwi ⇒ scale 1).
+        let sigma = if cli.gre_snr > 0.0 {
+            let det3 = |m: &[[f64; 4]; 4]| (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])).abs();
+            let scale = (det3(&grid.voxel_to_world) / det3(&gre_grid.voxel_to_world)).powf(cli.gre_snr_vol_exp);
+            acq_signal_scale() / cli.gre_snr * scale
+        } else {
+            0.0
+        };
         let mut rng = trxscan::kspace::Rng(0x6E7E_F1E1_D000_0000 ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let mut phasediff = Vec::with_capacity(fmap_acq.len());
-        for v in 0..fmap_acq.len() {
-            let phi = 2.0 * std::f64::consts::PI * fmap_acq[v] as f64 * (te2 - te1);
-            let (m1, m2) = (mags[0][v] as f64, mags[1][v] as f64);
-            let s1 = (m1 + sigma * rng.gauss(), sigma * rng.gauss());
-            let s2 = (m2 * phi.cos() + sigma * rng.gauss(), m2 * phi.sin() + sigma * rng.gauss());
-            // arg(s2 * conj(s1)) is already wrapped to (-pi, pi]
-            let dphi = (s2.1 * s1.0 - s2.0 * s1.1).atan2(s2.0 * s1.0 + s2.1 * s1.1);
-            mags[0][v] = (s1.0 * s1.0 + s1.1 * s1.1).sqrt() as f32;
-            mags[1][v] = (s2.0 * s2.0 + s2.1 * s2.1).sqrt() as f32;
-            phasediff.push(((dphi + std::f64::consts::PI) / (2.0 * std::f64::consts::PI) * 4096.0).round().clamp(0.0, 4095.0) as i16);
+        let n = s1re.len();
+        let (mut mag1, mut mag2) = (vec![0.0f32; n], vec![0.0f32; n]);
+        // Siemens integer phase: [-pi, pi] -> [0, 4096]; both routes qsiprep reads use this scale.
+        let siemens = |ph: f64| -> i16 { ((ph + pi) / tau * 4096.0).round().clamp(0.0, 4096.0) as i16 };
+        // phase_data holds [phasediff] or [phase1, phase2].
+        let mut phase_data: Vec<Vec<i16>> = if phase_mode { vec![Vec::with_capacity(n), Vec::with_capacity(n)] } else { vec![Vec::with_capacity(n)] };
+        for v in 0..n {
+            let s1 = (s1re[v] as f64 + sigma * rng.gauss(), s1im[v] as f64 + sigma * rng.gauss());
+            let s2 = (s2re[v] as f64 + sigma * rng.gauss(), s2im[v] as f64 + sigma * rng.gauss());
+            mag1[v] = (s1.0 * s1.0 + s1.1 * s1.1).sqrt() as f32;
+            mag2[v] = (s2.0 * s2.0 + s2.1 * s2.1).sqrt() as f32;
+            if phase_mode {
+                phase_data[0].push(siemens(s1.1.atan2(s1.0)));
+                phase_data[1].push(siemens(s2.1.atan2(s2.0)));
+            } else {
+                // arg(s2 * conj(s1)) is already wrapped to (-pi, pi]
+                let dphi = (s2.1 * s1.0 - s2.0 * s1.1).atan2(s2.0 * s1.0 + s2.1 * s1.1);
+                phase_data[0].push(((dphi + pi) / tau * 4096.0).round().clamp(0.0, 4095.0) as i16);
+            }
         }
-        let stamped = trxscan::gnl::stamp_phasediff_range(&mut phasediff);
+        // Only the phasediff route relies on the image spanning a full turn (qsiprep min/max
+        // rescale); the two-phase route uses a fixed scale, so no stamping needed.
+        let stamped = if phase_mode { false } else { trxscan::gnl::stamp_phasediff_range(&mut phase_data[0]) };
         println!(
-            "GRE fieldmap: TE {:.2}/{:.2} ms, tissue SNR {} (sigma {:.3}){}",
-            te1 * 1e3, te2 * 1e3, cli.gre_snr, sigma,
+            "GRE fieldmap: TE {:.2}/{:.2} ms, {}, {}, tissue SNR {} (sigma {:.3}){}",
+            te1 * 1e3, te2 * 1e3,
+            if phase_mode { format!("phase1/phase2 (rx-phase {:.1} rad)", cli.gre_rx_phase) } else { "phasediff".to_string() },
+            match cli.gre_res {
+                Some(r) => format!("{r} mm iso {:?} (complex intravoxel averaging)", gre_grid.dims),
+                None => "DWI acquisition grid".to_string(),
+            },
+            cli.gre_snr, sigma,
             if stamped { "; corner voxels stamped to 0/4095 so the phasediff spans its full range" } else { "" }
         );
-        gre_outputs = Some((mags, phasediff, te1, te2, gre_prefix.clone()));
+        gre_outputs = Some((vec![mag1, mag2], phase_data, te1, te2, gre_prefix.clone(), gre_grid, phase_mode));
     }
 
     // HBCD-like acquisition, per-compartment T2, optional Rician noise. The PE-train duration
@@ -850,6 +993,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         partial_fourier: acq.partial_fourier,
         accel: cli.accel,
         mb: cli.mb,
+        // When a GRE fieldmap is written this run, tag the DWI as its B0FieldSource.
+        b0_field_source: cli.gre_out.as_ref().map(|_| cli.gre_b0field.clone()),
     };
 
     io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
@@ -861,21 +1006,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote noise-level ground truth {}_desc-noise_sigma.nii.gz", cli.out);
     }
 
-    if let Some((mags, phasediff, te1, te2, prefix)) = gre_outputs.take() {
+    if let Some((mags, phase_data, te1, te2, prefix, gre_grid, phase_mode)) = gre_outputs.take() {
+        // Reorient on the GRE's OWN grid (which may differ from the DWI grid under --gre-res).
+        let greo = if cli.fsl_orientation {
+            Reorient::to_las(&gre_grid.voxel_to_world, gre_grid.dims)
+        } else {
+            Reorient::identity(gre_grid.dims)
+        };
+        let mut wgrid = gre_grid.clone();
+        wgrid.voxel_to_world = greo.apply_affine(&gre_grid.voxel_to_world);
+        wgrid.dims = greo.out_dims;
+        // Modern BIDS B0 linkage: the fieldmap declares B0FieldIdentifier; the DWI written this run
+        // carries the matching B0FieldSource. Set on every file of the estimation.
+        let b0id = &cli.gre_b0field;
         let p = |s: &str| PathBuf::from(format!("{prefix}{s}"));
         for (k, m) in mags.iter().enumerate() {
-            let vol = reo.apply_volume(m, 1);
-            io::write_3d(&p(&format!("_magnitude{}.nii.gz", k + 1)), grid.dims, &vol, &grid)?;
+            let vol = greo.apply_volume(m, 1);
+            io::write_3d(&p(&format!("_magnitude{}.nii.gz", k + 1)), wgrid.dims, &vol, &wgrid)?;
             let te = if k == 0 { te1 } else { te2 };
             std::fs::write(p(&format!("_magnitude{}.json", k + 1)), format!(
-                "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime\": {te:.5},\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"M\", \"ND\"]\n}}\n"))?;
+                "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime\": {te:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"M\", \"ND\"]\n}}\n"))?;
         }
-        let ph_f: Vec<f32> = phasediff.iter().map(|&v| v as f32).collect();
-        let ph_reo: Vec<i16> = reo.apply_volume(&ph_f, 1).iter().map(|&v| v as i16).collect();
-        io::write_3d_i16(&p("_phasediff.nii.gz"), grid.dims, &ph_reo, &grid)?;
-        std::fs::write(p("_phasediff.json"), format!(
-            "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime1\": {te1:.5},\n  \"EchoTime2\": {te2:.5},\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"P\", \"ND\", \"PHASE\"],\n  \"IntendedFor\": []\n}}\n"))?;
-        println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phasediff (+json)");
+        let write_phase = |suffix: &str, data: &[i16], json: String| -> Result<(), Box<dyn std::error::Error>> {
+            let ph_f: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+            let ph_reo: Vec<i16> = greo.apply_volume(&ph_f, 1).iter().map(|&v| v as i16).collect();
+            io::write_3d_i16(&p(&format!("_{suffix}.nii.gz")), wgrid.dims, &ph_reo, &wgrid)?;
+            std::fs::write(p(&format!("_{suffix}.json")), json)?;
+            Ok(())
+        };
+        if phase_mode {
+            // Two individual echo phases (phase1/phase2): qsiprep differences them internally.
+            for (k, ph) in phase_data.iter().enumerate() {
+                let te = if k == 0 { te1 } else { te2 };
+                write_phase(&format!("phase{}", k + 1), ph, format!(
+                    "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime\": {te:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"P\", \"ND\", \"PHASE\"]\n}}\n"))?;
+            }
+            println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phase{{1,2}} (+json)");
+        } else {
+            write_phase("phasediff", &phase_data[0], format!(
+                "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime1\": {te1:.5},\n  \"EchoTime2\": {te2:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"P\", \"ND\", \"PHASE\"]\n}}\n"))?;
+            println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phasediff (+json)");
+        }
     }
 
     if let Some(pk) = truth_peaks.as_ref() {
@@ -911,6 +1082,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The acquisition's nominal signal scale (matches `Acquisition::signal_scale` in `main`).
 fn acq_signal_scale() -> f64 {
     100.0
+}
+
+/// An isotropic `res`-mm grid covering `sig`'s field of view, sharing its world orientation
+/// (direction cosines) and FOV corner. Only the voxel spacing changes, so the output stays in the
+/// same world frame the DWI/field live in — and, because the axes are shared, a fine voxel maps to
+/// a coarse voxel by a per-axis spacing ratio alone (no affine inversion needed).
+fn gre_target_grid(sig: &Grid, res: f64) -> Grid {
+    let m = &sig.voxel_to_world;
+    let mut tv = [[0.0f64; 4]; 4];
+    tv[3][3] = 1.0;
+    let mut spacing = [0.0f64; 3];
+    for c in 0..3 {
+        let s = (m[0][c] * m[0][c] + m[1][c] * m[1][c] + m[2][c] * m[2][c]).sqrt();
+        spacing[c] = s;
+        for r in 0..3 {
+            tv[r][c] = m[r][c] / s * res; // unit cosine * new spacing
+        }
+    }
+    let dims = [
+        ((spacing[0] * sig.dims[0] as f64 / res).round() as usize).max(1),
+        ((spacing[1] * sig.dims[1] as f64 / res).round() as usize).max(1),
+        ((spacing[2] * sig.dims[2] as f64 / res).round() as usize).max(1),
+    ];
+    // Preserve the FOV corner (world coord of voxel index (-0.5,-0.5,-0.5)).
+    for r in 0..3 {
+        let corner = -0.5 * (m[r][0] + m[r][1] + m[r][2]) + m[r][3];
+        tv[r][3] = corner + 0.5 * (tv[r][0] + tv[r][1] + tv[r][2]);
+    }
+    Grid { dims, voxel_to_world: tv }
+}
+
+/// A smooth low-order receiver/transmit phase field (radians) on `sig`, peak ~`amp`. A real GRE's
+/// per-echo phase is this plus the field term `2π·f·TE`; φ₀ (not the field) drives most of the
+/// fringe wrapping in individual phase images, and cancels exactly in the phase difference.
+fn smooth_rx_phase(sig: &Grid, amp: f64) -> Vec<f32> {
+    let [nx, ny, nz] = sig.dims;
+    let mut v = vec![0.0f32; nx * ny * nz];
+    let norm = |a: usize, n: usize| 2.0 * a as f64 / (n.max(2) - 1) as f64 - 1.0; // -> [-1, 1]
+    for k in 0..nz {
+        let w = norm(k, nz);
+        for j in 0..ny {
+            let vv = norm(j, ny);
+            for i in 0..nx {
+                let u = norm(i, nx);
+                // a smooth ramp + curvature + a couple of cross terms (unit-ish scale)
+                let g = u + 0.7 * vv + 0.4 * w + 0.5 * (u * u - 0.5) + 0.4 * (vv * vv - 0.5) + 0.6 * u * vv + 0.3 * vv * w;
+                v[i + nx * (j + ny * k)] = (amp * g) as f32;
+            }
+        }
+    }
+    v
 }
 
 /// Block-average an in-plane oversampled volume (`sim = [nx*o, ny*o, nz]`) down to `[nx, ny, nz]`.

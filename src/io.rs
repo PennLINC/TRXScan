@@ -428,6 +428,10 @@ pub struct SidecarInfo {
     pub partial_fourier: f64,
     pub accel: usize,
     pub mb: usize,
+    /// Modern BIDS B0 linkage: when a fieldmap is written for this DWI, its
+    /// `B0FieldIdentifier` label is recorded here so the DWI carries the matching
+    /// `B0FieldSource` (the replacement for the deprecated `IntendedFor`).
+    pub b0_field_source: Option<String>,
 }
 
 pub fn write_complex_dwi(
@@ -449,11 +453,15 @@ pub fn write_complex_dwi(
     let ped = info.phase_encoding_direction.as_str();
     let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
     let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
+    let b0src = match &info.b0_field_source {
+        Some(id) => format!(",\n  \"B0FieldSource\": \"{id}\""),
+        None => String::new(),
+    };
     let common = format!(
         "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
          \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
          \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
-         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}",
+         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
         info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
     );
     std::fs::write(p("_part-mag_dwi.json"),
