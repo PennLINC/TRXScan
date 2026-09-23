@@ -3,7 +3,8 @@
 //! - **Streamlines**: `trx-rs` `read_tractogram` (TRX/TRK/TCK/VTK) → positions + CSR offsets.
 //! - **Tissue maps**: `nifti` 0.17 → f32 volume + voxel→world affine (sform, else qform quaternion,
 //!   mirroring `TRXViz/trxviz-core/src/data/nifti_data.rs`).
-//! - **4D DWI out**: NIfTI-1 with the acquisition affine + FSL `.bval`/`.bvec`.
+//! - **4D DWI out**: NIfTI-1 with the acquisition affine (`mrsim_acq::io::write_complex_4d`)
+//!   + FSL `.bval`/`.bvec` (`write_dwi_scheme`, here).
 //!
 //! Streamlines and tissue maps must share the same **world (RAS mm)** frame (they do when the TRK
 //! is world-space and the NIfTI affine is scanner/RAS — the qsiprep-testdata pipeline's convention).
@@ -17,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 // NIfTI volume read and array write live in the shared crate; re-exported so `io::` paths
 // inside and outside this crate keep resolving.
-pub use mrsim_acq::io::{hires_grid, load_volume, write_3d, write_3d_i16, write_4d};
+pub use mrsim_acq::io::{hires_grid, load_volume, write_3d, write_3d_i16, write_4d,
+                        write_complex_4d, SidecarInfo};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -284,61 +286,12 @@ pub fn write_dwi(out_prefix: &Path, dwi: &CleanDwi, grid: &Grid, scheme: &Gradie
     write_bval_bvec(&out_prefix.with_extension("bval"), &out_prefix.with_extension("bvec"), scheme)
 }
 
-/// Write a **complex** DWI as BIDS `part-mag` / `part-phase` NIfTIs (phase in radians) + shared
-/// `.bval`/`.bvec` + JSON sidecars — the layout `dwidenoise`/`dwidenoise2` consume for complex
-/// denoising. `out_prefix` is a BIDS stem, e.g. `.../sub-01_ses-V02_dir-AP_run-01`.
-/// Acquisition facts the BIDS JSON sidecars record. A plain struct (not
-/// `kspace::Acquisition`) so `io` stays usable without the `kspace` feature.
-pub struct SidecarInfo {
-    /// BIDS PhaseEncodingDirection ("j", "j-", …) already resolved for the *written* voxel frame
-    /// (see `orient` + the caller): a +off-resonance field displaces signal toward +this-axis.
-    pub phase_encoding_direction: String,
-    pub total_readout_time: f64, // s
-    pub echo_time: f64,          // s
-    pub partial_fourier: f64,
-    pub accel: usize,
-    pub mb: usize,
-    /// Modern BIDS B0 linkage: when a fieldmap is written for this DWI, its
-    /// `B0FieldIdentifier` label is recorded here so the DWI carries the matching
-    /// `B0FieldSource` (the replacement for the deprecated `IntendedFor`).
-    pub b0_field_source: Option<String>,
-}
-
-pub fn write_complex_dwi(
-    out_prefix: &str,
-    dims: [usize; 3],
-    ngrad: usize,
-    mag: &[f32],
-    phase: &[f32],
-    grid: &Grid,
-    scheme: &GradientScheme,
-    info: &SidecarInfo,
-) -> R<()> {
-    let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
-    write_4d(&p("_part-mag_dwi.nii.gz"), dims, ngrad, mag, grid)?;
-    write_4d(&p("_part-phase_dwi.nii.gz"), dims, ngrad, phase, grid)?;
-    write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)?;
-    // PED is resolved by the caller for the written frame (native grid, or reoriented to LAS with
-    // --fsl-orientation). EffectiveEchoSpacing is per the PE axis the code names, not a fixed axis.
-    let ped = info.phase_encoding_direction.as_str();
-    let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
-    let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
-    let b0src = match &info.b0_field_source {
-        Some(id) => format!(",\n  \"B0FieldSource\": \"{id}\""),
-        None => String::new(),
-    };
-    let common = format!(
-        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
-         \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
-         \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
-         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
-        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
-    );
-    std::fs::write(p("_part-mag_dwi.json"),
-        format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
-    std::fs::write(p("_part-phase_dwi.json"),
-        format!("{{\n{common},\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}}\n"))?;
-    Ok(())
+/// Write the FSL scheme files beside a complex 4D DWI. Diffusion-specific, so it stays here.
+/// The `write_bval_bvec` call lifted out of the old `write_complex_dwi`, with the same
+/// `_dwi.bval` / `_dwi.bvec` names it wrote before.
+pub fn write_dwi_scheme(out_prefix: &str, scheme: &GradientScheme) -> R<()> {
+    let p = |tail: &str| PathBuf::from(format!("{out_prefix}{tail}"));
+    write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)
 }
 
 /// Keep `n` streamlines, sampled without replacement with probability proportional to the SIFT2

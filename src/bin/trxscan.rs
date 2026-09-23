@@ -1011,7 +1011,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b0_field_source: cli.gre_out.as_ref().map(|_| cli.gre_b0field.clone()),
     };
 
-    io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
+    io::write_complex_4d(&cli.out, "dwi", grid.dims, comp.ngrad, &mag, &phase, &grid, &sidecar)?;
+    io::write_dwi_scheme(&cli.out, &scheme)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
     if let Some(ns) = &noise_sigma {
         let ns_out = if cli.fsl_orientation { reo.apply_volume(ns, 1) } else { ns.clone() };
