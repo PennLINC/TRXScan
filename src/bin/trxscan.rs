@@ -642,9 +642,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
         let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate,
             0xB10C_5EED ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        // Diffusion's dropout law: b-scaled, b0 (below 50) exempt, as before.
+        let law = motion::DropoutLaw::Scaled { drive: scheme.bvals.clone(), floor: 50.0 };
         let gt = motion::apply_multiband_motion(
             &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world,
-            cli.mb, true, &scheme.bvals, scheme.b_max, &events);
+            cli.mb, true, &law, &events);
         let mut tsv = String::from("volume\tshot\tslices\tattenuation\n");
         for d in &gt {
             let sl = d.slices.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
