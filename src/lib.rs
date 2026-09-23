@@ -24,7 +24,7 @@
 //! pull in the crates a given capability needs — see the README.
 
 // The acquisition stage lives in `mrsim-acq`; re-exported so `crate::` paths keep resolving.
-pub use mrsim_acq::{analytic, mat, orient, Vec3};
+pub use mrsim_acq::{analytic, mat, motion, noise, orient, phase, readout, Vec3};
 
 // --- signal stage ---
 pub mod scheme;
@@ -38,18 +38,13 @@ pub mod mixture;
 pub mod microstructure;
 
 // --- acquisition stage ---
-/// Object phase model (spec 3.2).
-pub mod phase;
-pub mod readout;
 pub mod kspace;
 /// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
 pub mod nufft;
 /// Scoreable benchmark outputs (spec 3.5).
 pub mod benchmark;
-pub mod noise;
 
 // --- cross-cutting ---
-pub mod motion;
 /// Gradient nonlinearity: coefficient model, field cache, image warp, graddev export.
 pub mod gnl;
 pub mod truth;
@@ -58,4 +53,4 @@ pub mod truth;
 #[cfg(feature = "io")]
 pub mod io;
 #[cfg(feature = "config")]
-pub mod config;
+pub use mrsim_acq::config;
