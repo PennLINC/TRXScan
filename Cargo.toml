@@ -13,17 +13,17 @@ publish = false
 [features]
 default = []
 # I/O: TRX streamlines + NIfTI tissue maps + 4D DWI writer
-io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra"]
+io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra", "mrsim-acq/io"]
 # k-space FFT backend (rustfft); the default k-space path is std-only and needs no feature
-kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr"]
+kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr", "mrsim-acq/kspace"]
 # config parsing (replaces the .ffp XML)
-config = ["dep:serde", "dep:toml"]
+config = ["dep:serde", "dep:toml", "mrsim-acq/config"]
 # ground-truth ODF/peak export + optional SH `todf` fast-mode (pulls odx-rs → hdf5)
 odx = ["dep:odx-rs", "io"]
 # command-line front end (clap); implies `io` since the binaries read/write NIfTI + TRX
 cli = ["dep:clap", "io"]
 # parallelism
-par = ["dep:rayon"]
+par = ["dep:rayon", "mrsim-acq/par"]
 
 [[bin]]
 name = "trxscan"
