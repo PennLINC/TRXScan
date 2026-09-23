@@ -124,7 +124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let shot = model.diffusion.shot(bval, bvec, 0, z, 0xB0A7);
                 produce_slice(
                     &comps, &[100.0], &fmap, &model, &shot,
-                    [snx, sny], [n, n], z, nz, &acq, bvec, bval,
+                    [snx, sny], [n, n], z, nz, &acq,
+                    if bval.abs() > 1e-9 { Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]) } else { None },
                     (z as u64).wrapping_mul(0x9E37) ^ 0x51E,
                 )
             })

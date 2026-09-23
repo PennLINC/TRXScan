@@ -945,9 +945,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // myelin and dropout all apply here exactly as they do on the nominal path.
         println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
                  cli.oversample, cli.phase_model);
+        // Per-volume eddy drive: the gradient product, or None where the old `bval ~= 0`
+        // branch disabled eddy. The decision is made HERE, on bval, never on the vector.
+        let eddy_drive: Vec<Option<[f64; 3]>> = scheme.bvals.iter().zip(scheme.bvecs.iter())
+            .map(|(&b, v)| if b.abs() > 1e-9 { Some([v[0] * b, v[1] * b, v[2] * b]) } else { None })
+            .collect();
         simulate_acquisition_oversampled(
             sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed,
+            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &eddy_drive, &phase_model, cli.seed,
             noise_sigma.as_deref(), eddy_trace.as_deref())
     } else {
         eprintln!(

@@ -17,7 +17,7 @@ fn centroid(o: usize, nx: usize, ny: usize, x0: f64, y0: f64) -> (f64, f64) {
     let fmap = vec![0.0f32; snx * sny];
     let acq = Acquisition { do_distortions: false, do_relaxation: false, ..Acquisition::default() };
     let out = simulate_slice(
-        &SliceInput { compartments: &comps, t2: &[80.0], fmap: &fmap, phase0: None, sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1, bvec: [1.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None },
+        &SliceInput { compartments: &comps, t2: &[80.0], fmap: &fmap, phase0: None, sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, slice_seed: 0, eddy_lin: None },
         &acq,
     );
     let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);

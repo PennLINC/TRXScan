@@ -58,8 +58,7 @@ pub fn produce_slice(
     z: usize,
     nz: usize,
     acq: &Acquisition,
-    bvec: [f64; 3],
-    bval: f64,
+    eddy_drive: Option<[f64; 3]>,
     seed: u64,
 ) -> BenchmarkSlice {
     let [snx, sny] = sim;
@@ -91,8 +90,7 @@ pub fn produce_slice(
                 acq_matrix,
                 z,
                 nz,
-                bvec,
-                bval,
+                eddy_drive,
                 slice_seed: seed,
                 eddy_lin: None,
             },
@@ -244,7 +242,7 @@ mod tests {
             signal_scale: 1.0, noise_variance: 1.0, ..Acquisition::default()
         });
         let b = produce_slice(&comps, &[100.0], &fmap, &model, &shot,
-                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 7);
+                              [snx, sny], [nx, ny], 0, 1, &acq, None, 7);
         assert_eq!(b.object_hires.len(), snx * sny);
         assert_eq!(b.object_nominal.len(), nx * ny);
         assert_eq!(b.acquired_clean.len(), nx * ny);
@@ -274,7 +272,7 @@ mod tests {
             signal_scale: 1.0, noise_variance: 4.0, ..Acquisition::default()
         });
         let b = produce_slice(&comps, &[100.0], &fmap, &PhaseModel::none(), &shot,
-                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 11);
+                              [snx, sny], [nx, ny], 0, 1, &acq, None, 11);
         let d: f64 = (0..nx * ny)
             .map(|i| (b.acquired_noisy[i].0 - b.acquired_clean[i].0) as f64)
             .map(|v| v * v)
