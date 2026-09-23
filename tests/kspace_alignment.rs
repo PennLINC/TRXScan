@@ -1,6 +1,6 @@
 //! The oversampled k-space stage must not move the object: a blob centred on acquired voxel
 //! (X0, Y0) -- i.e. at sim index o*X0 + (o-1)/2 -- must come back centred on (X0, Y0).
-use trxscan::kspace::{simulate_slice, Acquisition, SliceInput};
+use trxscan::kspace::{simulate_slice, Acquisition, SliceInput, T2Slice};
 
 fn centroid(o: usize, nx: usize, ny: usize, x0: f64, y0: f64) -> (f64, f64) {
     let (snx, sny) = (nx * o, ny * o);
@@ -17,7 +17,7 @@ fn centroid(o: usize, nx: usize, ny: usize, x0: f64, y0: f64) -> (f64, f64) {
     let fmap = vec![0.0f32; snx * sny];
     let acq = Acquisition { do_distortions: false, do_relaxation: false, ..Acquisition::default() };
     let out = simulate_slice(
-        &SliceInput { compartments: &comps, t2: &[80.0], fmap: &fmap, phase0: None, sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None },
+        &SliceInput { compartments: &comps, t2: &[T2Slice::Uniform(80.0)], t_inhom: None, fmap: &fmap, phase0: None, sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None },
         &acq,
     );
     let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);

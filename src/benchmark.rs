@@ -3,7 +3,7 @@
 //! Evaluating an unringing method needs an artifact-free target *and* a configuration in which the
 //! score means what it claims. This module provides both.
 
-use crate::kspace::{phase_slice, simulate_slice, Acquisition, SliceInput};
+use crate::kspace::{phase_slice, simulate_slice, Acquisition, SliceInput, T2Slice};
 use crate::phase::{PhaseModel, ShotPhase};
 
 /// Reduce a simulation-grid complex field onto the acquisition grid by the **complex block mean**
@@ -49,7 +49,7 @@ pub fn block_mean_complex(hires: &[(f64, f64)], snx: usize, sny: usize, o: usize
 #[allow(clippy::too_many_arguments)]
 pub fn produce_slice(
     comps: &[&[f32]],
-    t2: &[f32],
+    t2: &[T2Slice],
     fmap: &[f32],
     model: &PhaseModel,
     shot: &ShotPhase,
@@ -84,6 +84,7 @@ pub fn produce_slice(
             &SliceInput {
                 compartments: comps,
                 t2,
+                t_inhom: None,
                 fmap,
                 phase0: Some(&phi),
                 sim,
@@ -242,7 +243,7 @@ mod tests {
         let acq = gibbs_benchmark_acquisition(&Acquisition {
             signal_scale: 1.0, noise_variance: 1.0, ..Acquisition::default()
         });
-        let b = produce_slice(&comps, &[100.0], &fmap, &model, &shot,
+        let b = produce_slice(&comps, &[T2Slice::Uniform(100.0)], &fmap, &model, &shot,
                               [snx, sny], [nx, ny], 0, 1, &acq, None, 7);
         assert_eq!(b.object_hires.len(), snx * sny);
         assert_eq!(b.object_nominal.len(), nx * ny);
@@ -272,7 +273,7 @@ mod tests {
         let acq = gibbs_benchmark_acquisition(&Acquisition {
             signal_scale: 1.0, noise_variance: 4.0, ..Acquisition::default()
         });
-        let b = produce_slice(&comps, &[100.0], &fmap, &PhaseModel::none(), &shot,
+        let b = produce_slice(&comps, &[T2Slice::Uniform(100.0)], &fmap, &PhaseModel::none(), &shot,
                               [snx, sny], [nx, ny], 0, 1, &acq, None, 11);
         let d: f64 = (0..nx * ny)
             .map(|i| (b.acquired_noisy[i].0 - b.acquired_clean[i].0) as f64)

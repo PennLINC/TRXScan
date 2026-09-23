@@ -16,7 +16,7 @@ use trxscan::gnl::{GnlField, GnlPreset, GradCoef};
 use trxscan::io;
 use trxscan::kspace::{
     simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
-    PartialFourierMode,
+    PartialFourierMode, T2Volume,
 };
 use trxscan::phase::PhaseModel;
 use trxscan::motion;
@@ -955,9 +955,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let prep_drive: Vec<Option<(f64, [f64; 3])>> = scheme.bvals.iter().zip(scheme.bvecs.iter())
             .map(|(&b, &v)| Some((b, v)))
             .collect();
+        let t2: Vec<T2Volume> = comp.t2.iter().map(|&v| T2Volume::Uniform(v)).collect();
         simulate_acquisition_oversampled(
-            sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &fmap, &acq, &eddy_drive, &prep_drive, &phase_model, cli.seed,
+            sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &t2,
+            &fmap, None, &acq, &eddy_drive, &prep_drive, &phase_model, cli.seed,
             noise_sigma.as_deref(), eddy_trace.as_deref())
     } else {
         eprintln!(
@@ -965,8 +966,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              matrix, so the transforms are an exact round trip: the output will contain NO Gibbs \
              ringing and no object phase. Use --oversample 2 (default) or 4 for a realistic \
              acquisition.");
+        let t2: Vec<T2Volume> = comp.t2.iter().map(|&v| T2Volume::Uniform(v)).collect();
         simulate_acquisition_legacy(
-            grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients)
+            grid.dims, comp.ngrad, &comp.images, &t2, &fmap, None, &acq, &gradients)
     };
     println!("Stage B: {:?}", t.elapsed());
 
