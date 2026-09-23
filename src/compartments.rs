@@ -26,7 +26,7 @@
 //! [`crate::scheme`].
 
 use crate::mat;
-use crate::raster::Grid;
+use crate::raster::{Grid, GridRaster};
 use crate::scheme::GradientScheme;
 use crate::signal::{Ball, FiberSignalModel, IsotropicSignalModel, Stick, Tensor};
 use std::f64::consts::PI;
@@ -435,7 +435,7 @@ pub fn generate_compartments(
 /// object — instead of marginalizing to a signal at accumulation time.
 ///
 /// The segment loop is the one in [`generate_compartments`]: same iteration, same
-/// `mat::normalize` degenerate-direction skip, same [`Grid::intersect_segment`] hits. What changes
+/// `mat::normalize` degenerate-direction skip, same [`GridRaster::intersect_segment`] hits. What changes
 /// is where the weight goes. For streamline `s` with weight `w_s` (SIFT2 / Fiberfox's dropped
 /// `fiberWeight`; `weights == None` ⇒ every `w_s = 1`), each voxel hit of
 /// each segment contributes `w = w_s · length · π·r²` to that voxel's histogram row:

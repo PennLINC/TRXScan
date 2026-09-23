@@ -49,6 +49,7 @@ required-features = ["cli"]
 # --- path deps to sibling checkouts (see the README for the expected layout) ---
 trx-rs = { path = "../rust/trx-rs", optional = true }
 odx-rs = { path = "../odx-rs", optional = true }
+mrsim-acq = { path = "../mrsim-acq" }
 # --- I/O + math (versions matched to the sibling crates) ---
 nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
 ndarray = { version = "0.16", optional = true }
