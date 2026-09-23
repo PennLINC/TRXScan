@@ -91,6 +91,7 @@ pub fn produce_slice(
                 z,
                 nz,
                 eddy_drive,
+                prep_drive: None,
                 slice_seed: seed,
                 eddy_lin: None,
             },
@@ -229,14 +230,14 @@ mod tests {
     #[test]
     fn producer_derives_nominal_from_the_same_realization() {
         use crate::kspace::step_hires;
-        use crate::phase::{DiffusionPhase, PhaseModel};
+        use crate::phase::{PhaseModel, PrepPhase};
         let (nx, ny, o) = (16usize, 16usize, 4usize);
         let (snx, sny) = (nx * o, ny * o);
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
         let model = PhaseModel { global: 0.3, ..PhaseModel::none() };
-        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+        let shot = PrepPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
             .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
         let acq = gibbs_benchmark_acquisition(&Acquisition {
             signal_scale: 1.0, noise_variance: 1.0, ..Acquisition::default()
@@ -260,13 +261,13 @@ mod tests {
     #[test]
     fn clean_and_noisy_share_one_realization() {
         use crate::kspace::step_hires;
-        use crate::phase::{DiffusionPhase, PhaseModel};
+        use crate::phase::{PhaseModel, PrepPhase};
         let (nx, ny, o) = (16usize, 16usize, 4usize);
         let (snx, sny) = (nx * o, ny * o);
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
-        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+        let shot = PrepPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
             .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
         let acq = gibbs_benchmark_acquisition(&Acquisition {
             signal_scale: 1.0, noise_variance: 4.0, ..Acquisition::default()

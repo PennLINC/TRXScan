@@ -950,9 +950,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let eddy_drive: Vec<Option<[f64; 3]>> = scheme.bvals.iter().zip(scheme.bvecs.iter())
             .map(|(&b, v)| if b.abs() > 1e-9 { Some([v[0] * b, v[1] * b, v[2] * b]) } else { None })
             .collect();
+        // Prep-phase drive: (bval, bvec) exactly as read, for EVERY volume including b0 rows.
+        // PrepPhase::shot's own magnitude <= 0 guard is what disables them, as it always has.
+        let prep_drive: Vec<Option<(f64, [f64; 3])>> = scheme.bvals.iter().zip(scheme.bvecs.iter())
+            .map(|(&b, &v)| Some((b, v)))
+            .collect();
         simulate_acquisition_oversampled(
             sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &eddy_drive, &phase_model, cli.seed,
+            &fmap, &acq, &eddy_drive, &prep_drive, &phase_model, cli.seed,
             noise_sigma.as_deref(), eddy_trace.as_deref())
     } else {
         eprintln!(

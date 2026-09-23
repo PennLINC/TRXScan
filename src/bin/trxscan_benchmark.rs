@@ -11,6 +11,7 @@ use trxscan::benchmark::{
 };
 use trxscan::io;
 use trxscan::kspace::{box_hires, Acquisition, PartialFourierMode};
+use trxscan::phase::ShotPhase;
 use trxscan::raster::Grid;
 
 const USAGE: &str = "usage: trxscan-benchmark <out_dir> \
@@ -121,7 +122,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let comps: [&[f32]; 1] = [&img];
         let slices: Vec<_> = (0..nz)
             .map(|z| {
-                let shot = model.diffusion.shot(bval, bvec, 0, z, 0xB0A7);
+                let shot = model.prep.map_or(
+                    ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
+                    |p| p.shot(bval, bvec, 0, z, 0xB0A7));
                 produce_slice(
                     &comps, &[100.0], &fmap, &model, &shot,
                     [snx, sny], [n, n], z, nz, &acq,
