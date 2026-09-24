@@ -1001,12 +1001,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let sidecar = io::SidecarInfo {
+        manufacturer: "TRXScan".to_string(),
         phase_encoding_direction,
         total_readout_time,
         echo_time: acq.t_echo / 1000.0,
         partial_fourier: acq.partial_fourier,
         accel: cli.accel,
         mb: cli.mb,
+        // The DWI header keeps its zero time step (the P0 bit-identity baseline).
+        repetition_time_s: None,
         // When a GRE fieldmap is written this run, tag the DWI as its B0FieldSource.
         b0_field_source: cli.gre_out.as_ref().map(|_| cli.gre_b0field.clone()),
     };
