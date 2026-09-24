@@ -87,9 +87,13 @@ impl Default for CompartmentParams {
 }
 
 impl CompartmentParams {
-    /// Adult 3T parameter set. T2s per relaxometry literature (Stanisz 2005 / Wansapura 1999:
-    /// WM ≈ 70 ms, cortical GM ≈ 100 ms at 3T) — at TE ~88 ms these give the familiar
-    /// GM-brighter-than-WM b0/low-b contrast that the neonatal set lacks. Diffusivities:
+    /// Adult 3T parameter set. T2s from a 4-echo spin-echo EPI relaxometry fit (TE 15–100 ms) on
+    /// a 3T reference subject at 1.7 mm: WM 67.7 [63–72] ms, cortical GM 75.7 [71–81] ms. The
+    /// literature values first used here (Stanisz
+    /// 2005 / Wansapura 1999: 70 / 100 ms) overpredicted GM at TE 88 by 30 % — the real b0
+    /// GM/WM ratio is 1.16, not 1.5 — because the EPI-measured T2 of cortex, with its partial
+    /// volume at 1.7 mm, is well below the pure-tissue literature number. CSF is not measurable
+    /// with TE ≤ 100 ms and keeps the literature 2000 ms. Diffusivities:
     /// intra-axonal axial 1.7e-3 (standard-model range), extra-axonal (1.7, 0.6, 0.6)e-3 —
     /// the 0.55/0.45 mixture lands WM MD ≈ 0.75e-3 — and GM ball 0.85e-3, adult cortical MD.
     pub fn adult() -> Self {
@@ -102,8 +106,8 @@ impl CompartmentParams {
             d_extra: (0.0017, 0.0006, 0.0006),
             d_gm: 0.00085,
             d_csf: 0.003,
-            t2_fiber: 70.0,
-            t2_gm: 100.0,
+            t2_fiber: 68.0,
+            t2_gm: 76.0,
             t2_csf: 2000.0,
             gm_restricted_frac: 0.20,
             d_soma: 0.0003,
@@ -163,6 +167,19 @@ impl Compartments {
             }
         }
         CleanDwi { dims: self.dims, ngrad: self.ngrad, data }
+    }
+
+    /// Scale each compartment image by a per-compartment amplitude `[fiber, gm, csf]`
+    /// (proton density x T1 saturation). Lets a caller match a real acquisition's tissue b0
+    /// levels without touching the physics. No-op for an all-ones factor.
+    pub fn apply_s0(&mut self, s0: [f32; 3]) {
+        for (img, &a) in self.images.iter_mut().zip(s0.iter()) {
+            if (a - 1.0).abs() > f32::EPSILON {
+                for v in img.iter_mut() {
+                    *v *= a;
+                }
+            }
+        }
     }
 }
 
@@ -447,6 +464,102 @@ pub fn generate_mixture(
         params: *params,
         myelin: None,
     }
+}
+
+/// [`signal_from_mixture`] with a per-voxel gradient-nonlinearity field: every voxel sees the
+/// gradient the coils actually produced there, `J(x)ᵀ g` ([`crate::gnl::GnlField`]), so both the
+/// b-vector and (through the norm) the b-value deviate per voxel. The global vertex×gradient
+/// response table cannot be shared any more, so each voxel evaluates its nonzero histogram bins
+/// directly — the same shape as the myelin branch of [`signal_from_mixture`]. A `None` field
+/// reproduces [`signal_from_mixture`] bit for bit through the same code path.
+pub fn signal_from_mixture_gnl(
+    mix: &crate::mixture::MixtureField,
+    scheme: &GradientScheme,
+    field: Option<&crate::gnl::GnlField>,
+) -> Compartments {
+    let Some(field) = field else { return signal_from_mixture(mix, scheme) };
+    assert_eq!(field.dims, mix.dims, "GNL field is not on the mixture grid");
+    let ngrad = scheme.len();
+    let nvox = mix.nvox();
+    let p = mix.params;
+    let t2 = vec![p.t2_fiber, p.t2_gm, p.t2_csf];
+    if ngrad == 0 {
+        return Compartments { dims: mix.dims, ngrad, images: vec![Vec::new(); 3], t2 };
+    }
+    let grads = scheme.fiberfox_gradients();
+    let gm = Ball { b_value: p.b_value, diffusivity: p.d_gm };
+    let csf = Ball { b_value: p.b_value, diffusivity: p.d_csf };
+    let soma = Ball { b_value: p.b_value, diffusivity: p.d_soma };
+    let adult = CompartmentParams::adult();
+    let md = mix.md_fallback();
+
+    let voxel = |vox: usize, fib: &mut [f32], gmo: &mut [f32], cso: &mut [f32]| {
+        if !mix.is_masked(vox) {
+            return;
+        }
+        let (wf, gf, cf) = (mix.wm[vox] as f64, mix.gm[vox] as f64, mix.csf[vox] as f64);
+        let row = mix.odf_row(vox);
+        let nz: Vec<(usize, f64)> =
+            row.iter().enumerate().filter(|(_, &w)| w != 0.0).map(|(v, &w)| (v, w as f64)).collect();
+        let tot: f64 = nz.iter().map(|&(_, w)| w).sum();
+        let m = mix.myelin.as_ref().map(|mm| mm[vox] as f64).unwrap_or(0.0);
+        let li = |a: f64, b: f64| a + (b - a) * m;
+        let stick_m = Stick { b_value: p.b_value, diffusivity: li(p.d_intra, adult.d_intra) };
+        let extra_m = Tensor {
+            b_value: p.b_value,
+            eigenvalues: (
+                li(p.d_extra.0, adult.d_extra.0),
+                li(p.d_extra.1, adult.d_extra.1),
+                li(p.d_extra.2, adult.d_extra.2),
+            ),
+        };
+        let (fi, fe) = (li(p.intra_frac, adult.intra_frac), li(p.extra_frac, adult.extra_frac));
+        let md_m = if m <= 1e-3 {
+            md
+        } else {
+            (extra_m.eigenvalues.0 + extra_m.eigenvalues.1 + extra_m.eigenvalues.2) / 3.0
+        };
+        for g in 0..ngrad {
+            let gv = field.effective_gradient(vox, grads[g]);
+            let fiber_resp = if tot > 1e-12 {
+                nz.iter()
+                    .map(|&(v, w)| {
+                        let vert = mix.sphere.verts[v];
+                        w * (fi * stick_m.simulate(gv, vert) + fe * extra_m.simulate(gv, vert))
+                    })
+                    .sum::<f64>()
+                    / tot
+            } else {
+                (-p.b_value * mat::dot(gv, gv) * md_m).exp()
+            };
+            fib[g] = (wf * fiber_resp) as f32;
+            gmo[g] = (gf * ((1.0 - p.gm_restricted_frac) * gm.simulate(gv)
+                + p.gm_restricted_frac * soma.simulate(gv))) as f32;
+            cso[g] = (cf * csf.simulate(gv)) as f32;
+        }
+    };
+
+    let mut fiber_img = vec![0.0f32; nvox * ngrad];
+    let mut gm_img = vec![0.0f32; nvox * ngrad];
+    let mut csf_img = vec![0.0f32; nvox * ngrad];
+    #[cfg(feature = "par")]
+    {
+        use rayon::prelude::*;
+        fiber_img
+            .par_chunks_mut(ngrad)
+            .zip(gm_img.par_chunks_mut(ngrad))
+            .zip(csf_img.par_chunks_mut(ngrad))
+            .enumerate()
+            .for_each(|(vox, ((f, g), c))| voxel(vox, f, g, c));
+    }
+    #[cfg(not(feature = "par"))]
+    {
+        let it = fiber_img.chunks_mut(ngrad).zip(gm_img.chunks_mut(ngrad)).zip(csf_img.chunks_mut(ngrad));
+        for (vox, ((f, g), c)) in it.enumerate() {
+            voxel(vox, f, g, c);
+        }
+    }
+    Compartments { dims: mix.dims, ngrad, images: vec![fiber_img, gm_img, csf_img], t2 }
 }
 
 /// Evaluate the clean signal **from** a [`crate::mixture::MixtureField`] — the second half
@@ -879,5 +992,40 @@ mod tests {
         assert!((s[0] - 1.0).abs() < 1e-6, "b0 unattenuated: {}", s[0]);
         assert!((s[1] - s[2]).abs() < 1e-7, "hindered fallback is isotropic: {} vs {}", s[1], s[2]);
         assert!(s[1] < 1.0 && (s[1] - want).abs() < 1e-6, "exp(-b·|g|²·md): {} vs {want}", s[1]);
+    }
+    #[test]
+    fn an_identity_gnl_field_reproduces_signal_from_mixture() {
+        use crate::gnl::{GnlField, GradCoef, Vendor};
+        let (grid, positions, offsets, tissue) = fiber_fixture(&[[3, 4, 4]]);
+        let scheme = GradientScheme::from_str(BVAL, BVEC).unwrap();
+        let params = CompartmentParams { b_value: 1000.0, ..Default::default() };
+        let mix =
+            generate_mixture(&grid, &positions, &offsets, None, &tissue, &params, None, HemiSphere::icosphere(3));
+        // no nonlinear terms: d ≡ 0, J ≡ I
+        let identity = GnlField::on_grid(&GradCoef { r0_mm: 250.0, vendor: Vendor::Siemens, terms: Vec::new() }, &grid);
+        let a = signal_from_mixture(&mix, &scheme);
+        let b = signal_from_mixture_gnl(&mix, &scheme, Some(&identity));
+        assert_eq!(a.t2, b.t2);
+        for (c, (x, y)) in a.images.iter().zip(&b.images).enumerate() {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                assert!((p - q).abs() <= 1e-6 * p.abs().max(1e-6), "compartment {c} sample {i}: {p} vs {q}");
+            }
+        }
+    }
+
+    #[test]
+    fn apply_s0_scales_each_compartment_independently() {
+        let mut c = Compartments {
+            dims: [1, 1, 1],
+            ngrad: 1,
+            images: vec![vec![2.0f32], vec![3.0f32], vec![5.0f32]],
+            t2: vec![68.0, 76.0, 2000.0],
+        };
+        c.apply_s0([1.0, 0.5, 0.0]);
+        assert_eq!(c.images[0][0], 2.0); // fiber unchanged (factor 1.0)
+        assert_eq!(c.images[1][0], 1.5); // gm halved
+        assert_eq!(c.images[2][0], 0.0); // csf zeroed
+        // the mixed signal is the sum of the scaled compartments
+        assert_eq!(c.mixed().data[0], 3.5);
     }
 }

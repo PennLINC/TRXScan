@@ -51,12 +51,20 @@ pub mod microstructure;
 pub mod phase;
 pub mod readout;
 pub mod kspace;
+/// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
+pub mod nufft;
 /// Scoreable benchmark outputs (spec 3.5).
 pub mod benchmark;
 pub mod noise;
 
 // --- cross-cutting ---
 pub mod motion;
+/// Gradient nonlinearity: coefficient model, field cache, image warp, graddev export.
+pub mod gnl;
+/// Dual-echo GRE fieldmap synthesis from the same object (Siemens integer-phase conventions).
+pub mod gre;
+/// Ground-truth fibre orientations (peaks of the orientation mixture) per acquisition voxel.
+pub mod truth;
 
 // --- feature-gated I/O + config (reference their deps) ---
 #[cfg(feature = "io")]

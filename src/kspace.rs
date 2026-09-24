@@ -10,9 +10,17 @@
 //! readout time increases with the PE line) is what warps EPI along the phase-encode axis — the
 //! same physics that makes AP/PA reverse-PE pairs distort oppositely (the DRBUDDI/topup target).
 //!
-//! The transform is a direct sum (O(N³) via 1D factoring), std-only and exact — no FFT-convention
-//! ambiguity, so it stays directly comparable against Fiberfox. A faster time-segmented FFT path
-//! (via `rustfft`, behind the `kspace` feature) is not yet written.
+//! The transform is exact — the literal O(N³) sum, not an approximation of it — so it stays
+//! directly comparable against Fiberfox. It is organised for speed without changing a term: the
+//! per-line factors are split into static (hoisted), affine-in-ky (advanced by per-voxel rotors),
+//! per-line scalars (relaxation) and per-axis separable (the eddy polynomial), leaving an inner
+//! loop of complex multiply-adds; the x-DFT of each line and the 2-D reconstruction are FFTs
+//! (`rustfft`, behind the `kspace` feature) or twiddle-table sums (default, std-only) — same
+//! numbers either way (`restructured_forward_matches_the_literal_sum`,
+//! `fft_inverse_matches_the_direct_dft`). Under `kspace` the y-sum with the fieldmap is also
+//! O(N log N): read as geometry it is a source warp `y − sny·τ·fmap`, evaluated by a type-1
+//! NUFFT (`nufft.rs`, ~1e-13); only the legacy gradient-model eddy polynomial, whose time profile
+//! is not affine in ky, keeps the O(N³) rotor path.
 
 use crate::phase::{PhaseModel, ShotPhase};
 use crate::readout::{Readout, SingleShotEpi};
@@ -26,6 +34,7 @@ struct C {
 impl C {
     const ZERO: C = C { re: 0.0, im: 0.0 };
     #[inline]
+    #[cfg_attr(feature = "kspace", allow(dead_code))]
     fn cis(theta: f64) -> C {
         C { re: theta.cos(), im: theta.sin() }
     }
@@ -48,20 +57,20 @@ impl C {
 }
 
 /// Deterministic Gaussian source (SplitMix64 + Box–Muller), std-only so k-space stays dep-free.
-struct Rng(u64);
+pub struct Rng(pub u64);
 impl Rng {
-    fn next_u64(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
-    fn unit(&mut self) -> f64 {
+    pub fn unit(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     }
     /// standard normal
-    fn gauss(&mut self) -> f64 {
+    pub fn gauss(&mut self) -> f64 {
         let (u1, u2) = (self.unit(), self.unit());
         (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
     }
@@ -154,6 +163,8 @@ pub struct Acquisition {
     pub ghost_offset: f64,    // Nyquist ghost: kx offset (±) on odd/even PE lines (0 = off)
     pub eddy_strength: f64,   // linear (in-plane) eddy-current phase scale (0 = off)
     pub eddy_quad: f64,       // quadratic (x²,y²,z²) eddy-current phase scale (0 = off)
+    pub eddy_phase: f64,      // eddy OBJECT-phase ramp: rad per unit (bvec·bval) per acquired voxel;
+                              // direction- and b-dependent, imprints reconstructed phase (0 = off)
     pub eddy_tau: f64,        // eddy-current decay time (ms)
     pub n_spikes: usize,      // random k-space spikes per slice (0 = off) → herringbone
     pub spike_amplitude: f64, // spike magnitude as a fraction of the peak k-space sample
@@ -208,6 +219,7 @@ impl Default for Acquisition {
             ghost_offset: 0.0,
             eddy_strength: 0.0,
             eddy_quad: 0.0,
+            eddy_phase: 0.0,
             eddy_tau: 70.0,
             n_spikes: 0,
             spike_amplitude: 1.0,
@@ -216,6 +228,25 @@ impl Default for Acquisition {
             accel: 1,
             acs_lines: 24,
             seed: 0,
+        }
+    }
+}
+
+impl Acquisition {
+    /// The HBCD-like protocol the `trxscan` binary ships: TE 88 ms, 6/8 contiguous partial
+    /// Fourier, 24 ACS lines, a subtle residual Nyquist ghost, no spikes, unapodized. The PE-train
+    /// duration is pinned to the HBCD TotalReadoutTime (0.0917 s) for ANY matrix: distortion
+    /// shift = fmap · ny · t_line, so `t_line = 91.7 ms / ny`. Everything else (noise, eddy,
+    /// coils, GRAPPA, seed) is left at the [`Default`] and set by the caller.
+    pub fn hbcd(ny: usize) -> Self {
+        Acquisition {
+            t_line: 91.7 / ny.max(1) as f64,
+            t_echo: 88.0,
+            t_inhom: 50.0,
+            partial_fourier: 0.75,
+            pf_mode: PartialFourierMode::Contiguous,
+            ghost_offset: 0.015,
+            ..Default::default()
         }
     }
 }
@@ -246,7 +277,8 @@ pub struct SliceInput<'a> {
     pub t2: &'a [f32],
     /// Off-resonance field (Hz) on the SIM grid.
     pub fmap: &'a [f32],
-    /// Pre-readout object phase (radians) on the SIM grid. Ignored until Task 6.
+    /// Pre-readout object phase (radians) on the SIM grid: the object phase model, added to
+    /// every voxel before encoding (`None` = real-valued object).
     pub phase0: Option<&'a [f64]>,
     /// `[snx, sny]` — simulation grid, in-plane.
     pub sim: [usize; 2],
@@ -306,9 +338,6 @@ pub fn step_hires(snx: usize, sny: usize, edge: f64) -> Vec<f32> {
     v
 }
 
-/// Build the acquired k-space for one coil, complete with the ringing mask, spikes and thermal
-/// noise, but before GRAPPA, reconstruction and coil combination. Shared by [`simulate_slice`] and
-/// [`simulate_slice_kspace`] so tests can inspect the coefficients before reconstruction.
 /// Which k-space samples are actually acquired: partial Fourier plus GRAPPA undersampling.
 /// Layout `kx + nx*ky`.
 ///
@@ -354,6 +383,9 @@ pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
     m
 }
 
+/// Build the acquired k-space for one coil, complete with the ringing mask, spikes and thermal
+/// noise, but before GRAPPA, reconstruction and coil combination. Shared by [`simulate_slice`] and
+/// [`simulate_slice_kspace`] so tests can inspect the coefficients before reconstruction.
 fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
@@ -374,6 +406,7 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
     // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
     let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
+    let do_eddy_phase = acq.eddy_phase != 0.0 && inp.bval.abs() > 1e-9;
     // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
     // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
     // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
@@ -381,8 +414,10 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // which is NOT object phase; see `phase.rs` for that. Pinned by
     // `even_matrix_window_asymmetry_is_intentional`.
     let (xs, ys, zs) = (nx / 2, ny / 2, nz / 2);
-    let (sxs, sys) = (snx / 2, sny / 2);
     let (ox, oy) = (snx / nx, sny / ny); // in-plane oversampling factors
+    // The sim-grid centre is the IMAGE of the acquired centre, o*(n/2), not snx/2: for an odd
+    // acquired matrix those differ by one sim cell, i.e. (1/o) of an acquired voxel in-plane.
+    let (sxs, sys) = (ox * xs, oy * ys);
     // Half-cell alignment. Sim cell `x` covers [x, x+1) in sim units, so its centre is at x+0.5;
     // acquired cell `X` covers o cells and is centred at o*X + o/2. Aligning sample index `x` with
     // `o*X` — as a bare index substitution does — therefore misregisters the object against the
@@ -391,16 +426,188 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // acquired k-space is measured from the acquired grid's centre instead. Exactly zero at o=1.
     let (xoff, yoff) = ((ox as f64 - 1.0) / 2.0, (oy as f64 - 1.0) / 2.0);
     let at = |x: usize, y: usize| x + snx * y; // SIM-grid image index
-    let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
+    let nvox = snx * sny;
 
     // Which samples are acquired (partial Fourier + GRAPPA undersampling). Single source of
     // truth, shared with the noise below so signal and noise cannot disagree.
     let mask = sampling_mask(nx, ny, acq);
-    // ---- forward: build k-space, factored as  Σ_x e^{..kx x}[ Σ_y mod(x,y) e^{..ky y} ] ----
-    // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
-    // per ky, but that keeps the whole build at O(N³).
+
+    // ---- forward: k[kx,ky] = (1/N) Σ_x e^{i2π kx x} Σ_y mod_ky(x,y) e^{i2π ky y} ----
+    //
+    // The same O(N³) sum Fiberfox evaluates, but organised by how each factor of mod_ky depends
+    // on the PE line, so that the inner loop is pure complex arithmetic with no transcendentals:
+    //
+    //   static      amp(r)·e^{iφ0(r)}: signal_scale, coil sensitivity, object phase, the eddy
+    //               object-phase ramp — evaluated once per slice and coil;
+    //   affine      e^{i2π(rate(r)·t(ky) + ky_norm·(y−c))}: the fieldmap (rate = fmap) and the
+    //               replayed linear eddy shear (rate = a·pos/TRT) together with the y-DFT kernel.
+    //               `t` is affine in the line index per line parity (`readout.rs`), so this
+    //               factor advances between acquired lines by a per-voxel ROTOR that depends only
+    //               on the step (Δky, parity) — a complex multiply per voxel per line. The rotors
+    //               are memoised per step and checked against the actual Δt, so an exotic
+    //               readout timing degrades to the closed form rather than to a wrong answer;
+    //   per line    the compartment relaxations e^{-tRf/T2_c − |t|/tInhom}: one scalar per
+    //               compartment per line;
+    //   separable   the gradient-model eddy polynomial × exp(-tRead/τ)·t: e^{iθ_x(x)}·e^{iθ_y(y)}
+    //               ·e^{iθ_z}, i.e. snx + sny cis per line, not snx·sny.
+    //
+    // Round-off of the rotor recurrence is ~ny·ε; the state is re-anchored to the closed form
+    // every `REANCHOR` acquired lines. Pinned against the literal per-line sum by
+    // `restructured_forward_matches_the_literal_sum`.
+    const REANCHOR: usize = 32;
+    let zc = z as f64 - zs as f64;
+    let zc_c = z as f64 - (nz as f64 - 1.0) / 2.0;
+    let mut amp = vec![0.0f64; nvox];
+    let mut phi0 = vec![0.0f64; nvox];
+    let mut rate = vec![0.0f64; nvox];
+    for y in 0..sny {
+        for x in 0..snx {
+            let i = at(x, y);
+            // TWO coordinate frames, named apart on purpose. Both are in acquired-voxel
+            // UNITS and both carry the half-cell registration (`xoff = (o-1)/2`), but they
+            // have DIFFERENT ORIGINS, and a quantity evaluated in the wrong one is wrong by
+            // half a FOV rather than by a sub-voxel amount:
+            //
+            //   xa — ABSOLUTE on the acquired grid, 0 .. nx-1, averaging to exactly `v` over
+            //        the o sim cells of acquired voxel `v`. This is the frame the Roemer
+            //        combine walks (`x in 0..nx`), so anything the combine must agree with —
+            //        `coil_sensitivity`, whose coil ring is centred on nx/2 — uses it.
+            //   xc — CENTRED on the acquired image, -nx/2 .. nx/2-1. The eddy polynomial is
+            //        an expansion about the image centre and needs this one.
+            //
+            // Conflating them is not hypothetical: an earlier revision passed `xc` to
+            // `coil_sensitivity`, which put the forward model's sensitivity field half a FOV
+            // from the combine's at EVERY oversampling factor, o = 1 included (28% of peak).
+            // Pinned end-to-end by
+            // `multicoil_roemer_reproduces_the_single_coil_image_at_every_oversampling`.
+            let (xa, ya) = ((x as f64 - xoff) / ox as f64, (y as f64 - yoff) / oy as f64);
+            amp[i] = acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
+            let (xc, yc) = (
+                (x as f64 - sxs as f64 - xoff) / ox as f64,
+                (y as f64 - sys as f64 - yoff) / oy as f64,
+            );
+            // Pre-readout object phase, already in radians (outside the TAU factor).
+            let mut p0 = inp.phase0.map_or(0.0, |p| p[i]);
+            if do_eddy_phase {
+                // Eddy OBJECT-phase ramp: constant across the readout (NOT ∝ ky), so it
+                // imprints the reconstructed object phase rather than distorting geometry.
+                // Direction- and b-dependent (∝ gradient = bvec·bval), it reproduces the
+                // per-volume phase-ramp variation real DWI shows (∝ gradient direction).
+                // z centred on the volume's geometric centre (nz−1)/2; the eddy polynomial
+                // below keeps Fiberfox's k-space convention `zc = z − nz/2`.
+                p0 += acq.eddy_phase * (gradient[0] * xc + gradient[1] * yc + gradient[2] * zc_c);
+            }
+            phi0[i] = p0;
+            rate[i] = if acq.do_distortions { fmap[i] as f64 } else { 0.0 };
+        }
+    }
+    // Centred, half-cell-registered sim-grid coordinates in ACQUIRED-voxel units, per axis.
+    let xc_of = |x: usize| (x as f64 - sxs as f64 - xoff) / ox as f64;
+    let yc_of = |y: usize| (y as f64 - sys as f64 - yoff) / oy as f64;
+    let ky_norm_of = |kyi: usize| (kyi as f64 - ys as f64) / sny as f64;
+
+    // Rotor state: amp·e^{i(φ0 + 2π(rate·t + ky_norm·(y−c)))} for the current line. Allocated
+    // only when the rotor path runs (no NUFFT rows), below.
+    let (mut st_re, mut st_im): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let set_state = |kyi: usize, st_re: &mut [f64], st_im: &mut [f64]| {
+        let t = t_ms[kyi] / 1000.0;
+        let kyn = ky_norm_of(kyi);
+        for y in 0..sny {
+            let yy = y as f64 - sys as f64 - yoff;
+            for x in 0..snx {
+                let i = at(x, y);
+                let ph = phi0[i] + TAU * (rate[i] * t + kyn * yy);
+                st_re[i] = amp[i] * ph.cos();
+                st_im[i] = amp[i] * ph.sin();
+            }
+        }
+    };
+    // Memoised rotors, keyed by (Δky, parity of the source line); each remembers the (Δt, Δky_norm)
+    // it was built for so a mismatching step falls back to the closed form.
+    struct Rotor { key: (usize, usize), dt: f64, dkyn: f64, re: Vec<f64>, im: Vec<f64> }
+    let mut rotors: Vec<Rotor> = Vec::new();
+
+    // Compartment relaxation weights for this line.
+    let mut rel = vec![1.0f64; compartments.len()];
+    // Separable gradient-model eddy factors.
+    let (mut ex_re, mut ex_im) = (vec![1.0f64; snx], vec![0.0f64; snx]);
+    let (mut ey_re, mut ey_im) = (vec![1.0f64; sny], vec![0.0f64; sny]);
+    // y-sum result and x-stage inputs.
+    let (mut g_re, mut g_im) = (vec![0.0f64; snx], vec![0.0f64; snx]);
+    let mut xstage = XStage::new(snx, nx, xs, sxs, xoff, acq.ghost_offset);
+
+    // ---- NUFFT y-stage (feature `kspace`): the fieldmap as geometry ----
+    // With t affine in the line index per parity, t(ky) = τ·ky + t0 + δ·[ky odd], the phase
+    // 2π(rate·t + ky_norm·(y−c)) is 2π(ky−ys)·v/sny + const, with the SOURCE displaced to
+    // v = (y − c) + sny·τ·rate — every voxel contributes from its distorted PE position. The
+    // per-line y-sum then collapses to one type-1 NUFFT per column (per compartment, since the
+    // relaxation is an output-side scalar; per parity, since δ adds a static phase to the odd
+    // lines). The gradient-model eddy polynomial has a non-affine time profile and keeps the
+    // rotor path. The timing model is checked, not assumed.
+    #[cfg(feature = "kspace")]
+    let nufft_rows: Option<Vec<(Vec<f64>, Vec<f64>)>> = (!do_eddy && ny >= 3).then(|| {
+        let tau = (t_ms[2] - t_ms[0]) / 2.0;
+        let t0 = t_ms[0];
+        let delta = t_ms[1] - (tau + t0);
+        let tmax = t_ms.iter().fold(0.0f64, |m, t| m.max(t.abs())).max(1e-300);
+        let affine = (0..ny).all(|k| {
+            let pred = tau * k as f64 + t0 + if k % 2 == 1 { delta } else { 0.0 };
+            (t_ms[k] - pred).abs() <= 1e-9 * tmax
+        });
+        if !affine {
+            return None;
+        }
+        let (tau_s, delta_s) = (tau / 1000.0, delta / 1000.0);
+        let t_centre = (tau * ys as f64 + t0) / 1000.0; // even-line time at the centre line
+        let ncomp = compartments.len();
+        let mut nufft = crate::nufft::Nufft1::new(sny, -(ys as i64), ny, 1e-13);
+        // per-column buffers: positions, then (compartment, parity) weight vectors
+        let mut pos = vec![0.0f64; sny];
+        let mut wre = vec![vec![0.0f64; sny]; 2 * ncomp];
+        let mut wim = vec![vec![0.0f64; sny]; 2 * ncomp];
+        let mut out: Vec<(Vec<f64>, Vec<f64>)> = (0..2 * ncomp).map(|_| (Vec::new(), Vec::new())).collect();
+        // rows[c] = (re, im) of the y-summed line, layout x + snx*kyi
+        let mut rows: Vec<(Vec<f64>, Vec<f64>)> = (0..ncomp).map(|_| (vec![0.0; snx * ny], vec![0.0; snx * ny])).collect();
+        for x in 0..snx {
+            for y in 0..sny {
+                let i = at(x, y);
+                pos[y] = (y as f64 - sys as f64 - yoff) + sny as f64 * tau_s * rate[i];
+                let ph = phi0[i] + TAU * rate[i] * t_centre;
+                let (c0, s0) = (ph.cos(), ph.sin());
+                let phd = TAU * rate[i] * delta_s;
+                let (cd, sd) = (phd.cos(), phd.sin());
+                // odd-line phase = even phase + δ term
+                let (c1, s1) = (c0 * cd - s0 * sd, c0 * sd + s0 * cd);
+                for (c, comp) in compartments.iter().enumerate() {
+                    let a = amp[i] * comp[i] as f64;
+                    wre[2 * c][y] = a * c0;
+                    wim[2 * c][y] = a * s0;
+                    wre[2 * c + 1][y] = a * c1;
+                    wim[2 * c + 1][y] = a * s1;
+                }
+            }
+            let weights: Vec<(&[f64], &[f64])> = (0..2 * ncomp).map(|q| (wre[q].as_slice(), wim[q].as_slice())).collect();
+            nufft.run(&pos, &weights, &mut out);
+            for c in 0..ncomp {
+                for kyi in 0..ny {
+                    let q = 2 * c + (kyi % 2);
+                    rows[c].0[x + snx * kyi] = out[q].0[kyi];
+                    rows[c].1[x + snx * kyi] = out[q].1[kyi];
+                }
+            }
+        }
+        Some(rows)
+    }).flatten();
+    #[cfg(not(feature = "kspace"))]
+    let nufft_rows: Option<Vec<(Vec<f64>, Vec<f64>)>> = None;
+    if nufft_rows.is_none() {
+        st_re = vec![0.0f64; nvox];
+        st_im = vec![0.0f64; nvox];
+    }
+
     let mut kspace = vec![C::ZERO; nx * ny];
-    let n_inv = 1.0 / (snx * sny) as f64;
+    let mut prev: Option<usize> = None;
+    let mut since_anchor = 0usize;
     for kyi in 0..ny {
         // Not acquired (partial Fourier, or GRAPPA undersampling): this k-space row stays
         // zero and, critically, receives no noise either.
@@ -409,91 +616,125 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         }
         let t = t_ms[kyi] / 1000.0; // seconds
         let trf = trf_ms[kyi];
-        // Divide by the SIM extent: the loop still runs over the ny ACQUIRED lines, but each sits
-        // at absolute sim index sys - ys + kyi, whose normalized frequency is (kyi - ys)/sny.
-        let ky_norm = (kyi as f64 - ys as f64) / sny as f64;
-        // Nyquist (N/2) ghost: alternating readout-line kx offset (gradient-delay mismatch).
-        let ghost_shift = if kyi % 2 == 1 { -acq.ghost_offset } else { acq.ghost_offset };
-        // eddy-current decay for this PE line: exp(-tRead/τ)·t (itkKspaceImageFilter.cpp:354)
-        let eddy_decay = if do_eddy { (-tread_ms[kyi] / acq.eddy_tau).exp() * t } else { 0.0 };
-
-        // modulated image for this PE line
-        let mut modimg = vec![C::ZERO; snx * sny];
-        for y in 0..sny {
-            for x in 0..snx {
-                let mut f_real = 0.0f64;
-                for (c, comp) in compartments.iter().enumerate() {
-                    let mut v = comp[at(x, y)] as f64;
-                    if acq.do_relaxation {
-                        v *= (-(trf as f64) / t2[c] as f64 - t.abs() * 1000.0 / acq.t_inhom).exp();
+        // Advance the affine phase to this line: closed form on the first line and every
+        // REANCHOR lines, otherwise one rotor multiply per voxel.
+        if nufft_rows.is_none() {
+            match prev {
+                Some(p) if since_anchor < REANCHOR => {
+                    let key = (kyi - p, p % 2);
+                    let (dt, dkyn) = (t - t_ms[p] / 1000.0, ky_norm_of(kyi) - ky_norm_of(p));
+                    let idx = rotors.iter().position(|r| r.key == key).unwrap_or_else(|| {
+                        let (mut re, mut im) = (vec![0.0f64; nvox], vec![0.0f64; nvox]);
+                        for y in 0..sny {
+                            let yy = y as f64 - sys as f64 - yoff;
+                            for x in 0..snx {
+                                let i = at(x, y);
+                                let ph = TAU * (rate[i] * dt + dkyn * yy);
+                                re[i] = ph.cos();
+                                im[i] = ph.sin();
+                            }
+                        }
+                        rotors.push(Rotor { key, dt, dkyn, re, im });
+                        rotors.len() - 1
+                    });
+                    let r = &rotors[idx];
+                    if (r.dt - dt).abs() <= 1e-12 * dt.abs().max(1e-300) && r.dkyn == dkyn {
+                        for i in 0..nvox {
+                            let (a, b) = (st_re[i], st_im[i]);
+                            st_re[i] = a * r.re[i] - b * r.im[i];
+                            st_im[i] = a * r.im[i] + b * r.re[i];
+                        }
+                        since_anchor += 1;
+                    } else {
+                        set_state(kyi, &mut st_re, &mut st_im);
+                        since_anchor = 0;
                     }
-                    f_real += v;
                 }
-                // TWO coordinate frames, named apart on purpose. Both are in acquired-voxel
-                // UNITS and both carry the half-cell registration (`xoff = (o-1)/2`), but they
-                // have DIFFERENT ORIGINS, and a quantity evaluated in the wrong one is wrong by
-                // half a FOV rather than by a sub-voxel amount:
-                //
-                //   xa — ABSOLUTE on the acquired grid, 0 .. nx-1, averaging to exactly `v` over
-                //        the o sim cells of acquired voxel `v`. This is the frame the Roemer
-                //        combine walks (`x in 0..nx`), so anything the combine must agree with —
-                //        `coil_sensitivity`, whose coil ring is centred on nx/2 — uses it.
-                //   xc — CENTRED on the acquired image, -nx/2 .. nx/2-1. The eddy polynomial is
-                //        an expansion about the image centre and needs this one.
-                //
-                // Conflating them is not hypothetical: an earlier revision passed `xc` to
-                // `coil_sensitivity`, which put the forward model's sensitivity field half a FOV
-                // from the combine's at EVERY oversampling factor, o = 1 included (28% of peak).
-                // Pinned end-to-end by
-                // `multicoil_roemer_reproduces_the_single_coil_image_at_every_oversampling`.
-                let (xa, ya) = (
-                    (x as f64 - xoff) / ox as f64,
-                    (y as f64 - yoff) / oy as f64,
-                );
-                f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
-                let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
-                if do_eddy {
-                    // gradient-dependent field growing through the readout: linear (g·pos) plus a
-                    // quadratic (g·pos²) term — the polynomial forms eddy/TORTOISE fit.
-                    // centre on the sim grid, then express in ACQUIRED voxel units so that
-                    // eddy_strength/eddy_quad keep their meaning independent of oversampling
-                    let (xc, yc, zc) = (
-                        (x as f64 - sxs as f64 - xoff) / ox as f64,
-                        (y as f64 - sys as f64 - yoff) / oy as f64,
-                        z as f64 - zs as f64,
-                    );
-                    let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
-                    let quad =
-                        gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
-                    phi += (acq.eddy_strength * lin + acq.eddy_quad * quad) * eddy_decay;
+                _ => {
+                    set_state(kyi, &mut st_re, &mut st_im);
+                    since_anchor = 0;
                 }
-                // Pre-readout object phase, already in radians, so it is added outside the TAU
-                // factor that scales the distortion/eddy term.
-                let phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
-                modimg[at(x, y)] = C::cis(TAU * phi + phi0).scale(f_real);
             }
+            prev = Some(kyi);
         }
-        // inner y-sum over the SIM grid → g(x), then an x-DFT evaluated only at acquired kx
-        let mut g = vec![C::ZERO; snx];
-        for x in 0..snx {
-            let mut acc = C::ZERO;
-            for y in 0..sny {
-                let ph = C::cis(TAU * ky_norm * (y as f64 - sys as f64 - yoff));
-                acc = acc.add(modimg[at(x, y)].mul(ph));
-            }
-            g[x] = acc;
+
+        for (c, w) in rel.iter_mut().enumerate() {
+            *w = if acq.do_relaxation {
+                (-trf / t2[c] as f64 - t.abs() * 1000.0 / acq.t_inhom).exp()
+            } else {
+                1.0
+            };
         }
-        for kxi in 0..nx {
-            let kx_norm = (kxi as f64 - xs as f64 + ghost_shift) / snx as f64;
-            let mut acc = C::ZERO;
+        // Gradient-model eddy field growing through the readout: linear (g·pos) plus a
+        // quadratic (g·pos²) term — the polynomial eddy/TORTOISE fit — times
+        // exp(-tRead/τ)·t (itkKspaceImageFilter.cpp:354), so it grows with ky → geometric
+        // DISTORTION. The polynomial is a sum over axes, so its phase factor is separable.
+        let mut ez = (1.0f64, 0.0f64);
+        if do_eddy {
+            let eddy_decay = (-tread_ms[kyi] / acq.eddy_tau).exp() * t;
             for x in 0..snx {
-                acc = acc.add(g[x].mul(C::cis(TAU * kx_norm * (x as f64 - sxs as f64 - xoff))));
+                let xc = xc_of(x);
+                let ph = TAU * (acq.eddy_strength * gradient[0] * xc + acq.eddy_quad * gradient[0] * xc * xc) * eddy_decay;
+                ex_re[x] = ph.cos();
+                ex_im[x] = ph.sin();
             }
-            kspace[kat(kxi, kyi)] = acc.scale(n_inv);
+            for y in 0..sny {
+                let yc = yc_of(y);
+                let ph = TAU * (acq.eddy_strength * gradient[1] * yc + acq.eddy_quad * gradient[1] * yc * yc) * eddy_decay;
+                ey_re[y] = ph.cos();
+                ey_im[y] = ph.sin();
+            }
+            let ph = TAU * (acq.eddy_strength * gradient[2] * zc + acq.eddy_quad * gradient[2] * zc * zc) * eddy_decay;
+            ez = (ph.cos(), ph.sin());
         }
+
+        // inner y-sum over the SIM grid → g(x): Σ_y (Σ_c rel_c comp_c) · state · e_y
+        g_re.iter_mut().for_each(|v| *v = 0.0);
+        g_im.iter_mut().for_each(|v| *v = 0.0);
+        if let Some(rows) = &nufft_rows {
+            for (c, (rre, rim)) in rows.iter().enumerate() {
+                let row = &rre[snx * kyi..snx * (kyi + 1)];
+                let rowi = &rim[snx * kyi..snx * (kyi + 1)];
+                for x in 0..snx {
+                    g_re[x] += rel[c] * row[x];
+                    g_im[x] += rel[c] * rowi[x];
+                }
+            }
+        } else {
+            for y in 0..sny {
+                let row = snx * y;
+                let (eyr, eyi) = (ey_re[y], ey_im[y]);
+                for x in 0..snx {
+                    let i = row + x;
+                    let mut w = 0.0f64;
+                    for (c, comp) in compartments.iter().enumerate() {
+                        w += rel[c] * comp[i] as f64;
+                    }
+                    let (sr, si) = (st_re[i], st_im[i]);
+                    let (mr, mi) = if do_eddy { (sr * eyr - si * eyi, sr * eyi + si * eyr) } else { (sr, si) };
+                    g_re[x] += w * mr;
+                    g_im[x] += w * mi;
+                }
+            }
+        }
+        if do_eddy {
+            for x in 0..snx {
+                let (a, b) = (g_re[x], g_im[x]);
+                let (fr, fi) = (ex_re[x] * ez.0 - ex_im[x] * ez.1, ex_re[x] * ez.1 + ex_im[x] * ez.0);
+                g_re[x] = a * fr - b * fi;
+                g_im[x] = a * fi + b * fr;
+            }
+        }
+        // x-DFT evaluated only at the acquired kx band, with the Nyquist (N/2) ghost: an
+        // alternating readout-line kx offset (gradient-delay mismatch).
+        let ghost_shift = if kyi % 2 == 1 { -acq.ghost_offset } else { acq.ghost_offset };
+        xstage.run(&g_re, &g_im, ghost_shift, &mut kspace[nx * kyi..nx * (kyi + 1)]);
     }
-
-
+    let n_inv = 1.0 / nvox as f64;
+    for k in kspace.iter_mut() {
+        k.re *= n_inv;
+        k.im *= n_inv;
+    }
     // Spikes: overwrite random k-space points with a fraction of the peak sample → herringbone
     // ripple in the image (itkKspaceImageFilter.cpp:502).
     if acq.n_spikes > 0 {
@@ -539,6 +780,103 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     }
 
     kspace
+}
+
+
+/// The x-stage of the forward model: one PE line's y-summed row `g[x]` (sim grid, `snx` points)
+/// → its `nx` acquired kx samples, `kx_norm = (kxi − xs + ghost)/snx`, measured from the acquired
+/// grid's centre `sxs + xoff`. The Nyquist-ghost offset is an off-grid frequency shift, i.e. a
+/// linear phase on `g`; the centre offset is a linear phase on the output; between them sits a
+/// plain length-`snx` e^{+i2π} transform (rustfft's unnormalised inverse), of which the bins
+/// `(kxi − xs) mod snx` are kept. Without the `kspace` feature the identical sum is evaluated
+/// from precomputed twiddle tables (one per ghost polarity).
+struct XStage {
+    snx: usize,
+    nx: usize,
+    #[cfg(feature = "kspace")]
+    xs: usize,
+    #[cfg(feature = "kspace")]
+    fft: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    #[cfg(feature = "kspace")]
+    buf: Vec<rustfft::num_complex::Complex<f64>>,
+    #[cfg(feature = "kspace")]
+    scratch: Vec<rustfft::num_complex::Complex<f64>>,
+    /// Input ghost ramps `e^{i2π(±ghost)(x − sxs − xoff)/snx}` for [+ghost, −ghost].
+    #[cfg(feature = "kspace")]
+    ramp: [Vec<(f64, f64)>; 2],
+    /// Output centre phase `e^{−i2π m (sxs + xoff)/snx}`, m = kxi − xs.
+    #[cfg(feature = "kspace")]
+    centre: Vec<(f64, f64)>,
+    /// Twiddles `e^{i2π (m ± ghost)(x − sxs − xoff)/snx}`, layout `x + snx*kxi`, per polarity.
+    #[cfg(not(feature = "kspace"))]
+    tw: [Vec<(f64, f64)>; 2],
+}
+
+impl XStage {
+    fn new(snx: usize, nx: usize, xs: usize, sxs: usize, xoff: f64, ghost: f64) -> XStage {
+        let c = sxs as f64 + xoff;
+        #[cfg(feature = "kspace")]
+        {
+            let fft = rustfft::FftPlanner::<f64>::new().plan_fft_inverse(snx);
+            let scratch = vec![rustfft::num_complex::Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+            let ramp = [ghost, -ghost].map(|gh| {
+                (0..snx).map(|x| { let p = TAU * gh * (x as f64 - c) / snx as f64; (p.cos(), p.sin()) }).collect()
+            });
+            let centre = (0..nx)
+                .map(|kxi| { let p = -TAU * (kxi as f64 - xs as f64) * c / snx as f64; (p.cos(), p.sin()) })
+                .collect();
+            XStage { snx, nx, xs, fft, buf: vec![rustfft::num_complex::Complex::new(0.0, 0.0); snx], scratch, ramp, centre }
+        }
+        #[cfg(not(feature = "kspace"))]
+        {
+            let tw = [ghost, -ghost].map(|gh| {
+                let mut t = Vec::with_capacity(snx * nx);
+                for kxi in 0..nx {
+                    let kx_norm = (kxi as f64 - xs as f64 + gh) / snx as f64;
+                    for x in 0..snx {
+                        let p = TAU * kx_norm * (x as f64 - c);
+                        t.push((p.cos(), p.sin()));
+                    }
+                }
+                t
+            });
+            XStage { snx, nx, tw }
+        }
+    }
+
+    /// `ghost_shift` is `±ghost` for this line's parity; `out` receives the nx samples (unnormalised).
+    fn run(&mut self, g_re: &[f64], g_im: &[f64], ghost_shift: f64, out: &mut [C]) {
+        let pol = if ghost_shift < 0.0 { 1 } else { 0 };
+        #[cfg(feature = "kspace")]
+        {
+            for x in 0..self.snx {
+                let (rr, ri) = self.ramp[pol][x];
+                self.buf[x] = rustfft::num_complex::Complex::new(g_re[x] * rr - g_im[x] * ri, g_re[x] * ri + g_im[x] * rr);
+            }
+            self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
+            for kxi in 0..self.nx {
+                let m = kxi as i64 - self.xs as i64;
+                let bin = m.rem_euclid(self.snx as i64) as usize;
+                let (cr, ci) = self.centre[kxi];
+                let v = self.buf[bin];
+                out[kxi] = C { re: v.re * cr - v.im * ci, im: v.re * ci + v.im * cr };
+            }
+        }
+        #[cfg(not(feature = "kspace"))]
+        {
+            let tw = &self.tw[pol];
+            for kxi in 0..self.nx {
+                let row = &tw[self.snx * kxi..self.snx * (kxi + 1)];
+                let (mut ar, mut ai) = (0.0f64, 0.0f64);
+                for x in 0..self.snx {
+                    let (tr, ti) = row[x];
+                    ar += g_re[x] * tr - g_im[x] * ti;
+                    ai += g_re[x] * ti + g_im[x] * tr;
+                }
+                out[kxi] = C { re: ar, im: ai };
+            }
+        }
+    }
 }
 
 /// The acquired k-space of the first coil, before reconstruction. Layout `kx + nx*ky`.
@@ -631,6 +969,9 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
     let mut wsum = vec![C::ZERO; nx * ny];
     let mut ssum = vec![0.0f64; nx * ny];
     for (coil, ks) in coil_kspace.iter().enumerate() {
+        #[cfg(feature = "kspace")]
+        let img = inverse_2d_fft(ks, nx, ny, xs, ys);
+        #[cfg(not(feature = "kspace"))]
         let img = inverse_2d(ks, nx, ny, xs, ys);
         for y in 0..ny {
             for x in 0..nx {
@@ -649,7 +990,54 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Exact FFT reconstruction (feature `kspace`, backed by the well-tested `rustfft` crate).
+/// Bit-for-bit equivalent to [`inverse_2d`] up to floating-point round-off: the centred convention
+/// (`xs = nx/2`, `ys = ny/2`) is a fftshift, realised as linear-phase modulations of the input and
+/// output plus a constant phase, so only the O(N log N) transform is delegated to rustfft.
+#[cfg(feature = "kspace")]
+fn inverse_2d_fft(kspace: &[C], nx: usize, ny: usize, xs: usize, ys: usize) -> Vec<C> {
+    use rustfft::{num_complex::Complex, FftPlanner};
+    let mut planner = FftPlanner::<f64>::new();
+    let fx = planner.plan_fft_forward(nx);
+    let fy = planner.plan_fft_forward(ny);
+    let (nxf, nyf, xsf, ysf) = (nx as f64, ny as f64, xs as f64, ys as f64);
+    // 1) pre-modulate: K'[kx,ky] = K · cis(2π(kx·xs/nx + ky·ys/ny))
+    let mut buf: Vec<Complex<f64>> = (0..nx * ny)
+        .map(|i| {
+            let (kx, ky) = ((i % nx) as f64, (i / nx) as f64);
+            let ph = TAU * (kx * xsf / nxf + ky * ysf / nyf);
+            let (c, sn) = (ph.cos(), ph.sin());
+            Complex::new(kspace[i].re * c - kspace[i].im * sn, kspace[i].re * sn + kspace[i].im * c)
+        })
+        .collect();
+    // 2) forward FFT along x (rows are contiguous), then along y (strided columns)
+    for ky in 0..ny {
+        fx.process(&mut buf[ky * nx..(ky + 1) * nx]);
+    }
+    let mut col = vec![Complex::new(0.0, 0.0); ny];
+    for kx in 0..nx {
+        for y in 0..ny {
+            col[y] = buf[y * nx + kx];
+        }
+        fy.process(&mut col);
+        for y in 0..ny {
+            buf[y * nx + kx] = col[y];
+        }
+    }
+    // 3) post-modulate: out = F · cis(2π(x·xs/nx + y·ys/ny)) · cis(-2π(xs²/nx + ys²/ny))
+    let const_ph = -TAU * (xsf * xsf / nxf + ysf * ysf / nyf);
+    (0..nx * ny)
+        .map(|i| {
+            let (x, y) = ((i % nx) as f64, (i / nx) as f64);
+            let ph = TAU * (x * xsf / nxf + y * ysf / nyf) + const_ph;
+            let (c, sn) = (ph.cos(), ph.sin());
+            C { re: buf[i].re * c - buf[i].im * sn, im: buf[i].re * sn + buf[i].im * c }
+        })
+        .collect()
+}
+
 /// Inverse 2D DFT (separable direct sums): complex k-space → complex image, centred convention.
+#[cfg(any(not(feature = "kspace"), test))]
 fn inverse_2d(kspace: &[C], nx: usize, ny: usize, xs: usize, ys: usize) -> Vec<C> {
     let at = |x: usize, y: usize| x + nx * y;
     let mut h = vec![C::ZERO; nx * ny];
@@ -794,33 +1182,46 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
     }
 }
 
-/// Run the k-space acquisition over a whole 4D clean-signal volume: every (volume, slice) through
-/// [`simulate_slice`]. `clean` is the clean signal in `(x+nx*(y+ny*z))*ngrad + g` layout; `fmap`
-/// is the off-resonance field (Hz) on the same grid. v1 treats the mixed signal as one compartment
-/// with an effective T2 (`t2_eff`, ms) — per-tissue T2 for realistic b0 contrast is a refinement.
-/// Returns `(magnitude, phase)` 4D arrays (phase in radians, atan2), same layout — the complex pair
-/// needed for BIDS `part-mag`/`part-phase` and complex denoisers. Parallel over volumes with `par`.
-/// The production acquisition: a finer object, the nominal k-space band, reconstruction at the
-/// acquisition matrix (spec 3.1), with an object phase model applied before encoding (spec 3.2).
-///
-/// `images` and `fmap` are on the **simulation** grid `sim_dims = [nx*o, ny*o, nz]`; the output is
-/// on `acq_dims = [nx, ny, nz]`. `o` is derived and must divide both in-plane axes.
-///
-/// This is the path that makes ringing intrinsic. [`simulate_acquisition_legacy`] does not.
-#[allow(clippy::too_many_arguments)]
-pub fn simulate_acquisition_oversampled(
-    sim_dims: [usize; 3],
-    acq_dims: [usize; 3],
-    ngrad: usize,
-    images: &[Vec<f32>],
-    t2: &[f32],
-    fmap: &[f32],
-    acq: &Acquisition,
-    bvals: &[f64],
-    bvecs: &[[f64; 3]],
-    phase: &PhaseModel,
-    seed: u64,
-) -> (Vec<f32>, Vec<f32>) {
+/// Everything [`simulate_acquisition`] needs besides the [`Acquisition`] protocol: the object
+/// (per-compartment images, their T2s and the off-resonance field, all on the **simulation**
+/// grid), the diffusion scheme, the object phase model and the optional per-voxel noise map.
+/// One shape for the CLI and for bindings.
+#[derive(Clone, Copy)]
+pub struct SimulationInput<'a> {
+    /// Simulation grid `[nx*o, ny*o, nz]`; `images` and `fmap` live here.
+    pub sim_dims: [usize; 3],
+    /// Acquired matrix `[nx, ny, nz]`; the output lives here. `o` is derived and must divide both
+    /// in-plane axes. `o = 1` is allowed: the transforms are then an exact round trip, so the
+    /// output has no intrinsic Gibbs ringing.
+    pub acq_dims: [usize; 3],
+    pub ngrad: usize,
+    /// Per-compartment clean signal, each `(x + snx*(y + sny*z))*ngrad + g`.
+    pub images: &'a [Vec<f32>],
+    /// Per-compartment T2 (ms).
+    pub t2: &'a [f32],
+    /// Off-resonance field (Hz).
+    pub fmap: &'a [f32],
+    pub bvals: &'a [f64],
+    /// Unit gradient directions (world RAS).
+    pub bvecs: &'a [[f64; 3]],
+    pub phase: &'a PhaseModel,
+    /// Noise / shot-phase realisation; mixed into every per-slice seed.
+    pub seed: u64,
+    /// Optional per-voxel per-component noise SD on the ACQUIRED grid (`x + nx*(y + ny*z)`). When
+    /// given, complex Gaussian noise of this SD is added to the reconstructed complex image, before
+    /// the magnitude/phase split — so magnitude and phase share the SAME noise realization, and the
+    /// written SD map is the exact ground truth for a denoiser's estimated noise level. This is the
+    /// image-space, spatially-varying counterpart to `Acquisition::noise_variance` (uniform, k-space).
+    pub noise_sigma: Option<&'a [f32]>,
+}
+
+/// The acquisition: every (volume, slice) of the object through [`simulate_slice`] — a finer
+/// object, the nominal k-space band, reconstruction at the acquisition matrix (spec 3.1), with
+/// the object phase model applied before encoding (spec 3.2). Returns `(magnitude, phase)` 4D
+/// arrays in `(x + nx*(y + ny*z))*ngrad + g` layout (phase in radians) — the complex pair BIDS
+/// `part-mag`/`part-phase` and complex denoisers need. Parallel over volumes with `par`.
+pub fn simulate_acquisition(inp: &SimulationInput, acq: &Acquisition) -> (Vec<f32>, Vec<f32>) {
+    let SimulationInput { sim_dims, acq_dims, ngrad, images, t2, fmap, bvals, bvecs, phase, seed, noise_sigma } = *inp;
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
     assert_eq!(nz, nzo, "slice count must match; z is never oversampled");
@@ -874,8 +1275,20 @@ pub fn simulate_acquisition_oversampled(
             );
             for y in 0..ny {
                 for x in 0..nx {
-                    let (re, im) = out[x + nx * y];
+                    let (mut re, mut im) = out[x + nx * y];
                     let vox = x + nx * (y + ny * z);
+                    if let Some(ns) = noise_sigma {
+                        let sd = ns[vox] as f64;
+                        if sd > 0.0 {
+                            // deterministic per (volume, voxel); parallel-safe (per_vol is over g)
+                            let mut rng = Rng(
+                                seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                    ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
+                            );
+                            re += (rng.gauss() * sd) as f32;
+                            im += (rng.gauss() * sd) as f32;
+                        }
+                    }
                     mag[vox] = (re * re + im * im).sqrt();
                     ph[vox] = im.atan2(re);
                 }
@@ -902,99 +1315,170 @@ pub fn simulate_acquisition_oversampled(
     (magd, phased)
 }
 
-/// **Legacy path: no intrinsic Gibbs ringing and no object phase.**
-///
-/// Runs the acquisition with the object already on the reconstruction matrix (`o = 1`) and
-/// `phase0: None`. At `o = 1` the forward and inverse transforms are an exact round trip, so this
-/// produces **zero** ringing (measured: +0.0000% overshoot on a step edge) and a real-valued image.
-///
-/// Retained only for backward comparison. Production callers must use
-/// [`simulate_acquisition_oversampled`], which is what gives ringing intrinsic to the acquisition
-/// and a genuinely complex object.
-pub fn simulate_acquisition_legacy(
-    dims: [usize; 3],
-    ngrad: usize,
-    images: &[Vec<f32>],
-    t2: &[f32],
-    fmap: &[f32],
-    acq: &Acquisition,
-    gradients: &[[f64; 3]],
-) -> (Vec<f32>, Vec<f32>) {
-    let [nx, ny, nz] = dims;
-    let nvox = nx * ny * nz;
-    let ncomp = images.len();
-    // returns (magnitude, phase) for one volume
-    let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
-        let (mut mag, mut phase) = (vec![0.0f32; nvox], vec![0.0f32; nvox]);
-        let mut cslices = vec![vec![0.0f32; nx * ny]; ncomp];
-        let mut fslice = vec![0.0f32; nx * ny];
-        // split the scaled gradient into a unit direction and a magnitude; the forward model
-        // recombines them, so this preserves the previous behaviour exactly
-        let gr = gradients[g];
-        let bval = (gr[0] * gr[0] + gr[1] * gr[1] + gr[2] * gr[2]).sqrt();
-        let bvec =
-            if bval > 1e-12 { [gr[0] / bval, gr[1] / bval, gr[2] / bval] } else { [0.0; 3] };
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let vox = x + nx * (y + ny * z);
-                    for (c, img) in images.iter().enumerate() {
-                        cslices[c][x + nx * y] = img[vox * ngrad + g];
-                    }
-                    fslice[x + nx * y] = fmap[vox];
-                }
-            }
-            let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
-                .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let inp = SliceInput {
-                compartments: &refs,
-                t2,
-                fmap: &fslice,
-                phase0: None,
-                // v1 acquisition path: the object is already on the acquired matrix (o = 1).
-                sim: [nx, ny],
-                acq_matrix: [nx, ny],
-                z,
-                nz,
-                bvec,
-                bval,
-                slice_seed: seed,
-            };
-            let out = simulate_slice(&inp, acq);
-            for y in 0..ny {
-                for x in 0..nx {
-                    let (re, im) = out[x + nx * y];
-                    let vox = x + nx * (y + ny * z);
-                    mag[vox] = (re * re + im * im).sqrt();
-                    phase[vox] = im.atan2(re);
-                }
-            }
-        }
-        (mag, phase)
-    };
-
-    #[cfg(feature = "par")]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = {
-        use rayon::prelude::*;
-        (0..ngrad).into_par_iter().map(per_vol).collect()
-    };
-    #[cfg(not(feature = "par"))]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..ngrad).map(per_vol).collect();
-
-    let (mut magd, mut phased) = (vec![0.0f32; nvox * ngrad], vec![0.0f32; nvox * ngrad]);
-    for (g, (m, p)) in vols.iter().enumerate() {
-        for vox in 0..nvox {
-            magd[vox * ngrad + g] = m[vox];
-            phased[vox * ngrad + g] = p[vox];
-        }
-    }
-    (magd, phased)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The literal per-line sum the production forward was restructured from: every
+    /// factor re-evaluated for every (voxel, line). Kept verbatim as the oracle for
+    /// `restructured_forward_matches_the_literal_sum`; not a code path.
+    #[allow(clippy::needless_range_loop)]
+    fn reference_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
+        let [snx, sny] = inp.sim;
+        let [nx, ny] = inp.acq_matrix;
+        assert!(
+            snx % nx == 0 && sny % ny == 0,
+            "sim grid must be an integer multiple of the acquired matrix"
+        );
+        let (z, nz) = (inp.z, inp.nz);
+        let (compartments, t2, fmap) = (inp.compartments, inp.t2, inp.fmap);
+        let epi = SingleShotEpi {
+            kx_max: nx,
+            ky_max: ny,
+            t_line: acq.t_line,
+            t_echo: acq.t_echo,
+            reverse_phase: acq.reverse_phase,
+        };
+        let (t_ms, trf_ms, tread_ms) = line_times(&epi);
+        let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
+        // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
+        let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
+        let do_eddy_phase = acq.eddy_phase != 0.0 && inp.bval.abs() > 1e-9;
+        // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
+        // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
+        // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
+        // cover exactly this range. It gives a real object a small deterministic imaginary component,
+        // which is NOT object phase; see `phase.rs` for that. Pinned by
+        // `even_matrix_window_asymmetry_is_intentional`.
+        let (xs, ys, zs) = (nx / 2, ny / 2, nz / 2);
+        let (ox, oy) = (snx / nx, sny / ny); // in-plane oversampling factors
+        // The sim-grid centre is the IMAGE of the acquired centre, o*(n/2), not snx/2: for an odd
+        // acquired matrix those differ by one sim cell, i.e. (1/o) of an acquired voxel in-plane.
+        let (sxs, sys) = (ox * xs, oy * ys);
+        // Half-cell alignment. Sim cell `x` covers [x, x+1) in sim units, so its centre is at x+0.5;
+        // acquired cell `X` covers o cells and is centred at o*X + o/2. Aligning sample index `x` with
+        // `o*X` — as a bare index substitution does — therefore misregisters the object against the
+        // reconstruction grid by (o-1)/2 sim cells, i.e. (o-1)/(2o) of an ACQUIRED voxel: 0.44 voxels
+        // at o=8. Since this whole model turns on sub-voxel edge position, that shift is fatal and the
+        // acquired k-space is measured from the acquired grid's centre instead. Exactly zero at o=1.
+        let (xoff, yoff) = ((ox as f64 - 1.0) / 2.0, (oy as f64 - 1.0) / 2.0);
+        let at = |x: usize, y: usize| x + snx * y; // SIM-grid image index
+        let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
+
+        // Which samples are acquired (partial Fourier + GRAPPA undersampling). Single source of
+        // truth, shared with the noise below so signal and noise cannot disagree.
+        let mask = sampling_mask(nx, ny, acq);
+        // ---- forward: build k-space, factored as  Σ_x e^{..kx x}[ Σ_y mod(x,y) e^{..ky y} ] ----
+        // mod(x,y) depends on the PE line ky (through φ and relaxation), so the y-sum is recomputed
+        // per ky, but that keeps the whole build at O(N³).
+        let mut kspace = vec![C::ZERO; nx * ny];
+        let n_inv = 1.0 / (snx * sny) as f64;
+        for kyi in 0..ny {
+            // Not acquired (partial Fourier, or GRAPPA undersampling): this k-space row stays
+            // zero and, critically, receives no noise either.
+            if !mask[nx * kyi] {
+                continue;
+            }
+            let t = t_ms[kyi] / 1000.0; // seconds
+            let trf = trf_ms[kyi];
+            // Divide by the SIM extent: the loop still runs over the ny ACQUIRED lines, but each sits
+            // at absolute sim index sys - ys + kyi, whose normalized frequency is (kyi - ys)/sny.
+            let ky_norm = (kyi as f64 - ys as f64) / sny as f64;
+            // Nyquist (N/2) ghost: alternating readout-line kx offset (gradient-delay mismatch).
+            let ghost_shift = if kyi % 2 == 1 { -acq.ghost_offset } else { acq.ghost_offset };
+            // eddy-current decay for this PE line: exp(-tRead/τ)·t (itkKspaceImageFilter.cpp:354)
+            let eddy_decay = if do_eddy { (-tread_ms[kyi] / acq.eddy_tau).exp() * t } else { 0.0 };
+
+            // modulated image for this PE line
+            let mut modimg = vec![C::ZERO; snx * sny];
+            for y in 0..sny {
+                for x in 0..snx {
+                    let mut f_real = 0.0f64;
+                    for (c, comp) in compartments.iter().enumerate() {
+                        let mut v = comp[at(x, y)] as f64;
+                        if acq.do_relaxation {
+                            v *= (-(trf as f64) / t2[c] as f64 - t.abs() * 1000.0 / acq.t_inhom).exp();
+                        }
+                        f_real += v;
+                    }
+                    // TWO coordinate frames, named apart on purpose. Both are in acquired-voxel
+                    // UNITS and both carry the half-cell registration (`xoff = (o-1)/2`), but they
+                    // have DIFFERENT ORIGINS, and a quantity evaluated in the wrong one is wrong by
+                    // half a FOV rather than by a sub-voxel amount:
+                    //
+                    //   xa — ABSOLUTE on the acquired grid, 0 .. nx-1, averaging to exactly `v` over
+                    //        the o sim cells of acquired voxel `v`. This is the frame the Roemer
+                    //        combine walks (`x in 0..nx`), so anything the combine must agree with —
+                    //        `coil_sensitivity`, whose coil ring is centred on nx/2 — uses it.
+                    //   xc — CENTRED on the acquired image, -nx/2 .. nx/2-1. The eddy polynomial is
+                    //        an expansion about the image centre and needs this one.
+                    //
+                    // Conflating them is not hypothetical: an earlier revision passed `xc` to
+                    // `coil_sensitivity`, which put the forward model's sensitivity field half a FOV
+                    // from the combine's at EVERY oversampling factor, o = 1 included (28% of peak).
+                    // Pinned end-to-end by
+                    // `multicoil_roemer_reproduces_the_single_coil_image_at_every_oversampling`.
+                    let (xa, ya) = (
+                        (x as f64 - xoff) / ox as f64,
+                        (y as f64 - yoff) / oy as f64,
+                    );
+                    f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
+                    let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
+                    // Pre-readout object phase, already in radians, so it is added outside the TAU
+                    // factor that scales the distortion/eddy term.
+                    let mut phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
+                    if do_eddy || do_eddy_phase {
+                        // centre on the sim grid, then express in ACQUIRED voxel units so that the
+                        // eddy scales keep their meaning independent of oversampling
+                        let (xc, yc, zc) = (
+                            (x as f64 - sxs as f64 - xoff) / ox as f64,
+                            (y as f64 - sys as f64 - yoff) / oy as f64,
+                            z as f64 - zs as f64,
+                        );
+                        if do_eddy {
+                            // gradient-dependent field growing through the readout: linear (g·pos)
+                            // plus a quadratic (g·pos²) term — the polynomial eddy/TORTOISE fit. This
+                            // grows with the readout time (eddy_decay ∝ ky) → geometric DISTORTION.
+                            let lin = gradient[0] * xc + gradient[1] * yc + gradient[2] * zc;
+                            let quad =
+                                gradient[0] * xc * xc + gradient[1] * yc * yc + gradient[2] * zc * zc;
+                            phi += (acq.eddy_strength * lin + acq.eddy_quad * quad) * eddy_decay;
+                        }
+                        if do_eddy_phase {
+                            // Eddy OBJECT-phase ramp: constant across the readout (NOT ∝ ky), so it
+                            // imprints the reconstructed object phase rather than distorting geometry.
+                            // Direction- and b-dependent (∝ gradient = bvec·bval), it reproduces the
+                            // per-volume phase-ramp variation real DWI shows (∝ gradient direction).
+                            // z centred on the volume (zc above is slice-index-from-start, not centred).
+                            let zc_c = z as f64 - (inp.nz as f64 - 1.0) / 2.0;
+                            phi0 += acq.eddy_phase
+                                * (gradient[0] * xc + gradient[1] * yc + gradient[2] * zc_c);
+                        }
+                    }
+                    modimg[at(x, y)] = C::cis(TAU * phi + phi0).scale(f_real);
+                }
+            }
+            // inner y-sum over the SIM grid → g(x), then an x-DFT evaluated only at acquired kx
+            let mut g = vec![C::ZERO; snx];
+            for x in 0..snx {
+                let mut acc = C::ZERO;
+                for y in 0..sny {
+                    let ph = C::cis(TAU * ky_norm * (y as f64 - sys as f64 - yoff));
+                    acc = acc.add(modimg[at(x, y)].mul(ph));
+                }
+                g[x] = acc;
+            }
+            for kxi in 0..nx {
+                let kx_norm = (kxi as f64 - xs as f64 + ghost_shift) / snx as f64;
+                let mut acc = C::ZERO;
+                for x in 0..snx {
+                    acc = acc.add(g[x].mul(C::cis(TAU * kx_norm * (x as f64 - sxs as f64 - xoff))));
+                }
+                kspace[kat(kxi, kyi)] = acc.scale(n_inv);
+            }
+        }
+        kspace
+    }
 
     fn mag(v: &[(f32, f32)]) -> Vec<f32> {
         v.iter().map(|&(r, i)| (r * r + i * i).sqrt()).collect()
@@ -1391,7 +1875,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2: &[100.0], fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0
         }
     }
 
@@ -1410,7 +1894,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9
             },
             &acq,
         );
@@ -1436,7 +1920,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3
                 },
                 &acq,
             );
@@ -1478,7 +1962,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64
                 },
                 &acq,
             );
@@ -1546,7 +2030,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0
                 },
                 &Acquisition { partial_fourier: pf, ..clean() },
             )
@@ -1609,7 +2093,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5
                 },
                 &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
@@ -1632,7 +2116,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0
                 },
                 &Acquisition { window: w, ..clean() },
             );
@@ -1749,7 +2233,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0
         };
         let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
@@ -1772,7 +2256,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0,
+                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0
                 },
                 &acq,
             )
@@ -1795,9 +2279,9 @@ mod tests {
 
     #[test]
     fn production_path_produces_intrinsic_ringing_and_complex_phase() {
-        // Regression guard for the defect this test exists because of: the shipped CLI ran the
-        // o=1 legacy path, where the forward/inverse transforms are an exact round trip, so after
-        // zero_ringing was removed it produced +0.0000% overshoot and no object phase.
+        // Regression guard for the defect this test exists because of: the shipped CLI once ran
+        // at o=1, where the forward/inverse transforms are an exact round trip, so it produced
+        // +0.0000% overshoot and no object phase.
         use crate::phase::PhaseModel;
         let (nx, ny, nz, o) = (32usize, 32usize, 1usize, 4usize);
         let (snx, sny) = (nx * o, ny * o);
@@ -1807,9 +2291,14 @@ mod tests {
             signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
         };
         let model = PhaseModel::hbcd_like();
-        let (mag, ph) = simulate_acquisition_oversampled(
-            [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
-            &[1000.0], &[[1.0, 0.0, 0.0]], &model, 7,
+        let images = [img];
+        let (mag, ph) = simulate_acquisition(
+            &SimulationInput {
+                sim_dims: [snx, sny, nz], acq_dims: [nx, ny, nz], ngrad: 1, images: &images,
+                t2: &[100.0], fmap: &fmap, bvals: &[1000.0], bvecs: &[[1.0, 0.0, 0.0]],
+                phase: &model, seed: 7, noise_sigma: None,
+            },
+            &acq,
         );
         let row: Vec<f64> = (nx / 2 + 1..nx).map(|x| mag[(x + nx * (ny / 2)) * 1] as f64).collect();
         let over = row.iter().cloned().fold(f64::MIN, f64::max) - 1.0;
@@ -1825,8 +2314,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_path_is_documented_as_ringing_free() {
-        // Pins WHY the legacy path must not be the production one, so nobody re-wires it.
+    fn o1_is_an_exact_round_trip_with_no_ringing() {
+        // Pins WHY `--oversample 1` cannot show Gibbs ringing: with the object on the
+        // reconstruction matrix the forward and inverse transforms cancel exactly.
         let (nx, ny, nz) = (32usize, 32usize, 1usize);
         let mut img = vec![0.0f32; nx * ny * nz];
         for y in 0..ny {
@@ -1837,14 +2327,21 @@ mod tests {
         let acq = Acquisition {
             signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
         };
-        let (mag, _) = simulate_acquisition_legacy(
-            [nx, ny, nz], 1, &[img], &[100.0], &vec![0.0f32; nx * ny * nz], &acq,
-            &[[0.0, 0.0, 0.0]],
+        let images = [img];
+        let fmap = vec![0.0f32; nx * ny * nz];
+        let phase = PhaseModel::none();
+        let (mag, _) = simulate_acquisition(
+            &SimulationInput {
+                sim_dims: [nx, ny, nz], acq_dims: [nx, ny, nz], ngrad: 1, images: &images,
+                t2: &[100.0], fmap: &fmap, bvals: &[0.0], bvecs: &[[0.0, 0.0, 0.0]],
+                phase: &phase, seed: 0, noise_sigma: None,
+            },
+            &acq,
         );
         let over = (nx / 2 + 1..nx)
-            .map(|x| mag[(x + nx * (ny / 2)) * 1] as f64)
+            .map(|x| mag[x + nx * (ny / 2)] as f64)
             .fold(f64::MIN, f64::max) - 1.0;
-        assert!(over.abs() < 1e-4, "legacy path is an exact round trip by construction: {over}");
+        assert!(over.abs() < 1e-4, "o = 1 is an exact round trip by construction: {over}");
     }
 
     #[test]
@@ -1881,7 +2378,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5,
+                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5
             },
             &acq,
         );
@@ -1936,5 +2433,152 @@ mod tests {
             kept.last().unwrap() - kept[0] + 1, kept.len(),
             "contiguous mode must leave no gaps, got {kept:?}"
         );
+    }
+    /// The production forward is the literal per-line sum reorganised (static factors hoisted,
+    /// the affine phase advanced by memoised rotors, the eddy polynomial factored per axis, the
+    /// x-DFT done by FFT / twiddle table). Every effect, alone and combined, must reproduce the
+    /// literal sum to round-off — including the rotor re-anchoring (ny > REANCHOR), the odd-line
+    /// dwell offset, GRAPPA strides, partial Fourier in both modes and polarities, odd matrices
+    /// and o = 1 as well as o = 2.
+    #[test]
+    fn restructured_forward_matches_the_literal_sum() {
+        let mut rng = Rng(0xC0FFEE);
+        let unit = |r: &mut Rng| r.unit();
+        for &(nx, ny, o) in &[(17usize, 70usize, 2usize), (16, 40, 1), (8, 9, 3)] {
+            let (snx, sny) = (nx * o, ny * o);
+            let n = snx * sny;
+            let mut comps: Vec<Vec<f32>> = Vec::new();
+            for c in 0..3 {
+                comps.push((0..n).map(|i| {
+                    let (x, y) = ((i % snx) as f64 / snx as f64, (i / snx) as f64 / sny as f64);
+                    let blob = (-(((x - 0.5).powi(2) + (y - 0.45).powi(2)) / (0.03 * (c + 1) as f64))).exp();
+                    (blob + 0.05 * unit(&mut rng)) as f32
+                }).collect());
+            }
+            let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+            let t2 = [70.0f32, 100.0, 2000.0];
+            // fieldmap with a large range (±300 Hz over a 40–70 ms readout: ±20 cycles at the edge)
+            let fmap: Vec<f32> = (0..n).map(|i| {
+                let (x, y) = ((i % snx) as f64 / snx as f64, (i / snx) as f64 / sny as f64);
+                (300.0 * ((3.0 * x).sin() * (2.0 * y + 1.0).cos()) + 20.0 * unit(&mut rng)) as f32
+            }).collect();
+            let phase0: Vec<f64> = (0..n).map(|_| TAU * unit(&mut rng)).collect();
+            let full = Acquisition {
+                do_distortions: true, do_relaxation: true, signal_scale: 100.0,
+                ..Acquisition::default()
+            };
+            let cases: Vec<(&str, Acquisition, [f64; 3], f64, usize, usize)> = vec![
+                ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, [0.0; 3], 0.0, 0, 1),
+                ("distortion+relaxation", full.clone(), [0.0; 3], 0.0, 0, 1),
+                ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, [0.0; 3], 0.0, 0, 1),
+                ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, [0.0; 3], 0.0, 0, 1),
+                ("eddy-poly", Acquisition { eddy_strength: 3.0, eddy_quad: 0.4, eddy_tau: 70.0, ..full.clone() },
+                    [0.3, -0.8, 0.5], 1.0, 0, 1),
+                ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, [0.6, 0.6, 0.5], 1.0, 0, 1),
+                ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, [0.0; 3], 0.0, 0, 1),
+                ("pf-contiguous-reverse", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
+                    reverse_phase: true, ..full.clone() }, [0.0; 3], 0.0, 0, 1),
+                ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, [0.0; 3], 0.0, 2, 4),
+                ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, [0.0; 3], 0.0, 1, 4),
+                ("everything", Acquisition { ghost_offset: 0.02, eddy_strength: 2.0, eddy_quad: 0.3, eddy_phase: 0.1,
+                    partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
+                    [0.5, 0.5, 0.7], 1.0, 0, 3),
+            ];
+            for (name, acq, bvec, bval, coil, ncoils) in cases {
+                let inp = SliceInput {
+                    compartments: &comp_refs, t2: &t2, fmap: &fmap, phase0: Some(&phase0),
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, bvec, bval, slice_seed: 0,
+                };
+                let a = build_coil_kspace(&inp, &acq, coil, ncoils);
+                let b = reference_coil_kspace(&inp, &acq, coil, ncoils);
+                let peak = b.iter().map(|k| k.abs()).fold(0.0, f64::max);
+                let worst = a.iter().zip(&b).map(|(p, q)| (p.re - q.re).hypot(p.im - q.im)).fold(0.0, f64::max);
+                assert!(peak > 0.0, "{name}: empty reference");
+                assert!(worst <= 1e-10 * peak, "{name} @ {nx}x{ny} o={o}: max |Δ| {worst:.3e} vs peak {peak:.3e}");
+            }
+        }
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn fft_inverse_matches_the_direct_dft() {
+        // random k-space of a typical acquired size; the FFT recon must equal the direct DFT.
+        let (nx, ny) = (84, 100);
+        let mut rng = Rng(0xC0FFEE);
+        let ks: Vec<C> = (0..nx * ny).map(|_| C { re: rng.gauss(), im: rng.gauss() }).collect();
+        let (xs, ys) = (nx / 2, ny / 2);
+        let direct = inverse_2d(&ks, nx, ny, xs, ys);
+        let fft = inverse_2d_fft(&ks, nx, ny, xs, ys);
+        let mut max = 0.0f64;
+        for (a, b) in direct.iter().zip(&fft) {
+            max = max.max((a.re - b.re).abs()).max((a.im - b.im).abs());
+        }
+        // amplitudes are O(nx*ny) after an unnormalized inverse, so a ~1e-8 relative tolerance
+        assert!(max < 1e-6 * (nx * ny) as f64, "FFT vs direct DFT max abs diff {max}");
+    }
+    #[cfg(feature = "kspace")]
+    #[test]
+    #[ignore = "timing micro-benchmark; run explicitly with --ignored"]
+    fn bench_inverse_direct_vs_fft() {
+        // Load-independent micro-benchmark of the reconstruction transform at the acquired size.
+        let (nx, ny) = (85usize, 128usize);
+        let mut rng = Rng(1);
+        let ks: Vec<C> = (0..nx * ny).map(|_| C { re: rng.gauss(), im: rng.gauss() }).collect();
+        let (xs, ys) = (nx / 2, ny / 2);
+        let n = 3000;
+        let mut sink = 0.0f64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n { sink += inverse_2d(&ks, nx, ny, xs, ys)[0].re; }
+        let td = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        for _ in 0..n { sink += inverse_2d_fft(&ks, nx, ny, xs, ys)[0].re; }
+        let tf = t1.elapsed();
+        println!(
+            "inverse {nx}x{ny}: direct {:.2} us/call, fft {:.2} us/call, speedup {:.1}x (sink {sink:.1})",
+            td.as_micros() as f64 / n as f64, tf.as_micros() as f64 / n as f64,
+            td.as_secs_f64() / tf.as_secs_f64());
+    }
+
+    /// The oversampled k-space stage must not move the object: a blob centred on acquired voxel
+    /// (X0, Y0) -- i.e. at sim index o*X0 + (o-1)/2 -- must come back centred on (X0, Y0). Even
+    /// and odd acquired matrices: with an odd matrix the sim grid's `snx/2` is not the image of
+    /// the acquired centre `nx/2`, which used to shift the object by a fraction of a voxel.
+    #[test]
+    fn oversampled_reconstruction_keeps_the_object_in_place() {
+        fn centroid(o: usize, nx: usize, ny: usize, x0: f64, y0: f64) -> (f64, f64) {
+            let (snx, sny) = (nx * o, ny * o);
+            let off = (o as f64 - 1.0) / 2.0;
+            let (sx0, sy0) = (o as f64 * x0 + off, o as f64 * y0 + off);
+            let mut img = vec![0.0f32; snx * sny];
+            for y in 0..sny {
+                for x in 0..snx {
+                    let d2 = (x as f64 - sx0).powi(2) + (y as f64 - sy0).powi(2);
+                    img[x + snx * y] = (-d2 / (2.0 * (1.5 * o as f64).powi(2))).exp() as f32;
+                }
+            }
+            let comps: [&[f32]; 1] = [&img];
+            let fmap = vec![0.0f32; snx * sny];
+            let acq = Acquisition { do_distortions: false, do_relaxation: false, ..Acquisition::default() };
+            let out = simulate_slice(
+                &SliceInput { compartments: &comps, t2: &[80.0], fmap: &fmap, phase0: None, sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1, bvec: [1.0, 0.0, 0.0], bval: 0.0, slice_seed: 0 },
+                &acq,
+            );
+            let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);
+            for y in 0..ny {
+                for x in 0..nx {
+                    let (re, im) = out[x + nx * y];
+                    let m = ((re * re + im * im) as f64).sqrt();
+                    sx += m * x as f64; sy += m * y as f64; sw += m;
+                }
+            }
+            (sx / sw, sy / sw)
+        }
+        for (nx, ny) in [(24usize, 20usize), (25, 21), (107, 151)] {
+            for o in [1usize, 2, 4] {
+                if nx * o > 200 { continue; }
+                let (cx, cy) = centroid(o, nx, ny, 9.0, 7.0);
+                assert!((cx - 9.0).abs() < 0.05 && (cy - 7.0).abs() < 0.05, "{nx}x{ny} o={o}: centroid ({cx:.3}, {cy:.3})");
+            }
+        }
     }
 }

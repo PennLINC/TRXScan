@@ -57,6 +57,12 @@ jobs:
       - name: Test the parallel path
         run: cargo test --features cli,par --all-targets --verbose
         working-directory: TRXScan
+      # The `kspace` feature swaps the x-stage / reconstruction to rustfft and the fieldmap
+      # y-sum to the NUFFT. Identical numbers by construction, and the literal-sum oracle test
+      # (`restructured_forward_matches_the_literal_sum`) only exercises that path under the feature.
+      - name: Test the FFT / NUFFT path
+        run: cargo test --features kspace --verbose
+        working-directory: TRXScan
 
       # Reported, not enforced: most findings are pre-existing in modules this branch does not
       # touch (microstructure, mixture, sphere). Making it a gate is a separate cleanup.

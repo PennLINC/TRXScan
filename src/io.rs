@@ -350,7 +350,7 @@ pub fn write_benchmark(
     Ok(())
 }
 
-fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
+pub fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
     let [nx, ny, nz] = dims;
     let arr = Array4::from_shape_fn((nx, ny, nz, ngrad), |(x, y, z, g)| {
         data[(x + nx * (y + ny * z)) * ngrad + g]
@@ -361,12 +361,70 @@ fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Gr
 }
 
 /// Write one 3D scalar volume (layout `x + nx*(y + ny*z)`) as NIfTI-1 with the given affine.
-fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
+pub fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
     let [nx, ny, nz] = dims;
     let arr =
         ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
     let hdr = header_for_grid(grid.voxel_to_world);
     WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
+    Ok(())
+}
+
+/// Write one 3D volume as int16 (Siemens-style phase images are stored as integers 0..4095).
+pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) -> R<()> {
+    let [nx, ny, nz] = dims;
+    let arr =
+        ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
+    let hdr = header_for_grid(grid.voxel_to_world);
+    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
+    Ok(())
+}
+
+/// Write a synthesized GRE fieldmap as BIDS `<prefix>_magnitude{1,2}` + `_phasediff` (or
+/// `_phase{1,2}`) NIfTIs with sidecars carrying the echo times and `B0FieldIdentifier`. With
+/// `fsl_orientation` the volumes are written radiological LAS on the GRE's own grid (which may
+/// differ from the DWI grid when a resolution was requested).
+pub fn write_gre_fieldmap(prefix: &str, gre: &crate::gre::GreFieldmap, fsl_orientation: bool) -> R<()> {
+    use crate::gre::GreOutput;
+    use crate::orient::Reorient;
+    let greo = if fsl_orientation {
+        Reorient::to_las(&gre.grid.voxel_to_world, gre.grid.dims)
+    } else {
+        Reorient::identity(gre.grid.dims)
+    };
+    let mut wgrid = gre.grid.clone();
+    wgrid.voxel_to_world = greo.apply_affine(&gre.grid.voxel_to_world);
+    wgrid.dims = greo.out_dims;
+    let b0id = &gre.b0_field;
+    let p = |s: &str| PathBuf::from(format!("{prefix}{s}"));
+    for (k, m) in gre.magnitude.iter().enumerate() {
+        let vol = greo.apply_volume(m, 1);
+        write_3d(&p(&format!("_magnitude{}.nii.gz", k + 1)), wgrid.dims, &vol, &wgrid)?;
+        let te = gre.te_s[k];
+        std::fs::write(p(&format!("_magnitude{}.json", k + 1)), format!(
+            "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime\": {te:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"M\", \"ND\"]\n}}\n"))?;
+    }
+    let write_phase = |suffix: &str, data: &[i16], json: String| -> R<()> {
+        let ph_f: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let ph_reo: Vec<i16> = greo.apply_volume(&ph_f, 1).iter().map(|&v| v as i16).collect();
+        write_3d_i16(&p(&format!("_{suffix}.nii.gz")), wgrid.dims, &ph_reo, &wgrid)?;
+        std::fs::write(p(&format!("_{suffix}.json")), json)?;
+        Ok(())
+    };
+    match gre.output {
+        GreOutput::Phase => {
+            for (k, ph) in gre.phase.iter().enumerate() {
+                let te = gre.te_s[k];
+                write_phase(&format!("phase{}", k + 1), ph, format!(
+                    "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime\": {te:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"P\", \"ND\", \"PHASE\"]\n}}\n"))?;
+            }
+        }
+        GreOutput::Phasediff => {
+            let [te1, te2] = gre.te_s;
+            write_phase("phasediff", &gre.phase[0], format!(
+                "{{\n  \"Manufacturer\": \"TRXScan\",\n  \"EchoTime1\": {te1:.5},\n  \"EchoTime2\": {te2:.5},\n  \"B0FieldIdentifier\": \"{b0id}\",\n  \"ImageType\": [\"ORIGINAL\", \"PRIMARY\", \"P\", \"ND\", \"PHASE\"]\n}}\n"))?;
+        }
+    }
     Ok(())
 }
 
@@ -418,6 +476,10 @@ pub struct SidecarInfo {
     pub partial_fourier: f64,
     pub accel: usize,
     pub mb: usize,
+    /// Modern BIDS B0 linkage: when a fieldmap is written for this DWI, its
+    /// `B0FieldIdentifier` label is recorded here so the DWI carries the matching
+    /// `B0FieldSource` (the replacement for the deprecated `IntendedFor`).
+    pub b0_field_source: Option<String>,
 }
 
 pub fn write_complex_dwi(
@@ -439,11 +501,15 @@ pub fn write_complex_dwi(
     let ped = info.phase_encoding_direction.as_str();
     let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
     let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
+    let b0src = match &info.b0_field_source {
+        Some(id) => format!(",\n  \"B0FieldSource\": \"{id}\""),
+        None => String::new(),
+    };
     let common = format!(
         "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
          \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
          \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
-         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}",
+         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
         info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
     );
     std::fs::write(p("_part-mag_dwi.json"),

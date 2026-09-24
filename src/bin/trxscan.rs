@@ -1,21 +1,23 @@
 //! End-to-end simulator: streamlines + tissue + scheme + fieldmap → BIDS complex 4D DWI.
 //! Signal stage (per-voxel mixture → clean signal) → acquisition stage (EPI distortion, T2*, eddy,
-//! partial Fourier, Gibbs ringing, spikes, multi-coil, GRAPPA, noise), with optional head motion.
+//! partial Fourier, Gibbs ringing, spikes, multi-coil, GRAPPA, noise), with optional head motion,
+//! gradient nonlinearity and a matching synthetic GRE fieldmap.
 
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::Instant;
+
 use trxscan::compartments::{
-    generate_compartments_moving, generate_mixture, signal_from_mixture, CompartmentParams,
+    generate_compartments_moving, generate_mixture, signal_from_mixture_gnl, CompartmentParams,
 };
+use trxscan::gnl::{GnlField, GradCoef};
+use trxscan::gre::{self, GreObject, GreOutput, GreParams};
 use trxscan::io;
-use trxscan::kspace::{
-    simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
-    PartialFourierMode,
-};
-use trxscan::phase::PhaseModel;
+use trxscan::kspace::{simulate_acquisition, Acquisition, PartialFourierMode, SimulationInput};
 use trxscan::motion;
 use trxscan::orient::Reorient;
+use trxscan::phase::PhaseModel;
+use trxscan::raster::Grid;
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
 
@@ -24,7 +26,7 @@ use trxscan::sphere::HemiSphere;
 enum Preset {
     /// Fiberfox ffp legacy values (weak GM/WM contrast at low b by design)
     Neonatal,
-    /// 3T literature T2s / diffusivities
+    /// Adult 3T values: literature diffusivities, T2s from an EPI relaxometry fit
     Adult,
     /// Unmyelinated-WM diffusivities (pair with a myelin map)
     Infant,
@@ -71,11 +73,8 @@ struct Cli {
     /// FSL b-vectors
     #[arg(long, value_name = "BVEC")]
     bvec: PathBuf,
-    /// Off-resonance fieldmap in Hz, on the ACQUISITION grid. Required only for the legacy
-    /// `--oversample 1` path; the default oversampled path takes `--sim-fmap` instead.
-    ///
-    /// It used to be unconditionally required, which meant a default run could fail on a missing
-    /// or mis-gridded file whose values never reached the output.
+    /// Off-resonance fieldmap in Hz on the ACQUISITION grid. Used only with `--oversample 1`;
+    /// the default oversampled path takes `--sim-fmap` (on the simulation grid) instead.
     #[arg(long, value_name = "NII")]
     fmap: Option<PathBuf>,
     /// Output BIDS stem, e.g. out/sub-01_dir-AP_run-01
@@ -87,7 +86,7 @@ struct Cli {
     /// This is what makes Gibbs ringing INTRINSIC to the acquisition: the object is simulated
     /// finer than the acquisition matrix and only the nominal k-space band is acquired. With
     /// `--oversample 1` the object sits on the reconstruction matrix, the transforms are an exact
-    /// round trip, and the output has NO ringing and no object phase (the legacy path).
+    /// round trip, and the output has NO ringing.
     ///
     /// Requires `--sim-*` inputs at `voxel/N`, from
     /// `scripts/prepare_acquisition_grid.py --oversample N`. Upsampling the acquisition-grid maps
@@ -138,12 +137,23 @@ struct Cli {
     /// normalization; multi-coil combination lowers the final variance by sum_c s_c^2.
     #[arg(long, default_value_t = 0.0, value_name = "VAR")]
     noise: f64,
+    /// Per-voxel noise level (SD) map on the ACQUISITION grid: spatially-varying complex Gaussian
+    /// noise added to the reconstructed image, so magnitude and phase share one realization. Writes
+    /// the SD map as <out>_desc-noise_sigma.nii.gz (ground truth for a denoiser's noise estimate).
+    #[arg(long, value_name = "NII")]
+    noise_map: Option<PathBuf>,
     /// Linear eddy-current strength (DWI volumes only; b0 exempt)
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy: f64,
     /// Quadratic eddy-current strength
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy_quad: f64,
+    /// Eddy-current OBJECT-phase ramp strength (rad per unit bvec·bval per acquired voxel). Unlike
+    /// --eddy (which distorts geometry), this imprints a direction- and b-dependent ramp on the
+    /// reconstructed phase, reproducing the per-volume phase variation real DWI shows (~1.7e-5
+    /// matches a 3T HBCD-protocol scan). DWI volumes only.
+    #[arg(long, default_value_t = 0.0, value_name = "S")]
+    eddy_phase: f64,
     /// GRAPPA acceleration factor R
     #[arg(long, default_value_t = 1, value_name = "R")]
     accel: usize,
@@ -155,7 +165,8 @@ struct Cli {
     mb: usize,
 
     /// Head-motion trace: a qsiprep/eddy confounds TSV (trans_x/y/z mm, rot_x/y/z rad). Switches
-    /// the signal stage to the faithful per-volume re-simulation path.
+    /// the signal stage to the faithful per-volume re-simulation path (no SIFT2 weights, Watson
+    /// kappa, myelin, GNL or truth peaks there).
     #[arg(long, value_name = "TSV")]
     motion: Option<PathBuf>,
     /// Per-DWI-volume probability of a within-volume dropout event (needs --mb > 1)
@@ -174,6 +185,85 @@ struct Cli {
     /// Per-voxel myelination map (0..1): lerps the WM compartment toward the adult endpoint
     #[arg(long, value_name = "NII")]
     myelin: Option<PathBuf>,
+    /// Per-compartment signal amplitude "wm,gm,csf" (proton density x T1 saturation): scales the
+    /// fiber/GM/CSF b0 levels to match a real acquisition. Default: no change. CSF < 1 mimics
+    /// TR/T1 saturation (long-T1 CSF is not fully relaxed at a finite TR).
+    #[arg(long, value_name = "WM,GM,CSF")]
+    tissue_s0: Option<String>,
+    /// Scale each compartment's diffusivities "wm,gm,csf" to tune the S(b)/S0 decay to a real
+    /// acquisition (WM intra+extra + soma, GM ball, CSF ball). Default: no change.
+    #[arg(long, value_name = "WM,GM,CSF")]
+    diff_scale: Option<String>,
+
+    /// Gradient nonlinearity: a preset ("whole-body-80", "connectom-300") or a Siemens `.grad`
+    /// coefficient file. Adds the spatial encoding warp AND the per-voxel diffusion-encoding
+    /// deviation; writes the coefficient file, the displacement fields and the graddev image
+    /// next to the DWI. See docs/GNL.md.
+    #[arg(long, value_name = "PRESET|FILE")]
+    gnl: Option<String>,
+    /// Multiply the nonlinear coefficients (l >= 3) by this factor (severity knob).
+    #[arg(long, default_value_t = 1.0, value_name = "S", requires = "gnl")]
+    gnl_scale: f64,
+    /// Scanner isocentre, world RAS mm as "x,y,z". Default: the world origin. Every written
+    /// header is translated so this point becomes the origin, which is where TORTOISE's
+    /// coefficient evaluation puts the isocentre.
+    #[arg(long, value_name = "X,Y,Z")]
+    isocenter: Option<String>,
+    /// GNL: skip the spatial warp (diffusion-encoding deviation only).
+    #[arg(long, requires = "gnl")]
+    gnl_no_warp: bool,
+    /// GNL: skip the diffusion-encoding deviation (spatial warp only).
+    #[arg(long, requires = "gnl")]
+    gnl_no_encoding: bool,
+    /// GNL: do not modulate warped intensities by 1/|det J|.
+    #[arg(long, requires = "gnl")]
+    gnl_no_jacobian_modulation: bool,
+    /// GNL: print the field envelope at 2/5/8/10/12 cm from the isocentre and exit.
+    #[arg(long, requires = "gnl")]
+    gnl_info: bool,
+
+    /// Also synthesize a dual-echo GRE fieldmap (magnitude1/magnitude2 + phasediff or
+    /// phase1/phase2, Siemens conventions, with sidecars) from the same off-resonance field, at
+    /// this BIDS stem. Sees the same GNL warp and --tissue-s0 as the DWI.
+    #[arg(long, value_name = "PREFIX")]
+    gre_out: Option<String>,
+    /// Tissue SNR of the synthetic GRE echoes (complex Gaussian noise on both echoes; 0 =
+    /// noiseless, with the phasediff's corner voxels stamped to 0/4095 so its range stays full
+    /// for min/max-based Siemens phase conversion).
+    #[arg(long, default_value_t = 50.0, requires = "gre_out")]
+    gre_snr: f64,
+    /// GRE fieldmap output resolution (isotropic mm). Default: the DWI acquisition grid. With a
+    /// value, the GRE is generated at that resolution by complex-averaging the fine-grid signal
+    /// onto the coarser grid (intravoxel dephasing) instead of sampling the field pointwise.
+    #[arg(long, value_name = "MM", requires = "gre_out")]
+    gre_res: Option<f64>,
+    /// B0 field identifier label for the GRE fieldmap (BIDS `B0FieldIdentifier`, which replaces
+    /// the deprecated `IntendedFor`). The DWI written in the same run carries the matching
+    /// `B0FieldSource`, so qsiprep links them automatically.
+    #[arg(long, default_value = "b0gre", value_name = "LABEL", requires = "gre_out")]
+    gre_b0field: String,
+    /// How the GRE SNR scales with voxel volume relative to the DWI acquisition resolution:
+    /// SNR ∝ V^exp, i.e. σ ∝ (V_dwi / V_gre)^exp. 1.0 (default) = fixed scan time and FOV;
+    /// 0.5 = fixed number of averages; 0 = constant σ at all resolutions.
+    #[arg(long, default_value_t = 1.0, value_name = "EXP", requires = "gre_out")]
+    gre_snr_vol_exp: f64,
+    /// GRE phase representation: `phasediff` (default, smooth single image) or `phase` (the two
+    /// individual echo phases `phase1`/`phase2`, which show the receiver-phase fringe wrapping of a
+    /// raw GRE and go through qsiprep's two-phase route).
+    #[arg(long, value_enum, default_value_t = GreOutput::Phasediff, requires = "gre_out")]
+    gre_output: GreOutput,
+    /// Peak amplitude (rad) of the smooth receiver/transmit phase φ₀ added to the individual echo
+    /// phases (`--gre-output phase`). Larger → more fringes. Cancels in the phase difference.
+    #[arg(long, default_value_t = 6.0, value_name = "RAD", requires = "gre_out")]
+    gre_rx_phase: f64,
+
+    /// Also write the ground-truth fibre orientations per acquisition voxel: up to three peaks
+    /// of the orientation mixture (aggregated over the oversampled cells, refined to sub-bin
+    /// accuracy), each a unit vector in world RAS scaled by its mass fraction, as a 9-volume
+    /// NIfTI `<out>_desc-truth_peaks.nii.gz`. Unaffected by the GNL warp: the mixture is the
+    /// object in its true frame.
+    #[arg(long)]
+    truth_peaks: bool,
 
     /// Global random seed: selects the noise/dropout realization and drives --subsample.
     /// The default (0) reproduces the historical output for identical inputs.
@@ -218,6 +308,26 @@ fn gen_dropout_events(bvals: &[f64], n_shots: usize, rate: f64, seed: u64) -> Ve
     evs
 }
 
+/// Parse a "a,b,c" triple.
+fn parse3(spec: &str, name: &str) -> Result<[f64; 3], String> {
+    let v: Vec<f64> = spec.split(',').map(|t| t.trim().parse::<f64>())
+        .collect::<Result<_, _>>().map_err(|_| format!("{name} expects three comma-separated numbers, got {spec:?}"))?;
+    if v.len() != 3 {
+        return Err(format!("{name} expects three comma-separated values, got {spec:?}"));
+    }
+    Ok([v[0], v[1], v[2]])
+}
+
+/// World position (RAS mm) of a continuous voxel coordinate on `grid`.
+fn voxel_to_world(grid: &Grid, p: [f64; 3]) -> [f64; 3] {
+    let w = &grid.voxel_to_world;
+    [
+        w[0][0] * p[0] + w[0][1] * p[1] + w[0][2] * p[2] + w[0][3],
+        w[1][0] * p[0] + w[1][1] * p[1] + w[1][2] * p[2] + w[1][3],
+        w[2][0] * p[0] + w[2][1] * p[1] + w[2][2] * p[2] + w[2][3],
+    ]
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let kappa = cli.kappa.filter(|k| *k > 0.0);
@@ -247,9 +357,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (st, sg, need_sim(&cli.sim_fmap, "sim-fmap")?)
     } else {
-        // `--fmap` is required HERE and only here: the legacy path is the only one that uses it.
+        eprintln!(
+            "WARNING: --oversample 1 puts the object on the reconstruction matrix, so the \
+             transforms are an exact round trip and the output has NO Gibbs ringing. Use \
+             --oversample 2 (default) or 4 for a realistic acquisition.");
         (tissue, grid.clone(), cli.fmap.clone().ok_or(
-            "--oversample 1 (the legacy path) requires --fmap, the acquisition-grid fieldmap. \
+            "--oversample 1 requires --fmap, the acquisition-grid fieldmap. \
              The default oversampled path takes --sim-fmap instead and ignores --fmap.")?)
     };
     let (mut positions, mut offsets, mut weights) =
@@ -260,13 +373,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut scheme = GradientScheme::from_fsl(&cli.bval, &cli.bvec)?;
     // ONE fieldmap load, on whichever grid the signal stage runs on -- `--sim-fmap` when
-    // oversampling, `--fmap` on the legacy path. Loading and grid-checking `--fmap` here as well
-    // made a default run depend on a file whose values could not influence its output.
-    let (fmap, fgrid) = io::load_volume(&sig_fmap_path)?;
+    // oversampling, `--fmap` at o = 1.
+    let (mut fmap, fgrid) = io::load_volume(&sig_fmap_path)?;
     if fgrid.dims != sig_grid.dims {
         return Err(format!("fieldmap grid {:?} != signal grid {:?}",
                            fgrid.dims, sig_grid.dims).into());
     }
+
+    // Scanner isocentre: translate the world frame so it sits at the origin. Streamlines live in
+    // world mm and are rasterised through the grid affines, so they move with the grids.
+    let mut sig_grid = sig_grid;
+    if let Some(spec) = &cli.isocenter {
+        let v = parse3(spec, "--isocenter")?;
+        for r in 0..3 {
+            grid.voxel_to_world[r][3] -= v[r];
+            sig_grid.voxel_to_world[r][3] -= v[r];
+        }
+        for p in positions.iter_mut() {
+            for r in 0..3 {
+                p[r] -= v[r];
+            }
+        }
+        println!("isocenter: world point {:?} mm moved to the origin", v);
+    }
+
+    // Gradient nonlinearity: the coefficient set and its field on the signal grid.
+    let gnl: Option<(GradCoef, GnlField)> = if let Some(spec) = &cli.gnl {
+        let mut coef = GradCoef::from_spec(spec).map_err(|e| format!("--gnl: {e}"))?;
+        coef.scale_nonlinear(cli.gnl_scale);
+        let t = Instant::now();
+        let field_sig = GnlField::on_grid(&coef, &sig_grid);
+        println!("GNL: {} ({} terms, scale {}), field built in {:?}",
+            spec, coef.terms.len(), cli.gnl_scale, t.elapsed());
+        for radius in [20.0, 50.0, 80.0, 100.0, 120.0] {
+            let e = field_sig.envelope(&sig_grid, radius);
+            println!("  within {radius:>5.0} mm: {:>7} voxels  max |d| {:.2} mm  max gradient dev {:.2} %  max angle {:.2} deg",
+                e.n_voxels, e.max_disp_mm, 100.0 * e.max_gradient_dev, e.max_angle_deg);
+        }
+        if cli.gnl_info {
+            return Ok(());
+        }
+        Some((coef, field_sig))
+    } else {
+        None
+    };
+    let gnl_encoding = gnl.as_ref().filter(|_| !cli.gnl_no_encoding).map(|(_, f)| f);
+    let gnl_warp = gnl.as_ref().filter(|_| !cli.gnl_no_warp).map(|(_, f)| (f, !cli.gnl_no_jacobian_modulation));
     println!("acquisition grid {:?}  signal grid {:?}  {} streamlines  {} volumes  shells {:?}",
         grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
         scheme.shells(50.0));
@@ -332,7 +484,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let base = cli.params.params();
+    let mut base = cli.params.params();
+    if let Some(spec) = &cli.diff_scale {
+        let s = parse3(spec, "--diff-scale")?;
+        base.d_intra *= s[0];
+        base.d_extra = (base.d_extra.0 * s[0], base.d_extra.1 * s[0], base.d_extra.2 * s[0]);
+        base.d_gm *= s[1];
+        base.d_soma *= s[1];
+        base.d_csf *= s[2];
+        println!("diffusivity scale: wm x{} gm x{} csf x{}", s[0], s[1], s[2]);
+    }
+    let tissue_s0: [f32; 3] = match &cli.tissue_s0 {
+        Some(spec) => {
+            let s = parse3(spec, "--tissue-s0")?;
+            println!("tissue s0: fiber {} gm {} csf {}", s[0], s[1], s[2]);
+            [s[0] as f32, s[1] as f32, s[2] as f32]
+        }
+        None => [1.0; 3],
+    };
     println!("compartment params: {}  T2 fiber/gm/csf {}/{}/{} ms",
         cli.params, base.t2_fiber, base.t2_gm, base.t2_csf);
     let params = CompartmentParams { b_value: scheme.b_max, ..base };
@@ -341,9 +510,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // by that volume's pose and re-simulate (Fiberfox-style). Otherwise the histogram-first
     // mixture path — SIFT2 weights + Watson κ dispersion, and the same
     // mixture `trxscan-microstructure` computes ground truth from.
+    let mut truth_peaks: Option<Vec<f32>> = None;
     let mut comp = if let Some(tsv) = &cli.motion {
+        // The per-segment path has no orientation mixture, so everything that lives on the
+        // mixture is unavailable. Refuse rather than silently ignore.
         if weights.is_some() || kappa.is_some() {
             eprintln!("note: weights/kappa are ignored in motion mode (per-segment re-simulation)");
+        }
+        if cli.myelin.is_some() {
+            return Err("--myelin is not supported together with --motion (per-segment path)".into());
+        }
+        if cli.truth_peaks {
+            return Err("--truth-peaks is not available together with --motion (no orientation mixture)".into());
+        }
+        if gnl.is_some() {
+            return Err("--gnl is not supported together with --motion yet".into());
         }
         let poses = motion::load_motion_tsv(tsv)?;
         let moved = poses.iter().filter(|p| **p != motion::Pose::IDENTITY).count();
@@ -366,6 +547,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("myelin map: {} (per-voxel lerp to adult endpoint)", mp.display());
             mix.myelin = Some(my);
         }
+        if cli.truth_peaks {
+            truth_peaks = Some(trxscan::truth::truth_peaks(&mix, cli.oversample.max(1), 3));
+        }
         let fb = mix.fallback.iter().filter(|&&f| f == 1).count();
         println!(
             "Mixture: {} fallback WM voxels{}{}",
@@ -373,9 +557,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if weights.is_some() { ", SIFT2-weighted" } else { "" },
             kappa.map(|k| format!(", Watson kappa {k}")).unwrap_or_default()
         );
-        signal_from_mixture(&mix, &scheme)
+        signal_from_mixture_gnl(&mix, &scheme, gnl_encoding)
     };
     println!("Signal stage (per-compartment signal): {:?}  T2 {:?}", t.elapsed(), comp.t2);
+    comp.apply_s0(tissue_s0);
 
     // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
@@ -396,47 +581,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.mb, gt.len(), cli.out);
     }
 
-    // HBCD-like acquisition, per-compartment T2, optional Rician noise. The PE-train duration
-    // is pinned to the HBCD protocol's TotalReadoutTime (0.0917 s) for ANY matrix:
-    // distortion shift = fmap · ny · t_line, so t_line = 91.7 ms / ny.
+    // Gradient nonlinearity, spatial part: the scanner encodes tissue at φ(r), so every
+    // compartment image and the off-resonance field move to the apparent frame before k-space
+    // encoding (kspace looks the field up at the voxel it is encoding).
+    if let Some((field_sig, modulate)) = gnl_warp {
+        let t = Instant::now();
+        for img in comp.images.iter_mut() {
+            *img = field_sig.warp_4d(img, comp.ngrad, modulate);
+        }
+        fmap = field_sig.warp_volume(&fmap, false);
+        println!("GNL spatial warp of {} compartment images + fieldmap: {:?}", comp.images.len(), t.elapsed());
+    }
+
+    // The HBCD-like protocol; the flags override its artifact knobs.
     let acq = Acquisition {
-        t_line: 91.7 / grid.dims[1] as f64,
-        t_echo: 88.0,
-        t_inhom: 50.0,
         signal_scale: 100.0,
         reverse_phase: cli.reverse_pe,
-        do_distortions: true,
-        do_relaxation: true,
         noise_variance: cli.noise,
-        partial_fourier: 0.75,  // HBCD
-        // Defaults to CONTIGUOUS: this CLI describes itself as HBCD-like, and a scanner produces
-        // contiguous PF. The Fiberfox rule keeps ~78% at a nominal 6/8 because it preserves line
-        // zero on even matrices; it stays available via --pf-mode fiberfox.
         pf_mode: match cli.pf_mode.as_str() {
             "contiguous" => PartialFourierMode::Contiguous,
             "fiberfox" => PartialFourierMode::FiberfoxCompatible,
             o => return Err(format!("unknown --pf-mode {o:?}; expected contiguous or fiberfox").into()),
         },
-        ghost_offset: 0.015,    // subtle residual Nyquist ghost
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,
-        eddy_tau: 70.0,
-        n_spikes: 0,            // spikes are rare/aggressive; left off (available)
-        spike_amplitude: 1.0,
-        window: KspaceWindow::None,  // unapodized; ringing comes from the crop when --oversample > 1
+        eddy_phase: cli.eddy_phase,
         n_coils: cli.coils,
         accel: cli.accel,
-        acs_lines: 24,
         seed: cli.seed,
+        ..Acquisition::hbcd(grid.dims[1])
     };
-    // per-volume eddy gradient = unit bvec × b-value (b0 → zero → no eddy)
-    let gradients: Vec<[f64; 3]> = (0..scheme.len())
-        .map(|g| {
-            let (d, b) = (scheme.bvecs[g], scheme.bvals[g]);
-            [d[0] * b, d[1] * b, d[2] * b]
-        })
-        .collect();
-    let t = Instant::now();
+
+    // Dual-echo GRE fieldmap from the same object: magnitudes from the tissue mixture with the
+    // compartment T2s, phase from the (already warped) off-resonance field.
+    let gre_fieldmap = if let Some(prefix) = &cli.gre_out {
+        let p = GreParams {
+            snr: cli.gre_snr,
+            res_mm: cli.gre_res,
+            snr_vol_exp: cli.gre_snr_vol_exp,
+            output: cli.gre_output,
+            rx_phase_rad: cli.gre_rx_phase,
+            b0_field: cli.gre_b0field.clone(),
+            ..Default::default()
+        };
+        let g = gre::synthesize(&GreObject {
+            sig_grid: &sig_grid,
+            acq_grid: &grid,
+            fractions: [&sig_tissue.wm, &sig_tissue.gm, &sig_tissue.csf],
+            s0: tissue_s0,
+            t2_ms: &comp.t2,
+            fmap_hz: &fmap,
+            warp: gnl_warp,
+            signal_scale: acq.signal_scale,
+            seed: cli.seed,
+        }, &p);
+        println!(
+            "GRE fieldmap: TE {:.2}/{:.2} ms, {}, {}, tissue SNR {} (sigma {:.3}){}",
+            p.te_s[0] * 1e3, p.te_s[1] * 1e3,
+            match p.output {
+                GreOutput::Phase => format!("phase1/phase2 (rx-phase {:.1} rad)", p.rx_phase_rad),
+                GreOutput::Phasediff => "phasediff".to_string(),
+            },
+            match p.res_mm {
+                Some(r) => format!("{r} mm iso {:?} (complex intravoxel averaging)", g.grid.dims),
+                None => "DWI acquisition grid".to_string(),
+            },
+            p.snr, g.sigma,
+            if g.stamped { "; corner voxels stamped to 0/4095 so the phasediff spans its full range" } else { "" }
+        );
+        Some((prefix.clone(), g))
+    } else {
+        None
+    };
+
+    // Optional spatially-varying noise level map (acquisition grid, per-voxel per-component SD).
+    let noise_sigma: Option<Vec<f32>> = if let Some(nmp) = &cli.noise_map {
+        let (nm, ng) = io::load_volume(nmp)?;
+        if ng.dims != grid.dims {
+            return Err(format!(
+                "--noise-map grid {:?} != acquisition grid {:?}", ng.dims, grid.dims).into());
+        }
+        println!("noise level map: {} (spatially-varying complex noise; ground truth written)",
+            nmp.display());
+        Some(nm)
+    } else {
+        None
+    };
 
     let phase_model = match cli.phase_model.as_str() {
         "hbcd" => PhaseModel::hbcd_like(),
@@ -444,23 +674,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => return Err(format!("unknown --phase-model {other:?}; expected hbcd or none").into()),
     };
 
-    let (mut mag, mut phase) = if cli.oversample > 1 {
-        // `comp` was already built on the simulation grid above, so motion, SIFT2 weights, kappa,
-        // myelin and dropout all apply here exactly as they do on the nominal path.
-        println!("Stage B (oversampled o={}: intrinsic Gibbs + object phase '{}')",
-                 cli.oversample, cli.phase_model);
-        simulate_acquisition_oversampled(
-            sig_grid.dims, grid.dims, comp.ngrad, &comp.images, &comp.t2,
-            &fmap, &acq, &scheme.bvals, &scheme.bvecs, &phase_model, cli.seed)
-    } else {
-        eprintln!(
-            "WARNING: --oversample 1 uses the legacy path. The object sits on the reconstruction \
-             matrix, so the transforms are an exact round trip: the output will contain NO Gibbs \
-             ringing and no object phase. Use --oversample 2 (default) or 4 for a realistic \
-             acquisition.");
-        simulate_acquisition_legacy(
-            grid.dims, comp.ngrad, &comp.images, &comp.t2, &fmap, &acq, &gradients)
-    };
+    let t = Instant::now();
+    println!("Stage B (o={}: {}object phase '{}')",
+        cli.oversample, if cli.oversample > 1 { "intrinsic Gibbs + " } else { "" }, cli.phase_model);
+    let (mut mag, mut phase) = simulate_acquisition(
+        &SimulationInput {
+            sim_dims: sig_grid.dims,
+            acq_dims: grid.dims,
+            ngrad: comp.ngrad,
+            images: &comp.images,
+            t2: &comp.t2,
+            fmap: &fmap,
+            bvals: &scheme.bvals,
+            bvecs: &scheme.bvecs,
+            phase: &phase_model,
+            seed: cli.seed,
+            noise_sigma: noise_sigma.as_deref(),
+        },
+        &acq,
+    );
     println!("Stage B: {:?}", t.elapsed());
 
     // Resolve the output orientation + PhaseEncodingDirection. PE is the grid y/j axis; a positive
@@ -481,10 +713,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         phase = reo.apply_volume(&phase, comp.ngrad);
         grid.voxel_to_world = reo.apply_affine(&grid.voxel_to_world);
         grid.dims = reo.out_dims;
-        for b in scheme.bvecs.iter_mut() {
-            *b = reo.apply_bvec(*b);
-        }
         println!("Reoriented output to FSL/dcm2niix (LAS), PhaseEncodingDirection={phase_encoding_direction}");
+    }
+    // The scheme's directions are world (RAS) -- that is how the signal encoded them and how
+    // the truth peaks are written -- and FSL bvecs are voxel-frame with the determinant rule.
+    for b in scheme.bvecs.iter_mut() {
+        *b = Reorient::fsl_bvec(*b, &grid.voxel_to_world);
     }
 
     let sidecar = io::SidecarInfo {
@@ -494,9 +728,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         partial_fourier: acq.partial_fourier,
         accel: cli.accel,
         mb: cli.mb,
+        // When a GRE fieldmap is written this run, tag the DWI as its B0FieldSource.
+        b0_field_source: gre_fieldmap.as_ref().map(|(_, g)| g.b0_field.clone()),
     };
 
     io::write_complex_dwi(&cli.out, grid.dims, comp.ngrad, &mag, &phase, &grid, &scheme, &sidecar)?;
     println!("wrote BIDS {}_part-{{mag,phase}}_dwi.nii.gz (+bval/bvec/json)", cli.out);
+    if let Some(ns) = &noise_sigma {
+        let ns_out = if cli.fsl_orientation { reo.apply_volume(ns, 1) } else { ns.clone() };
+        io::write_4d(&PathBuf::from(format!("{}_desc-noise_sigma.nii.gz", cli.out)),
+            grid.dims, 1, &ns_out, &grid)?;
+        println!("wrote noise-level ground truth {}_desc-noise_sigma.nii.gz", cli.out);
+    }
+
+    if let Some((prefix, g)) = &gre_fieldmap {
+        io::write_gre_fieldmap(prefix, g, cli.fsl_orientation)?;
+        match g.output {
+            GreOutput::Phase => println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phase{{1,2}} (+json)"),
+            GreOutput::Phasediff => println!("wrote GRE fieldmap {prefix}_magnitude{{1,2}}/_phasediff (+json)"),
+        }
+    }
+
+    if let Some(pk) = truth_peaks.as_ref() {
+        let vol = reo.apply_volume(pk, 9);
+        io::write_4d(&PathBuf::from(format!("{}_desc-truth_peaks.nii.gz", cli.out)), grid.dims, 9, &vol, &grid)?;
+        std::fs::write(format!("{}_desc-truth_peaks.json", cli.out),
+            "{\n  \"Description\": \"Ground-truth fibre orientations: up to 3 peaks of the orientation mixture per voxel, volumes 3k..3k+2 = peak k as a unit vector in world RAS scaled by its mass fraction (0 = no peak). Object in its true (gradient-nonlinearity-free) frame.\"\n}\n")?;
+        println!("wrote truth peaks {}_desc-truth_peaks.nii.gz", cli.out);
+    }
+    if let Some((coef, _)) = gnl.as_ref() {
+        std::fs::write(format!("{}_desc-gnl_coeff.grad", cli.out), coef.write_siemens())?;
+        // Truth on the written (possibly reoriented) grid: the field is world-defined, so it is
+        // simply re-evaluated there. Forward displacement d(r) = φ(r) − r warps points/streamlines
+        // (true → apparent); the inverse φ⁻¹(x) − x pulls images (apparent ← true).
+        let field_out = GnlField::on_grid(coef, &grid);
+        let nvox = grid.dims.iter().product::<usize>();
+        let (nx, ny) = (grid.dims[0], grid.dims[1]);
+        let mut disp = vec![0.0f32; nvox * 3];
+        let mut inv = vec![0.0f32; nvox * 3];
+        for v in 0..nvox {
+            disp[v * 3..v * 3 + 3].copy_from_slice(&field_out.disp[v]);
+            let sv = field_out.src_vox[v];
+            let src = voxel_to_world(&grid, [sv[0] as f64, sv[1] as f64, sv[2] as f64]);
+            let here = voxel_to_world(&grid, [(v % nx) as f64, ((v / nx) % ny) as f64, (v / (nx * ny)) as f64]);
+            for c in 0..3 {
+                inv[v * 3 + c] = (src[c] - here[c]) as f32;
+            }
+        }
+        io::write_4d(&PathBuf::from(format!("{}_desc-gnl_disp.nii.gz", cli.out)), grid.dims, 3, &disp, &grid)?;
+        io::write_4d(&PathBuf::from(format!("{}_desc-gnl_invdisp.nii.gz", cli.out)), grid.dims, 3, &inv, &grid)?;
+        let graddev = field_out.graddev_volumes(&grid);
+        io::write_4d(&PathBuf::from(format!("{}_desc-gnl_graddev.nii.gz", cli.out)), grid.dims, 9, &graddev, &grid)?;
+        std::fs::write(format!("{}_desc-gnl_graddev.json", cli.out), format!(
+            "{{\n  \"Description\": \"Ground-truth gradient deviation: 9 volumes, HCP/FSL layout; read row-major into T, the applied gradient in this image's voxel axes is T.T @ g; identity included.\",\n  \"GradientNonlinearity\": \"{}\",\n  \"GradientNonlinearityScale\": {},\n  \"SpatialWarpApplied\": {},\n  \"EncodingDeviationApplied\": {},\n  \"JacobianModulation\": {}\n}}\n",
+            cli.gnl.as_deref().unwrap_or(""), cli.gnl_scale, !cli.gnl_no_warp, !cli.gnl_no_encoding, !cli.gnl_no_jacobian_modulation))?;
+        std::fs::write(format!("{}_desc-gnl_disp.json", cli.out),
+            "{\n  \"Description\": \"Ground-truth gradient-nonlinearity displacement d(r) = phi(r) - r at each voxel centre r, three volumes = RAS x,y,z in mm (apparent minus true position). Apply to points/streamlines to warp true -> apparent.\"\n}\n")?;
+        std::fs::write(format!("{}_desc-gnl_invdisp.json", cli.out),
+            "{\n  \"Description\": \"Inverse gradient-nonlinearity displacement phi^-1(x) - x at each voxel centre x, three volumes = RAS x,y,z in mm (true minus apparent position). Resample images through it to pull apparent <- true.\"\n}\n")?;
+        println!("wrote GNL truth {}_desc-gnl_{{coeff.grad,disp,invdisp,graddev}}", cli.out);
+    }
     Ok(())
 }

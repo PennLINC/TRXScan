@@ -129,6 +129,27 @@ impl Reorient {
         out
     }
 
+    /// FSL-convention bvec for a world (RAS) gradient direction on the grid with this affine.
+    ///
+    /// FSL bvecs are voxel-frame components, with the first component negated when the
+    /// voxel-to-world transform has a positive determinant. Nothing here is a property of the
+    /// reorientation, so the same conversion serves every output orientation.
+    pub fn fsl_bvec(g_ras: [f64; 3], affine: &[[f64; 4]; 4]) -> [f64; 3] {
+        let mut v = [0.0f64; 3];
+        for (a, item) in v.iter_mut().enumerate() {
+            let n = (0..3).map(|r| affine[r][a] * affine[r][a]).sum::<f64>().sqrt();
+            *item = (0..3).map(|r| affine[r][a] * g_ras[r]).sum::<f64>() / n;
+        }
+        let m = &affine;
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        if det > 0.0 {
+            v[0] = -v[0];
+        }
+        v
+    }
+
     /// Transform a bvec (image/voxel-frame gradient direction) consistently with the axis remap:
     /// reorder to the output axes and negate the flipped ones.
     pub fn apply_bvec(&self, b: [f64; 3]) -> [f64; 3] {
@@ -164,6 +185,23 @@ mod tests {
         assert_eq!(r.src, [0, 1, 2]);
         assert_eq!(r.flip, [false, true, false]);
         assert_eq!(r.out_dims, [4, 5, 6]);
+    }
+
+    #[test]
+    fn fsl_bvec_follows_the_determinant_rule_on_lps_and_las_grids() {
+        let g = [0.3, -0.5, 0.812];
+        // LPS+ (det > 0): voxel components (-x, -y, z), then FSL negates the first.
+        let lps = [[-1.7, 0.0, 0.0, 10.0], [0.0, -1.7, 0.0, 20.0], [0.0, 0.0, 1.7, -5.0], [0.0, 0.0, 0.0, 1.0]];
+        let v = Reorient::fsl_bvec(g, &lps);
+        assert!((v[0] - 0.3).abs() < 1e-12 && (v[1] - 0.5).abs() < 1e-12 && (v[2] - 0.812).abs() < 1e-12, "{v:?}");
+        // LAS (det < 0): voxel components (-x, y, z), no negation.
+        let las = [[-1.7, 0.0, 0.0, 10.0], [0.0, 1.7, 0.0, -20.0], [0.0, 0.0, 1.7, -5.0], [0.0, 0.0, 0.0, 1.0]];
+        let v = Reorient::fsl_bvec(g, &las);
+        assert!((v[0] + 0.3).abs() < 1e-12 && (v[1] + 0.5).abs() < 1e-12 && (v[2] - 0.812).abs() < 1e-12, "{v:?}");
+        // RAS (det > 0): components as-is, first negated.
+        let ras = [[1.7, 0.0, 0.0, 0.0], [0.0, 1.7, 0.0, 0.0], [0.0, 0.0, 1.7, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let v = Reorient::fsl_bvec(g, &ras);
+        assert!((v[0] + 0.3).abs() < 1e-12 && (v[1] + 0.5).abs() < 1e-12);
     }
 
     #[test]

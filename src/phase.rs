@@ -39,7 +39,7 @@ impl Rng {
 /// phases that GRAPPA and coil combination depend on.
 ///
 /// Coefficient order: `1, x, y, z, x^2, y^2, z^2, xy, xz, yz`, in voxel units from the FOV centre.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BackgroundPhase {
     pub coeffs: [f64; 10],
 }
@@ -131,8 +131,20 @@ impl PhaseModel {
 
     /// A preset tuned to the HBCD-protocol NIBS data (spec 4.2).
     ///
-    /// Calibrated 2026-09-01 from NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices
-    /// (`scripts/calibration_nibs.json`), with the two terms held to different standards.
+    /// Calibrated 2026-09-01 from NIBS sub-60515 ses-01 dir-AP run-01, central 5 slices, with
+    /// the two terms held to different standards. The measured targets (circular SD of the WM
+    /// phase per shell, and the WM magnitude SNR the thermal floor was modelled from):
+    ///
+    /// | b | circular SD (rad) | SNR |
+    /// |---|---|---|
+    /// | 500 | 1.079 | 337 |
+    /// | 1000 | 1.348 | 225 |
+    /// | 2000 | 1.856 | 115 |
+    /// | 3000 | 2.311 | 66 |
+    ///
+    /// Siemens phase provenance: stored uint16 0..4095 (nibabel applies slope 2 / inter −4096),
+    /// so `rad = scaled · π/4096`, equivalently `unscaled · 2π/4096 − π`
+    /// (`scripts/calibrate_phase.py`).
     ///
     /// **Background is TUNED, not fitted.** Its gradient matches the measured 0.164 rad/voxel,
     /// pinned by a test. Reconstructed phase mixes magnetization, coil and combination, scanner

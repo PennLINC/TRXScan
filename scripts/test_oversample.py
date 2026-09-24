@@ -1,5 +1,5 @@
 """Checks --oversample emits a sim grid that is an exact integer refinement of the acq grid."""
-import subprocess, sys, pathlib
+import os, subprocess, sys, pathlib
 
 import pytest
 
@@ -10,8 +10,9 @@ nib = pytest.importorskip("nibabel")
 
 def test_sim_grid_is_integer_refinement(tmp_path):
     here = pathlib.Path(__file__).parent
-    # The truth-data bundle is a sibling of the TRXScan repo, not part of it.
-    root = here.parent.parent / "data" / "trxscan_truth_data"
+    # The reference bundle is not part of the repo: $TRXSCAN_REFERENCE, else
+    # ~/projects/trxscan-reference (the same default tools/roundtrip_fieldmap_test.py uses).
+    root = pathlib.Path(os.environ.get("TRXSCAN_REFERENCE", pathlib.Path.home() / "projects/trxscan-reference"))
     if not (root / "sub-0001a" / "anat").is_dir():
         import pytest
         pytest.skip(f"truth-data bundle not found at {root}", allow_module_level=False)
