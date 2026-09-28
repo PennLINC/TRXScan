@@ -4,15 +4,15 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 ## What this is
 
-A headless diffusion-MRI simulator: the MITK Fiberfox simulation math re-implemented in Rust on
-`trx-rs`/`odx-rs`, plus what Fiberfox can't do (within-volume/multiband motion, GRAPPA, complex
-magnitude+phase output, gradient nonlinearity, a matching synthetic GRE fieldmap). Input:
-tractogram + tissue volume-fraction maps + FSL bval/bvec (+ fieldmap). Output: BIDS complex 4D
-DWI (`part-mag`/`part-phase`) + bval/bvec (+ ground-truth maps). A companion binary emits
-analytic ground-truth microstructure maps from the same per-voxel mixture. The simulator is
-considered feature-complete; the next step is Python bindings for a "dMRI and its artifacts"
-Jupyter book, so keep the library surface (structs in, structs out) the thing that grows, not
-the CLI.
+A headless diffusion-MRI simulator in Rust with a Python package. The signal and k-space
+models were ported from MITK Fiberfox; the acquisition model has been extended since with
+within-volume/multiband motion, GRAPPA, complex magnitude+phase output, scanner-style partial
+Fourier, gradient nonlinearity, a synthetic GRE fieldmap and analytic microstructure ground
+truth. Input: tractogram + tissue volume-fraction maps + FSL bval/bvec (+ fieldmap). Output:
+BIDS complex 4D DWI (`part-mag`/`part-phase`) + bval/bvec (+ ground-truth maps). A companion
+binary emits the microstructure maps from the same per-voxel mixture. The Python package
+(`python/`) wraps the library surface (structs in, structs out) for a "dMRI and its artifacts"
+Jupyter book, so keep that surface the thing that grows, not the CLI.
 
 ## Commands
 
@@ -74,7 +74,7 @@ are `--wm/--gm/--csf/--mask/--streamlines` (+ `--bval/--bvec` and `--sim-*` or `
 
 ## Architecture
 
-Two stages, mirroring Fiberfox's own split:
+Two stages (the split Fiberfox also uses):
 
 ```
 Signal   streamlines + tissue maps + scheme → clean per-voxel, per-gradient signal
@@ -100,7 +100,7 @@ feature `kspace`), `gnl` (gradient nonlinearity: coefficients, field, warp, grad
 Three binaries (all `--features cli`): `trxscan` (full simulation), `trxscan-microstructure`
 (ground-truth scalar maps from tractogram + tissue — no acquisition; supports Watson κ dispersion
 and TRX dps SIFT2 weights) and `trxscan-benchmark`. The first two take a `--params` preset —
-`neonatal` (default; Fiberfox ffp legacy, T2s nearly cancel at TE 88 → weak low-b GM/WM
+`neonatal` (default; Fiberfox's ffp values, T2s nearly cancel at TE 88 → weak low-b GM/WM
 contrast), `adult` (literature diffusivities; T2s 68/76 ms from a 3T EPI relaxometry fit, which
 the literature 70/100 overpredicted GM with), or `infant` (unmyelinated-WM diffusivities) — and an
 optional per-voxel `--myelin` map (0..1; lerps
@@ -127,8 +127,8 @@ needs `--gre-out`, `--gnl-*` needs `--gnl`) via clap `requires`; keep new knobs 
   `kspace` can apply per-compartment T2 relaxation. `Compartments::mixed()` collapses them.
 - **Streamlines and tissue maps must share a world (RAS mm) frame.** The rasterizer maps world → the
   DWI grid's own (possibly oblique) affine; nothing re-registers for you.
-- **`kspace` is the exact O(N³) sum, not an approximation of it** — no FFT-convention ambiguity
-  while validating against Fiberfox. It is *organised* for speed without changing a term: static
+- **`kspace` is the O(N³) per-line sum, not an approximation of it** — there is no FFT-convention
+  ambiguity to track. It is *organised* for speed without changing a term: static
   factors hoisted, the affine-in-ky phase (fieldmap, eddy shear, y-DFT kernel) advanced by
   memoised per-voxel rotors, the eddy polynomial factored per axis, and the per-line x-DFT plus
   the 2-D reconstruction done by `rustfft` (feature `kspace`) or twiddle-table sums (default).
@@ -138,9 +138,9 @@ needs `--gre-out`, `--gnl-*` needs `--gnl`) via clap `requires`; keep new knobs 
   the fieldmap read as a source warp `y − sny·τ·fmap` — so the whole forward is O(N log N) except
   the legacy `--eddy` polynomial (non-affine time profile), which keeps the O(N³) rotor path.
   Production Stage B: ~145 s → 8 s; the default std-only build (twiddle tables, rotors) ~40 s.
-- **Two motion paths, very different fidelity.** `compartments::generate_compartments_moving` is the
-  faithful one (re-transforms streamlines per volume and re-simulates, so fiber–gradient angles
-  change); `motion::apply_motion` only resamples the finished images and misses the directional
+- **Two motion paths, different fidelity.** `compartments::generate_compartments_moving`
+  re-transforms streamlines per volume and re-simulates, so fiber–gradient angles change;
+  `motion::apply_motion` only resamples the finished images and misses the directional
   effect. `motion::apply_multiband_motion` layers within-volume shot jumps + b-scaled dropout on top
   and returns the dropped-slice ground truth.
 - **Rayon accumulation in `compartments` is deliberately chunked, not `fold`ed** — see the comment
@@ -152,7 +152,7 @@ needs `--gre-out`, `--gnl-*` needs `--gnl`) via clap `requires`; keep new knobs 
   + `microstructure::field_scalars` derive signal and truth from one object (docs/FORCE.md §3). The
   fallback contract matters: WM voxels with no streamline support must be treated as an isotropic
   Gaussian at `md_fallback()` by *both* consumers.
-- **`microstructure` is a faithful dipy port — don't "fix" its conventions.** Branch thresholds,
+- **`microstructure` is a port of dipy's closed forms — don't "fix" its conventions.** Branch thresholds,
   kurtosis clips ([-3/7, 3] for MK; [-3/7, 10] for AK/RK/MKT), Carlson errtols, and guard values
   are dipy's, on purpose; the fixture diff enforces them. Change behaviour only together with
   regenerated fixtures.
@@ -191,22 +191,29 @@ real phantom. Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do n
 CLI build's HDF5 compile. Release: tag `X.Y.Z` (no `v`) matching `[workspace.package].version`
 (`.github/workflows/release.yml` builds manylinux/musllinux/macOS/Windows wheels and publishes).
 
-## Fiberfox is the oracle
+## Origins and reference anchors
 
-Nearly every module's doc comment carries a `file:line` anchor into the MITK-Diffusion source
-(a local checkout of github.com/MIC-DKFZ/MITK-Diffusion; e.g.
+The modules ported from Fiberfox (`raster`, `signal`, `scheme`, the original per-segment path in
+`compartments`, the between-volume generators in `motion`, and the distortion / relaxation / eddy
+/ ghost / partial-Fourier / spike / noise terms in `kspace`) carry `file:line` anchors into the
+MITK-Diffusion source in their doc comments (a local checkout of
+github.com/MIC-DKFZ/MITK-Diffusion; e.g.
 `Modules/MriSimulation/Algorithms/itkKspaceImageFilter.cpp:452`). Read the anchor before changing
-physics. `docs/FINDINGS.md` decomposes that source; `docs/FEATURES.md` designs the
-multiband-motion and GRAPPA extensions; `docs/FORCE.md` covers the ground-truth microstructure
-scalars (FORCE closed forms, dipy as the fixture oracle) and sourcing compartment fractions, fibre
-density (SIFT2 / AFD), and fixel dispersion from CONSH.
+that physics, and keep the anchors accurate. Everything else (the histogram signal stage,
+multiband motion, GRAPPA, complex output, object phase, scanner partial Fourier, the FFT/NUFFT
+path, GNL, GRE, microstructure, the Python package) is TRXScan's own and is documented by its
+tests and `docs/`. `docs/FINDINGS.md` decomposes the Fiberfox source; `docs/FEATURES.md` is the
+design note for multiband motion and GRAPPA; `docs/GNL.md` for gradient nonlinearity;
+`docs/FORCE.md` covers the ground-truth microstructure scalars (FORCE closed forms, dipy as the
+fixture oracle) and sourcing compartment fractions, fibre density (SIFT2 / AFD), and fixel
+dispersion from CONSH.
 
 ## Not implemented (don't assume from the module list)
 
 `noise.rs` and `config.rs` are `todo!()` stubs — k-space noise lives inline in `kspace.rs`, so
 `noise.rs` is dead code, and there is no TOML config (the protocol is `Acquisition::hbcd` in the
 library, overridden field-by-field from the flags in `src/bin/trxscan.rs`). ODX ground-truth
-export, GNL together with `--motion`, and any oracle diff against Fiberfox are unwritten. Per-fixel
+export, GNL together with `--motion`, and any numerical comparison against Fiberfox are unwritten. Per-fixel
 κ from CONSH fixels (vs the current global κ) and the disp(κ) LUT are future work
 (docs/FORCE.md §4c). The one-subject realism-tuning pipeline (MESE/MEGRE relaxometry fits, the
 HTML report) was moved out of this repo into the nibs reference kit; `scripts/` keeps only the

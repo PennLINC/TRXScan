@@ -1,15 +1,16 @@
-# Extensions: multiband motion and GRAPPA
+# Design note: multiband motion and GRAPPA
 
-The two capabilities TRXScan adds beyond Fiberfox. Both extend the k-space stage; Fiberfox can't
-do either because its acquisition model is volume-level and single-image, whereas in a clean Rust
-design they fall out naturally.
+The first two extensions of the k-space stage beyond the ported Fiberfox model (later ones,
+gradient nonlinearity and the GRE fieldmap, have their own note in `GNL.md`). Fiberfox's
+acquisition model is volume-level and single-image, so neither exists there; TRXScan's per-slice
+acquisition stage is where they attach.
 
 **Status: the design note below predates the implementation. What was built differs in three
 places:**
 
 - *Multiband motion* is the "cheaper first cut" of §1: `motion::apply_multiband_motion` keeps the
   whole-volume signal and resamples the finished images per slice-group, layering within-volume
-  shot jumps and b-scaled dropout on top (with the dropped-slice ground truth). The faithful
+  shot jumps and b-scaled dropout on top (with the dropped-slice ground truth). The
   per-volume re-simulation (`compartments::generate_compartments_moving`) is volume-level only.
 - *GRAPPA* (§2) is as designed except the coil combination: it is a Roemer combine with the
   known sensitivities, not RSS (`kspace.rs`, `simulate_slice`).
@@ -18,7 +19,7 @@ places:**
 
 ## 1. Within-volume motion under multiband
 
-**Why Fiberfox can't.** Signal is generated once per volume at one pose
+**Where the Fiberfox model stops.** Signal is generated once per volume at one pose
 (`itkTractsToDWIImageFilter.cpp:1018`); all slices of that volume share it. The `AcquisitionType`
 interface has **no slice-dimension timing** (`Sequences/mitkAcquisitionType.h:41`) — slices are just
 looped. So motion can only change between volumes.
@@ -29,7 +30,7 @@ looped. So motion can only change between volumes.
    `n_slices/mb`), acquired in an interleaved order over the TR. Produces, per volume, a list of
    *slice-groups* each with an acquisition time `t_group` → a head pose `P(volume, group)` sampled
    from the motion trajectory.
-2. **Per-slice-group signal.** For faithful slice-level motion the slice's *content* must be
+2. **Per-slice-group signal.** For slice-level motion the slice's *content* must be
    generated at its group's pose, not the volume pose. Restructure the signal stage to
    `volume → slice-group → pose → paint only that group's slices`. Cost ≈ ×(`n_slices/mb`) the fiber
    loop per volume (bounded, `rayon`-parallel). A cheaper first cut: keep whole-volume signal but
@@ -45,7 +46,7 @@ future work.
 
 ## 2. GRAPPA (parallel imaging)
 
-**Big head start.** Fiberfox already synthesizes a **per-coil complex forward model** — the coil loop
+**What the ported model already provides.** Fiberfox synthesizes a **per-coil complex forward model** — the coil loop
 (`itkTractsToDWIImageFilter.cpp:247`), per-coil sensitivity that moves with the excited slice
 (`itkKspaceImageFilter.cpp:241`), per-coil real/imag output — and it already **skips PE lines** for
 partial Fourier (`itkKspaceImageFilter.cpp:322`). The whole substrate exists in the `kspace` port.
@@ -57,8 +58,9 @@ partial Fourier (`itkKspaceImageFilter.cpp:322`). The whole substrate exists in 
 2. **Noise before recon.** Keep noise injection per coil in the undersampled k-space (already there).
 3. **GRAPPA reconstruction.** Fit kernel weights from the ACS lines (per coil), synthesize the missing
    lines, then coil-combine (RSS). New numeric code, well-specified. `nalgebra` for the weight solve.
-4. **g-factor for free.** Because you reconstruct genuinely undersampled *noisy* multi-coil data, the
-   spatially-varying noise amplification (g-factor) emerges from the physics — no need to model it.
+4. **g-factor.** Because undersampled, noisy multi-coil data are reconstructed, the
+   spatially-varying noise amplification (g-factor) follows from the reconstruction and is not
+   modelled separately.
 
 ## Config surface (sketch)
 

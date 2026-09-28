@@ -68,15 +68,15 @@ fiber_resp(g) = fiber[vox][g] / intra_vol[vox]
 That is a **path-length-weighted average over every segment orientation crossing the voxel**. A
 90° crossing gives the correct two-population signal; fanning gives genuine dispersion; a
 three-way crossing needs no special case. There is no orientation prior, no peak-count limit, and
-no dispersion parameter — the geometry *is* the model. This is TRXScan's real advantage over
-FORCE's parametric sampling, and it sidesteps FORCE's own library coverage gap (dense WM at high
-dispersion is absent from the parametric library).
+no dispersion parameter — the geometry *is* the model. This differs from FORCE's parametric
+sampling and covers cases its library does not (dense WM at high dispersion is absent from the
+parametric library).
 
 **The representation is lossy.** The gradient sum happens *at accumulation time*: only
 `S(g)` and the scalar `intra_vol` survive. The set of (direction, weight) pairs — the mixture
-itself — is never stored. So today you cannot recover the per-voxel mixture from a finished
-signal-stage run, and therefore cannot apply FORCE's closed forms. **That is the one thing that has to
-change**, and it is small.
+itself — is never stored. So the per-voxel mixture cannot be recovered from a finished
+signal-stage run, and FORCE's closed forms cannot be applied to it. That is the one thing that
+has to change, and it is small.
 
 ## 3. FORCE scalars from the rasterized segments
 
@@ -143,7 +143,7 @@ histogram — `S(g) = Σ_v odf[v] · (intra_frac·stick(g, v) + extra_frac·zepp
 exports it. Signal and ground truth derive from one object, so they cannot disagree by
 construction. Cost shifts from O(hits·ngrad) to O(hits) + O(nvox_wm·nvert·ngrad) — comparable for
 dense tractograms, and strictly better once a dispersion kernel enters (evaluating a kernel per
-segment per gradient would be brutal). Memory is `nvox·nvert` floats: ~90 MB f32 at 362
+segment per gradient would be far more expensive). Memory is `nvox·nvert` floats: ~90 MB f32 at 362
 hemisphere vertices on a 64³ grid (fold antipodally — `vv^T` and every downstream moment are
 antipodally invariant).
 
@@ -155,9 +155,8 @@ mixture evaluated on the scheme) with existing tools.
 
 ### Porting the closed forms to Rust (sizing)
 
-Porting the closed forms to Rust (rather than calling dipy) is bounded, dependency-free, and it is
-this repo's native methodology — dipy becomes the oracle exactly the way Fiberfox is. Two facts
-make it tractable:
+Porting the closed forms to Rust (rather than calling dipy) is bounded and dependency-free,
+with dipy as the fixture oracle. Two facts make it tractable:
 
 - The mixture is Gaussian, so ~90 % of the math is elementary linear algebra — contractions,
   3×3 determinants, one symmetric 3×3 eigendecomposition. The **only special function in the
@@ -206,7 +205,7 @@ against numerical spherical averaging of directional kurtosis on a dense sphere.
 
 ## 4. Compartment fractions from CONSH
 
-Yes — and there are two genuinely different uses, worth not conflating.
+There are two different uses, worth not conflating.
 
 Today the WM/GM/CSF fractions are three externally supplied NIfTIs, and the intra/extra split
 inside WM is a global constant (0.55/0.45). CONSH fits all three tissues jointly from the DWI
@@ -238,19 +237,17 @@ orientation gets 10× the weight, for reasons that have nothing to do with tissu
 tractogram contributes fixel-level density that is arbitrary in scale and biased in ratio, and
 nothing in the pipeline currently corrects it.
 
-Named plainly: this is the bias **SIFT exists to remove, run in reverse**. SIFT filters
-streamlines until their density matches the FOD's fibre density; the rasterizer takes
-*unfiltered* streamline density and defines fibre density with it. Which also points at the
-cleanest fix, and it is a restoration rather than an addition: Fiberfox weights every fiber's
-contribution (`fiberWeight`, `itkTractsToDWIImageFilter.cpp:1055–1073`) and the port dropped it.
-Three ways in, cheapest first:
+This is the bias SIFT exists to remove, run in reverse: SIFT filters streamlines until their
+density matches the FOD's fibre density, while the rasterizer takes *unfiltered* streamline
+density and defines fibre density with it. The simplest fix is per-streamline weights, which
+Fiberfox has (`fiberWeight`, `itkTractsToDWIImageFilter.cpp:1055–1073`) and the port had
+dropped. Three ways in, cheapest first:
 
 1. **Consume SIFT2 weights.** Accept per-streamline weights and accumulate
    `w_s · length · seg_area`. SIFT2's defining property is that `Σ w_s·length` is proportional
    to fibre volume per fixel — exactly the corrected density the rasterizer wants, consumed
    directly. `trx-rs` already loads TRX `dps` arrays (`TrxFile::dps(name)`), so
-   `io::load_streamlines` just needs to surface one, defaulting to `w_s = 1`. Restores Fiberfox
-   parity for free.
+   `io::load_streamlines` just needs to surface one, defaulting to `w_s = 1`.
 2. **Calibrate.** Regress the rasterizer's per-fixel `Σ length·area` against CONSH's per-fixel
    AFD on a real subject. The scatter — not the slope, which is unidentifiable — is the
    interesting part: it measures how far the tractogram's fixel density departs from the data's,
@@ -363,9 +360,9 @@ CONSH (real subject)  ──fractions + AFD + κ──►  TRXScan phantom
 
 Simulate from a real subject's tissue composition, reconstruct the simulated DWI with the same
 tooling used on real data, and score it against scalars that were computed analytically rather
-than fitted. Fiberfox never had the middle column.
+than fitted.
 
-## Verdict
+## Summary
 
 Keep streamline-driven signal generation — the crossing/branching geometry, and *which
 population is which bundle*, only the tractogram knows. Borrow FORCE for **ground-truth

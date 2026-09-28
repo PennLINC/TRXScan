@@ -52,7 +52,7 @@ coefficient set that it also *writes out* in Siemens `.grad` format, so that qsi
 TORTOISE consume the very same field. That closes the loop: truth field vs TORTOISE's field
 (unit-level), and truth orientations vs corrected reconstruction (end-to-end).
 
-### Why TRXScan is unusually well placed
+### What the existing code provides
 
 - **b lives in the gradient norm** (`src/scheme.rs:123-137`, `fiberfox_gradient`). Replacing
   the encoded gradient `g` by `J(x)ᵀ g` per voxel gives the full b-matrix deviation
@@ -66,8 +66,9 @@ TORTOISE consume the very same field. That closes the loop: truth field vs TORTO
 
 ## 2. Coefficient sets without proprietary files
 
-Vendor `.grad`/`gw_coils.dat` files cannot ship. Realism comes from three constraints that
-every whole-body gradient set satisfies, plus a calibrated *envelope* rather than copied numbers:
+Vendor `.grad`/`gw_coils.dat` files cannot ship. The synthetic sets are built from three
+constraints that every whole-body gradient set satisfies, plus a calibrated *envelope* rather
+than copied numbers:
 
 **Symmetry (structural realism).** Whole-body coils are antisymmetric about isocentre, so only
 odd `l` appear. The transverse coils have odd `m` only: x uses cosine terms `A(l, m)`, y uses
@@ -242,7 +243,7 @@ for the signal stage only").
 
 ## 4. Interactions and known approximations
 
-- **Motion × GNL.** In the faithful motion path the field is sampled where the tissue *is*
+- **Motion × GNL.** In the per-volume re-simulation path the field is sampled where the tissue *is*
   during each volume (scanner grid), so subject motion changes the bias in head coordinates —
   the effect Rudrapatna et al. describe. In the default path with multiband intra-volume
   motion, the encoding deviation is evaluated at the unmoved position and only the images move;
@@ -257,7 +258,7 @@ for the signal stage only").
 - **Vendor coverage**: Siemens grammar and frame first; GE/Philips is a different file grammar
   (`read_GE_format`) but the same physics — the frame switch is one diagonal.
 
-## 5. Validation (what makes this trustworthy)
+## 5. Validation
 
 Unit tests, in-module and std-only as `CLAUDE.md` requires:
 
@@ -286,7 +287,7 @@ normalization and frame — everything above could be self-consistently wrong):
    gradwarp-corrected DWI should match the `--gnl-no-warp` simulation to sub-voxel accuracy
    (same seed), and its graddev should match truth after the ACPC rotation.
 
-End-to-end (the reason for all of this):
+End to end:
 
 10. Reconstruct the corrected qsiprep output (DSI Studio GQI and MRtrix CSD), run
     `odx graddev`, and `odx compare` against the reconstruction of the `--gnl 0` simulation with

@@ -7,7 +7,7 @@ name = "trxscan"
 # Version comes from [workspace.package].version in ../Cargo.toml (maturin reads it at build
 # time), so Cargo.toml, the wheel filename and PyPI metadata cannot disagree. Bump it there.
 dynamic = ["version"]
-description = "Diffusion-MRI simulator (TRXScan): Fiberfox physics in Rust with realistic EPI artifacts, callable from Python"
+description = "Diffusion-MRI simulator (TRXScan): complex 4D DWI with EPI artifacts, motion and ground truth from a tractogram phantom"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT OR Apache-2.0" }
