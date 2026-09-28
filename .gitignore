@@ -6,3 +6,10 @@ Cargo.lock
 # Python bytecode from scripts/
 __pycache__/
 *.pyc
+
+# Python bindings: maturin's own target dir and built wheels
+/python/target
+/python/dist
+/python/.venv
+*.egg-info
+.pytest_cache/

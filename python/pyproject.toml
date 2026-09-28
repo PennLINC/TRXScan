@@ -1,0 +1,62 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "trxscan"
+# Version comes from [workspace.package].version in ../Cargo.toml (maturin reads it at build
+# time), so Cargo.toml, the wheel filename and PyPI metadata cannot disagree. Bump it there.
+dynamic = ["version"]
+description = "Diffusion-MRI simulator (TRXScan): Fiberfox physics in Rust with realistic EPI artifacts, callable from Python"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Matt Cieslak", email = "mattcieslak@gmail.com" }]
+keywords = ["diffusion-mri", "simulation", "phantom", "tractography", "k-space", "neuroimaging"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "nibabel>=5",
+    "pooch>=1.8",
+]
+
+[project.optional-dependencies]
+dipy = ["dipy>=1.12"]
+trx = ["trx-python>=0.6"]
+viz = ["odx>=0.1.3"]
+ismrmrd = ["ismrmrd>=1.14"]
+test = ["pytest>=8", "dipy>=1.12", "trx-python>=0.6"]
+all = ["trxscan[dipy,trx,viz,ismrmrd]"]
+
+[project.urls]
+Homepage = "https://github.com/PennLINC/TRXScan"
+Repository = "https://github.com/PennLINC/TRXScan"
+Issues = "https://github.com/PennLINC/TRXScan/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "Cargo.toml"
+python-source = "."
+module-name = "trxscan._core"
+# Keep the sdist small: the workspace root (`..`) is bundled as the path dependency, minus these.
+exclude = ["../target/**", "../docs/**", "../scripts/**", "../tools/**", "../tests/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["phantom: needs the full sub-60501 phantom download (set TRXSCAN_RUN_PHANTOM=1)"]

@@ -114,6 +114,10 @@ needs `--gre-out`, `--gnl-*` needs `--gnl`) via clap `requires`; keep new knobs 
 
 ### Conventions to respect
 
+- **Partial Fourier skips the START of the EPI train by default** (`PartialFourierMode::Scanner`:
+  the centre is reached `ny(1-pf)` lines sooner, the eddy-decay clock starts at the first acquired
+  line, `t_echo` stays the caller's number). `Contiguous` (drop the END, timing unchanged) and
+  `FiberfoxCompatible` are kept for reproducing older runs; `--pf-mode` selects.
 - **b-value lives in the gradient norm.** Fiberfox's signal models take `b_value = b_max` and a
   gradient scaled to `unit_bvec · sqrt(b_i / b_max)`, so `|g|²` carries the per-volume b-value.
   Always feed models `GradientScheme::fiberfox_gradients()`, never raw bvecs.
@@ -160,8 +164,32 @@ implies `io`; it also puts `clap::ValueEnum` on `gre::GreOutput`). `odx` is decl
 `Cargo.toml` for work that isn't written yet. The **`kspace` module is always compiled and needs
 no feature**; the `kspace` feature only swaps the x-stage and reconstruction to `rustfft` and the
 fieldmap y-sum to the NUFFT (identical numbers, ~5× faster than the default build). `par` (rayon) parallelizes over streamline groups
-in the signal stage and over volumes in the acquisition stage. Path deps assume sibling checkouts: `../rust/trx-rs` and
-`../odx-rs`.
+in the signal stage and over volumes in the acquisition stage. `trx-rs` and `odx-rs` are git-pinned
+in `Cargo.toml` (no sibling checkout). The crate is a workspace; `python/` is the pyo3 extension
+(`trxscan._core`, std-only core + `kspace,par`, built with maturin) behind the `trxscan` PyPI package.
+
+## Python bindings (`python/`)
+
+`python/` is a workspace member: a pyo3 `cdylib` (`trxscan._core`, `python/src/lib.rs`) over the
+std-only core with `kspace,par`, plus the object-oriented Python layer in `python/trxscan/`
+(`Phantom`/`Object`, `Protocol`, `Artifacts`, `Motion`, `Voxel`, `Simulation`, `KSpace`,
+`BidsDwi`). Conventions: arrays cross the boundary **flat** (3-D as `x + nx*(y + ny*z)` = an
+F-contiguous `(nx, ny, nz)` array; 4-D as `(x + nx*(y + ny*z))*ngrad + g` = a C-contiguous
+`(nz, ny, nx, ngrad)` array; k-space `kx + nx*ky` = C-order `(ny, nx)`); complex data are
+`float32` pairs viewed as `complex64`; every heavy call releases the GIL. The Rust entry points
+the binding needs are `kspace::simulate_acquisition_complex` (complex output, k-space capture,
+per-volume TE, `slice_z`/`nz_full` for slab runs), `compartments::mixture_from_fibers`,
+`streamlines::subsample_streamlines`, `motion::{dropout_events, apply_multiband_motion_slab}`.
+
+```bash
+cd python && maturin develop --release && pytest tests -m "not phantom"   # in a virtualenv
+TRXSCAN_RUN_PHANTOM=1 TRXSCAN_DATA=/path TRXSCAN_CLI=target/release/trxscan pytest python/tests
+```
+
+`tests/test_phantom.py::test_bids_parity_with_the_cli` pins Python-vs-CLI bit-identity on the
+real phantom. Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
+CLI build's HDF5 compile. Release: tag `X.Y.Z` (no `v`) matching `[workspace.package].version`
+(`.github/workflows/release.yml` builds manylinux/musllinux/macOS/Windows wheels and publishes).
 
 ## Fiberfox is the oracle
 

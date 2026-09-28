@@ -1,0 +1,7 @@
+# Python extension modules on macOS must leave the interpreter's symbols unresolved at link
+# time (they are provided by whichever Python loads the module). Same flags odx-rs uses.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

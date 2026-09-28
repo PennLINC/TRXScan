@@ -1,10 +1,23 @@
+[workspace]
+members = [".", "python"]
+resolver = "2"
+
+# Single source of truth for the version. `python/Cargo.toml` inherits it and maturin reads it
+# at wheel-build time (`dynamic = ["version"]` in python/pyproject.toml); the release workflow
+# refuses an `X.Y.Z` tag that disagrees with it.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PennLINC/TRXScan"
+
 [package]
 name = "trxscan"
-version = "0.0.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Headless diffusion-MRI simulator: Fiberfox physics in Rust, on trx-rs/odx-rs"
-license = "MIT OR Apache-2.0"
-repository = ""
 publish = false
 
 # Every external dependency is optional and off by default, so the default build is
@@ -41,9 +54,10 @@ path = "src/bin/trxscan_benchmark.rs"
 required-features = ["cli"]
 
 [dependencies]
-# --- path deps to sibling checkouts (see the README for the expected layout) ---
-trx-rs = { path = "../rust/trx-rs", optional = true }
-odx-rs = { path = "../odx-rs", optional = true }
+# --- git-pinned sibling crates (no local checkout needed; only fetched when a feature enables them) ---
+# trx-rs: the commit the `io` module was written against (8 commits past the v0.1.0 tag).
+trx-rs = { git = "https://github.com/tee-ar-ex/trx-rs", rev = "13cfacd397fa1db2d272fa00dfa11f3e3e5e1b40", optional = true }
+odx-rs = { git = "https://github.com/PennLINC/odx-rs", tag = "v0.1.3", optional = true }
 # --- I/O + math (versions matched to the sibling crates) ---
 nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
 ndarray = { version = "0.16", optional = true }
