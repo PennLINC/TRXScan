@@ -188,7 +188,7 @@ TRXSCAN_RUN_PHANTOM=1 TRXSCAN_DATA=/path TRXSCAN_CLI=target/release/trxscan pyte
 
 `tests/test_phantom.py::test_bids_parity_with_the_cli` pins Python-vs-CLI bit-identity on the
 real phantom. Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
-CLI build's HDF5 compile. Release: tag `vX.Y.Z` matching `[workspace.package].version`
+CLI build's HDF5 compile. Release: tag `X.Y.Z` (no `v`) matching `[workspace.package].version`
 (`.github/workflows/release.yml` builds manylinux/musllinux/macOS/Windows wheels and publishes).
 
 ## Fiberfox is the oracle

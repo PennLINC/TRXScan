@@ -4,7 +4,7 @@ resolver = "2"
 
 # Single source of truth for the version. `python/Cargo.toml` inherits it and maturin reads it
 # at wheel-build time (`dynamic = ["version"]` in python/pyproject.toml); the release workflow
-# refuses a `vX.Y.Z` tag that disagrees with it.
+# refuses an `X.Y.Z` tag that disagrees with it.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
