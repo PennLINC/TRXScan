@@ -1,22 +1,22 @@
 //! # TRXScan
 //!
-//! A headless diffusion-MRI simulator: the MITK Fiberfox simulation math, rebuilt in Rust on
-//! `trx-rs` / `odx-rs` and extended with within-volume (multiband) motion, GRAPPA, and complex
-//! (magnitude + phase) output.
+//! A headless diffusion-MRI simulator. The signal and k-space models were ported from MITK
+//! Fiberfox; the acquisition model adds within-volume (multiband) motion, GRAPPA, complex
+//! (magnitude + phase) output, scanner-style partial Fourier, gradient nonlinearity and a
+//! synthetic GRE fieldmap, and a histogram-based signal stage supplies closed-form ground truth.
 //!
-//! The pipeline runs in two stages, mirroring Fiberfox's own split, with head motion cutting
-//! across both:
+//! The pipeline runs in two stages, with head motion cutting across both:
 //!
 //! ```text
 //! streamlines + tissue maps + scheme
-//!   → raster (exact 3D-DDA) → signal (Stick/Tensor/Ball) → compartments   [signal stage → clean]
+//!   → raster (3D-DDA) → signal (Stick/Tensor/Ball) → compartments   [signal stage → clean]
 //!   → readout (EPI) → kspace (distortion/T2*/eddy/coils/PF/ringing/spikes/GRAPPA/noise)  [acquisition]
 //!   (+ motion applied to the fibers per volume, or per multiband slice-group)
 //! → BIDS complex 4D DWI (magnitude + phase, .bval/.bvec)
 //! ```
 //!
-//! A parallel path builds the per-voxel orientation [`mixture`] once and derives both the clean
-//! signal and closed-form ground-truth [`microstructure`] scalars from it, so they cannot disagree.
+//! The default path builds the per-voxel orientation [`mixture`] once and derives both the clean
+//! signal and the closed-form ground-truth [`microstructure`] scalars from it.
 //!
 //! ## Build shape
 //! Every external dependency is optional; the default build is pure std, so `cargo test` exercises

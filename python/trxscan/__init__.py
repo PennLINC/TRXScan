@@ -1,6 +1,6 @@
-"""trxscan: diffusion-MRI simulation with realistic artifacts.
+"""trxscan: diffusion-MRI simulation with acquisition artifacts and ground truth.
 
-Four nouns and one verb::
+Typical use::
 
     import trxscan as ts
     from dipy.core.gradients import gradient_table

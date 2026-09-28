@@ -17,7 +17,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Headless diffusion-MRI simulator: Fiberfox physics in Rust, on trx-rs/odx-rs"
+description = "Headless diffusion-MRI simulator: tractogram + tissue maps + scheme to a complex 4D DWI with EPI artifacts, motion and ground truth"
 publish = false
 
 # Every external dependency is optional and off by default, so the default build is

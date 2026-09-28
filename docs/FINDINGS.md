@@ -1,8 +1,10 @@
 # The Fiberfox simulator, decomposed
 
-All `file:line` anchors are into the **MITK-Diffusion** source tree
-(`Modules/MriSimulation/…`, from the 2024.11.26 release). Once you strip MITK/ITK/VTK/Qt,
-the simulator is two transforms plus motion, and the code that matters is small.
+Notes from reading the Fiberfox source before porting it. All `file:line` anchors are into the
+**MITK-Diffusion** source tree (`Modules/MriSimulation/…`, from the 2024.11.26 release). Once
+MITK/ITK/VTK/Qt are set aside, the simulator is two transforms plus motion, and the relevant
+code is a few thousand lines. TRXScan's current signal stage and acquisition model have grown
+past what is described here; this note documents the starting point.
 
 ## The pipeline in two stages
 
@@ -54,8 +56,8 @@ Each also has a `SimulateMeasurement(dir)` batch form returning the whole gradie
 Per (volume, slice, coil), the slice's compartment signal is turned into a distorted image:
 
 - **Readout as a manual DFT** (`:303`+). Iterates k-space points; for each, sums over **all**
-  image pixels applying a per-pixel phase — O(N⁴) per slice. This is Fiberfox's real bottleneck.
-  TRXScan keeps the exact per-line sum but organises it for speed (`src/kspace.rs`): static
+  image pixels applying a per-pixel phase — O(N⁴) per slice, which dominates Fiberfox's run time.
+  TRXScan keeps the per-line sum but organises it for speed (`src/kspace.rs`): static
   factors hoisted, the affine-in-ky phase advanced by memoised rotors, and — under the `kspace`
   feature — the x-DFT / reconstruction done by rustfft and the fieldmap y-sum by a type-1 NUFFT
   (`src/nufft.rs`), so the whole forward is O(N log N) except the non-affine eddy polynomial. The
@@ -85,7 +87,7 @@ Small (~60 lines each). `mitkSingleShotEpi.h`:
 - `GetTimeFromMaxEcho / GetTimeFromLastDiffusionGradient / GetTimeFromRf`: linear in `tick·dt`.
 
 The `AcquisitionType` interface (`Sequences/mitkAcquisitionType.h:41`) is **purely in-plane** —
-there is *no* slice-dimension timing. Multiband slice scheduling is genuinely new code (see
+there is *no* slice-dimension timing. Multiband slice scheduling is new code (see
 [`FEATURES.md`](FEATURES.md)). `mitkFastSpinEcho.h`, `mitkConventionalSpinEcho.h` are the other two.
 
 ## Motion (`itkTractsToDWIImageFilter.cpp:1456`)
@@ -103,11 +105,11 @@ Per volume `g`, from a global amplitude + a `motionvolumes` list + a `randomMoti
 
 A load-order gotcha in the original: `motionvolumes` is parsed against the gradient count *at ffp
 load time*, before the `-t` template sets the real scheme — so with no gradients loaded it silently
-moves **all** volumes. TRXScan designs this away (the scheme is known up-front).
+moves **all** volumes. TRXScan avoids this by reading the scheme first.
 
 ## What TRXScan omits
 
 MITK/ITK/VTK/Qt entirely (→ `ndarray` + `nalgebra` + TRXScan's own streamline type); the Qt
-Fiberfox GUI plugin; the `.ffp` XML parameter format and its load-order bugs (→ a Rust config
-struct); procedural fiber *generation* / spline fitting (TRXScan consumes external tractograms);
-DICOM and the format zoo; the unused signal models. What remains is the physics above.
+Fiberfox GUI plugin; the `.ffp` XML parameter format (→ a Rust `Acquisition` struct); procedural
+fiber *generation* / spline fitting (TRXScan consumes external tractograms); DICOM and the other
+input formats; the unused signal models. What was ported is the physics above.
