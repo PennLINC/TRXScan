@@ -1,0 +1,22 @@
+[package]
+name = "trxscan-py"
+# Version/edition/license come from [workspace.package] in ../Cargo.toml, so one bump there
+# flows through to the wheel filename and PyPI metadata (maturin reads it).
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Python bindings for trxscan (built via maturin; not published as a Rust crate)"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The std-only simulation core plus the FFT/NUFFT k-space path and rayon. No `io`: file I/O is
+# Python's job (nibabel, trx-python), which keeps trx-rs/HDF5/cmake out of the wheel entirely.
+trxscan = { path = "..", default-features = false, features = ["kspace", "par"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+numpy = "0.29"
+rayon = "1"

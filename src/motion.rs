@@ -295,6 +295,45 @@ pub struct MotionEvent {
     pub jump_deg: [f64; 3],
 }
 
+/// The seed [`dropout_events`] is fed by the `trxscan` binary for `--seed <s>`: a fixed salt
+/// mixed with the run seed, so dropout realisations are decoupled from the noise realisation.
+/// Exposed so other front ends (the Python bindings) reproduce the CLI's dropout table exactly.
+pub fn dropout_seed(run_seed: u64) -> u64 {
+    0xB10C_5EED ^ run_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Deterministically pick DWI shots to corrupt: each DWI volume (b >= 50) gets a dropout event with
+/// probability `rate`, at a pseudo-random shot, with severity 0.6–1.0 and a ~1–3 mm bulk jump.
+pub fn dropout_events(bvals: &[f64], n_shots: usize, rate: f64, seed: u64) -> Vec<MotionEvent> {
+    let mix = |z0: u64| {
+        let mut z = z0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut evs = Vec::new();
+    for (g, &b) in bvals.iter().enumerate() {
+        if b < 50.0 {
+            continue; // b0s don't dropout
+        }
+        let h = mix(seed ^ (g as u64).wrapping_mul(0x0100_0001));
+        if (h % 100_000) as f64 / 100_000.0 >= rate {
+            continue;
+        }
+        let shot = (h >> 20) as usize % n_shots.max(1);
+        let severity = 0.6 + ((h >> 33) % 40) as f32 / 100.0;
+        let j = 1.0 + ((h >> 45) % 20) as f64 / 10.0;
+        evs.push(MotionEvent {
+            volume: g,
+            shot,
+            severity,
+            jump_mm: [0.3 * j, j, 0.2 * j],
+            jump_deg: [0.5, 0.3, 0.2],
+        });
+    }
+    evs
+}
+
 /// Ground truth of a dropped shot (for scoring `eddy --repol` / SHORELine outlier detection).
 #[derive(Debug, Clone)]
 pub struct DroppedShot {
@@ -322,9 +361,44 @@ pub fn apply_multiband_motion(
     b_max: f64,
     events: &[MotionEvent],
 ) -> Vec<DroppedShot> {
+    apply_multiband_motion_slab(images, dims, ngrad, v2w, mb, interleaved, bvals, b_max, events, None, None)
+}
+
+/// [`apply_multiband_motion`] on a slab of a larger volume: `slice_z` gives the full-FOV z index
+/// of each local slice and `nz_full` the full slice count, so the multiband shot schedule (and
+/// therefore which shots touch which slices) is the full volume's. Shots whose slices lie outside
+/// the slab are skipped; the returned [`DroppedShot::slices`] are full-FOV indices. The geometric
+/// jump resamples within the slab, so keep a few slices of context around the ones of interest.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_multiband_motion_slab(
+    images: &mut [Vec<f32>],
+    dims: [usize; 3],
+    ngrad: usize,
+    v2w: [[f64; 4]; 4],
+    mb: usize,
+    interleaved: bool,
+    bvals: &[f64],
+    b_max: f64,
+    events: &[MotionEvent],
+    slice_z: Option<&[usize]>,
+    nz_full: Option<usize>,
+) -> Vec<DroppedShot> {
     let [nx, ny, nz] = dims;
     let nvox = nx * ny * nz;
-    let schedule = slice_schedule(nz, mb, interleaved);
+    let nz_full = nz_full.unwrap_or(nz);
+    if let Some(sz) = slice_z {
+        assert_eq!(sz.len(), nz, "slice_z must name every local slice");
+    }
+    // full-FOV schedule, then each shot's slices mapped to LOCAL indices (dropping any outside)
+    let schedule_full = slice_schedule(nz_full, mb, interleaved);
+    let local_of = |zg: usize| -> Option<usize> {
+        match slice_z {
+            None => (zg < nz).then_some(zg),
+            Some(sz) => sz.iter().position(|&z| z == zg),
+        }
+    };
+    let schedule: Vec<Vec<usize>> =
+        schedule_full.iter().map(|shot| shot.iter().filter_map(|&z| local_of(z)).collect()).collect();
     let n_shots = schedule.len();
     let at3 = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
     let mut gt = Vec::new();
@@ -384,7 +458,7 @@ pub fn apply_multiband_motion(
                     }
                 }
             }
-            gt.push(DroppedShot { volume: g, shot: e.shot, slices: schedule[e.shot].clone(), attenuation: atten });
+            gt.push(DroppedShot { volume: g, shot: e.shot, slices: schedule_full[e.shot].clone(), attenuation: atten });
         }
     }
     gt
@@ -393,6 +467,46 @@ pub fn apply_multiband_motion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiband_slab_matches_the_full_volume_where_no_jump_crosses_the_edge() {
+        // Pure dropout (zero jump) on a 2-slice slab of a 6-slice volume, mb=2: the slab sees the
+        // full volume's shot schedule, so the same slices attenuate by the same factor.
+        let (nx, ny, nz, ngrad) = (4usize, 3usize, 6usize, 2usize);
+        let v2w = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let mk = || vec![(0..nx * ny * nz * ngrad).map(|i| 1.0 + (i % 13) as f32).collect::<Vec<f32>>()];
+        let bvals = [0.0, 2000.0];
+        let events = [MotionEvent { volume: 1, shot: 1, severity: 0.8, jump_mm: [0.0; 3], jump_deg: [0.0; 3] }];
+        let mut full = mk();
+        let gt_full = apply_multiband_motion(&mut full, [nx, ny, nz], ngrad, v2w, 2, true, &bvals, 2000.0, &events);
+        // slab = slices 4..6 (local 0,1 = global 4,5)
+        let mut slab = vec![full[0][..0].to_vec()];
+        let orig = mk();
+        slab[0] = orig[0][nx * ny * 4 * ngrad..nx * ny * 6 * ngrad].to_vec();
+        let gt_slab = apply_multiband_motion_slab(
+            &mut slab, [nx, ny, 2], ngrad, v2w, 2, true, &bvals, 2000.0, &events, Some(&[4, 5]), Some(nz),
+        );
+        assert_eq!(slab[0], full[0][nx * ny * 4 * ngrad..nx * ny * 6 * ngrad].to_vec());
+        assert_eq!(gt_full.len(), 1);
+        assert_eq!(gt_full[0].slices, gt_slab[0].slices, "dropped slices are reported in full-FOV indices");
+        assert!(gt_full[0].slices.contains(&4) || gt_full[0].slices.contains(&5) || gt_full[0].slices.iter().all(|&z| z < 4));
+    }
+
+    #[test]
+    fn dropout_events_are_deterministic_and_skip_b0() {
+        let bvals: Vec<f64> = vec![0.0, 1000.0, 1000.0, 2000.0, 0.0, 3000.0, 1000.0, 2000.0, 3000.0, 1000.0];
+        let a = dropout_events(&bvals, 20, 0.5, dropout_seed(0));
+        let b = dropout_events(&bvals, 20, 0.5, dropout_seed(0));
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!((x.volume, x.shot, x.severity, x.jump_mm, x.jump_deg), (y.volume, y.shot, y.severity, y.jump_mm, y.jump_deg));
+        }
+        assert!(a.iter().all(|e| bvals[e.volume] >= 50.0));
+        assert!(a.iter().all(|e| e.shot < 20 && (0.6..=1.0).contains(&e.severity)));
+        let all = dropout_events(&bvals, 20, 1.0, dropout_seed(0));
+        assert_eq!(all.len(), 8, "rate 1 drops every DWI volume");
+        assert!(dropout_events(&bvals, 20, 0.0, dropout_seed(0)).is_empty());
+    }
 
     #[test]
     fn identity_pose_is_the_identity_matrix() {

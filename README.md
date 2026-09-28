@@ -92,18 +92,20 @@ cargo build --release --features cli,par,kspace
 
 `cli` pulls in `clap` and the I/O stack; `par` turns on rayon (streamline groups in the signal
 stage, volumes in the acquisition stage); `kspace` is the fast k-space path. The **first** build
-compiles the I/O stack from source — `trx-rs` → `itk-transforms-rs` (a git dependency) →
+with `cli`/`io` compiles the I/O stack from source — `trx-rs` → `itk-transforms-rs` →
 `hdf5-metno-src`, which builds HDF5 — so it needs network access and `cmake` and takes a while.
-Lay the sibling crates out next to this one:
+`trx-rs` and `odx-rs` are git-pinned in [`Cargo.toml`](Cargo.toml); no sibling checkout is needed.
+The crate is a cargo workspace whose second member, [`python/`](python/), is the pyo3 extension
+behind the `trxscan` PyPI package (it depends on the std-only core with `kspace,par`, so the wheel
+has no C dependencies; see `python/README.md`).
 
-```
-~/projects/
-  ├── TRXScan/      (this crate)
-  ├── odx-rs/
-  └── rust/trx-rs/
-```
+## Python
 
-The path dependencies in [`Cargo.toml`](Cargo.toml) point at those locations.
+The [`trxscan`](python/README.md) package (`pip install trxscan`) wraps the same simulator for
+notebooks: `Phantom.load("sub-60501").simulate(gtab, Protocol.HBCD, Artifacts(noise=2e-4),
+slices=40)` returns nibabel images, per-coil k-space and readout timing for one slice in a few
+seconds, bit-identical to the CLI's output for that slice; `Voxel(...)` gives dipy.sims-style
+single-voxel signals with the closed-form ground truth. See `python/README.md`.
 
 ## Usage
 
@@ -144,7 +146,7 @@ sidecars (`PhaseEncodingDirection`, `TotalReadoutTime`, `EchoTime`, …). Option
 | `--phase-model <m>` | hbcd | object phase: `hbcd` (calibrated background ramp + per-shot diffusion phase) or `none` |
 | `--reverse-pe` | off | flip phase-encode polarity (the AP/PA pair for topup/DRBUDDI) |
 | `--fsl-orientation` | off | write radiological LAS with FSL-convention bvecs, as dcm2niix would |
-| `--pf-mode <m>` | contiguous | partial-Fourier line-dropping rule: `contiguous` (scanner) or `fiberfox` |
+| `--pf-mode <m>` | scanner | partial-Fourier rule: `scanner` (skips the first lines of the train, so the centre is reached sooner), `contiguous` (legacy: drops the last lines, timing unchanged) or `fiberfox` |
 | `--noise <var>` | 0 | complex k-space noise variance → Rician magnitude |
 | `--noise-map <nii>` | — | per-voxel noise SD on the acquisition grid (image-space, shared by mag and phase); writes `<out>_desc-noise_sigma.nii.gz` as ground truth |
 | `--eddy <s>` / `--eddy-quad <s>` | 0 | linear / quadratic eddy-current geometric distortion (b0 exempt) |
@@ -219,8 +221,8 @@ the surface a Python binding wraps.
 
 | Crate | Used for |
 |---|---|
-| [`trx-rs`](https://github.com/tee-ar-ex/trx-rs) (`../rust/trx-rs`) | load TRX/TRK/TCK/VTK streamlines + per-streamline SIFT2 weights from TRX `dps` |
-| [`odx-rs`](https://github.com/PennLINC/odx-rs) (`../odx-rs`) | *planned:* SH/sphere math and ground-truth ODX export (behind the `odx` feature; not wired up yet) |
+| [`trx-rs`](https://github.com/tee-ar-ex/trx-rs) (git-pinned) | load TRX/TRK/TCK/VTK streamlines + per-streamline SIFT2 weights from TRX `dps` |
+| [`odx-rs`](https://github.com/PennLINC/odx-rs) (git-pinned) | *planned:* SH/sphere math and ground-truth ODX export (behind the `odx` feature; not wired up yet) |
 | [`nifti`](https://crates.io/crates/nifti) 0.17 | 3D/4D NIfTI read + write, affine |
 
 ## Provenance

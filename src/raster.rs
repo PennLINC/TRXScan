@@ -21,6 +21,30 @@ pub struct Grid {
     pub voxel_to_world: [[f64; 4]; 4],
 }
 
+impl Grid {
+    /// The simulation grid: in-plane refined by `o`, same FOV, slice direction untouched.
+    ///
+    /// The origin shifts by half the difference between the coarse and fine voxel sizes on each
+    /// refined axis, matching the half-cell registration the forward transform uses and the
+    /// geometry `scripts/prepare_acquisition_grid.py` writes. Identity at `o = 1`.
+    pub fn hires(&self, o: usize) -> Grid {
+        assert!(o > 0, "oversampling factor must be positive");
+        let f = o as f64;
+        let mut m = self.voxel_to_world;
+        for r in 0..3 {
+            for c in 0..2 {
+                m[r][c] /= f;
+            }
+        }
+        for r in 0..3 {
+            m[r][3] = self.voxel_to_world[r][3]
+                - 0.5 * self.voxel_to_world[r][0] * (1.0 - 1.0 / f)
+                - 0.5 * self.voxel_to_world[r][1] * (1.0 - 1.0 / f);
+        }
+        Grid { dims: [self.dims[0] * o, self.dims[1] * o, self.dims[2]], voxel_to_world: m }
+    }
+}
+
 /// One intersection of a streamline segment with a voxel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentHit {
@@ -49,18 +73,40 @@ impl Grid {
     /// Walk one segment `a → b` (world mm); return each voxel it passes through with the length of
     /// the intersection (world mm). Voxels outside the grid are dropped.
     pub fn intersect_segment(&self, a: Vec3, b: Vec3) -> Vec<SegmentHit> {
+        let mut ts = Vec::new();
+        let mut hits = Vec::new();
+        self.intersect_segment_into(a, b, &mut ts, &mut hits);
+        hits
+    }
+
+    /// [`Grid::intersect_segment`] writing into caller-owned buffers (`ts` is scratch, `hits` is
+    /// cleared and filled), so a loop over millions of segments allocates nothing per segment.
+    /// Same hits, same order, same lengths.
+    pub fn intersect_segment_into(&self, a: Vec3, b: Vec3, ts: &mut Vec<f64>, hits: &mut Vec<SegmentHit>) {
+        hits.clear();
         let (av, bv) = match (self.world_to_voxel(a), self.world_to_voxel(b)) {
             (Some(x), Some(y)) => (x, y),
-            _ => return Vec::new(),
+            _ => return,
         };
         let world_len = mat::norm(mat::sub(b, a));
         if world_len < 1e-12 {
-            return Vec::new();
+            return;
+        }
+        // Exact early-out: a segment whose two endpoints lie beyond the same face of the grid on
+        // any axis cannot enter it (the grid is convex). Skips the boundary walk and its
+        // allocations for the bulk of a tractogram when the grid is a slab of the head.
+        for i in 0..3 {
+            let n = self.dims[i] as f64;
+            if (av[i] < 0.0 && bv[i] < 0.0) || (av[i] >= n && bv[i] >= n) {
+                return;
+            }
         }
         let dv = [bv[0] - av[0], bv[1] - av[1], bv[2] - av[2]];
 
         // all t in (0,1) where the ray crosses an integer voxel boundary, on any axis
-        let mut ts = vec![0.0_f64, 1.0];
+        ts.clear();
+        ts.push(0.0);
+        ts.push(1.0);
         for i in 0..3 {
             if dv[i].abs() <= 1e-12 {
                 continue;
@@ -77,7 +123,6 @@ impl Grid {
         }
         ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
 
-        let mut hits = Vec::new();
         for w in ts.windows(2) {
             let (t0, t1) = (w[0], w[1]);
             if t1 - t0 <= 1e-12 {
@@ -96,7 +141,6 @@ impl Grid {
             }
             hits.push(SegmentHit { voxel: [vx, vy, vz], length: (t1 - t0) * world_len });
         }
-        hits
     }
 }
 

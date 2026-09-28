@@ -117,10 +117,12 @@ struct Cli {
     /// Object phase model: "hbcd" (calibrated), or "none" for a real-valued object
     #[arg(long, value_name = "MODEL", default_value = "hbcd")]
     phase_model: String,
-    /// Partial-Fourier line-dropping rule: "contiguous" (scanner-like, exactly round(ny*pf)
-    /// consecutive lines) or "fiberfox" (the ported rule, which preserves line zero on even
-    /// matrices and so keeps ~78% at a nominal 6/8).
-    #[arg(long, value_name = "MODE", default_value = "contiguous")]
+    /// Partial-Fourier rule: "scanner" (default: the train starts late, skipping the first
+    /// ny*(1-pf) lines, so the centre is reached sooner; exactly round(ny*pf) consecutive lines),
+    /// "contiguous" (legacy: the same lines dropped from the END of the train, timing unchanged)
+    /// or "fiberfox" (the ported rule, which preserves line zero on even matrices and so keeps
+    /// ~78% at a nominal 6/8).
+    #[arg(long, value_name = "MODE", default_value = "scanner")]
     pf_mode: String,
 
     /// Flip phase-encode polarity (the AP/PA pair for topup / DRBUDDI)
@@ -274,38 +276,6 @@ struct Cli {
     /// trxscan-microstructure, so simulated data and ground truth describe the same phantom.
     #[arg(long, value_name = "N")]
     subsample: Option<usize>,
-}
-
-/// Deterministically pick DWI shots to corrupt: each DWI volume gets a dropout event with
-/// probability `rate`, at a pseudo-random shot, with severity 0.6–1.0 and a ~1–3 mm bulk jump.
-fn gen_dropout_events(bvals: &[f64], n_shots: usize, rate: f64, seed: u64) -> Vec<motion::MotionEvent> {
-    let mix = |z0: u64| {
-        let mut z = z0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    let mut evs = Vec::new();
-    for (g, &b) in bvals.iter().enumerate() {
-        if b < 50.0 {
-            continue; // b0s don't dropout
-        }
-        let h = mix(seed ^ (g as u64).wrapping_mul(0x0100_0001));
-        if (h % 100_000) as f64 / 100_000.0 >= rate {
-            continue;
-        }
-        let shot = (h >> 20) as usize % n_shots.max(1);
-        let severity = 0.6 + ((h >> 33) % 40) as f32 / 100.0;
-        let j = 1.0 + ((h >> 45) % 20) as f64 / 10.0;
-        evs.push(motion::MotionEvent {
-            volume: g,
-            shot,
-            severity,
-            jump_mm: [0.3 * j, j, 0.2 * j],
-            jump_deg: [0.5, 0.3, 0.2],
-        });
-    }
-    evs
 }
 
 /// Parse a "a,b,c" triple.
@@ -566,8 +536,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
     if cli.mb > 1 && cli.dropout_rate > 0.0 {
         let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
-        let events = gen_dropout_events(&scheme.bvals, n_shots, cli.dropout_rate,
-            0xB10C_5EED ^ cli.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let events = motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed));
         let gt = motion::apply_multiband_motion(
             &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world,
             cli.mb, true, &scheme.bvals, scheme.b_max, &events);
@@ -599,9 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reverse_phase: cli.reverse_pe,
         noise_variance: cli.noise,
         pf_mode: match cli.pf_mode.as_str() {
+            "scanner" => PartialFourierMode::Scanner,
             "contiguous" => PartialFourierMode::Contiguous,
             "fiberfox" => PartialFourierMode::FiberfoxCompatible,
-            o => return Err(format!("unknown --pf-mode {o:?}; expected contiguous or fiberfox").into()),
+            o => return Err(format!("unknown --pf-mode {o:?}; expected scanner, contiguous or fiberfox").into()),
         },
         eddy_strength: cli.eddy,
         eddy_quad: cli.eddy_quad,

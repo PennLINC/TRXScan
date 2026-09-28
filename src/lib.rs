@@ -40,6 +40,8 @@ pub mod scheme;
 pub mod raster;
 pub mod signal;
 pub mod compartments;
+/// Weighted streamline subsampling (std-only; shared by both binaries and the bindings).
+pub mod streamlines;
 
 // --- ground truth: orientation mixture + closed-form scalars ---
 pub mod sphere;

@@ -256,26 +256,10 @@ fn header_for_grid(v: [[f64; 4]; 4]) -> NiftiHeader {
 }
 
 /// Write a 4D `[x,y,z,g]` (layout `(x+nx*(y+ny*z))*ngrad+g`) as NIfTI-1 with the given affine.
-/// The simulation grid's [`Grid`]: in-plane refined by `o`, same FOV, slice direction untouched.
-///
-/// The origin shifts by half the difference between the coarse and fine voxel sizes on each
-/// refined axis, matching the half-cell registration the forward transform uses and the geometry
-/// `scripts/prepare_acquisition_grid.py` writes. Identity at `o = 1`.
+/// The simulation grid's [`Grid`] for oversampling `o`: see [`Grid::hires`] (kept here so the
+/// benchmark writer and the io tests keep their call site).
 pub fn hires_grid(g: &Grid, o: usize) -> Grid {
-    assert!(o > 0, "oversampling factor must be positive");
-    let f = o as f64;
-    let mut m = g.voxel_to_world;
-    for r in 0..3 {
-        for c in 0..2 {
-            m[r][c] /= f;
-        }
-    }
-    for r in 0..3 {
-        m[r][3] = g.voxel_to_world[r][3]
-            - 0.5 * g.voxel_to_world[r][0] * (1.0 - 1.0 / f)
-            - 0.5 * g.voxel_to_world[r][1] * (1.0 - 1.0 / f);
-    }
-    Grid { dims: [g.dims[0] * o, g.dims[1] * o, g.dims[2]], voxel_to_world: m }
+    g.hires(o)
 }
 
 /// Write the four benchmark images as BIDS-style magnitude/phase pairs.
@@ -519,12 +503,9 @@ pub fn write_complex_dwi(
     Ok(())
 }
 
-/// Keep `n` streamlines, sampled without replacement with probability proportional to the SIFT2
-/// weight (uniform when unweighted): Efraimidis-Spirakis exponential keys from a SplitMix64 hashed
-/// per streamline index, so the same `n` and `seed` select the same subset in every binary.
-/// Survivors get uniform weights (total/n), keeping the weighted density unbiased in expectation.
-/// Selecting the top-n *by weight* instead would gut over-tracked bundles: SIFT2 weights are
-/// tight around 1 and high weight means under-tracked, not important.
+/// Keep `n` streamlines sampled proportionally to weight; see
+/// [`crate::streamlines::subsample_streamlines`]. This wrapper prints the summary the binaries
+/// have always printed.
 pub fn subsample_streamlines(
     positions: Vec<[f64; 3]>,
     offsets: Vec<u32>,
@@ -532,46 +513,9 @@ pub fn subsample_streamlines(
     n: usize,
     seed: u64,
 ) -> (Vec<[f64; 3]>, Vec<u32>, Option<Vec<f32>>) {
-    let total = offsets.len().saturating_sub(1);
-    if n >= total {
-        println!("subsample: {n} >= {total} streamlines, keeping all");
-        return (positions, offsets, weights);
-    }
-    let mut keys: Vec<(f64, u32)> = (0..total as u32)
-        .map(|i| {
-            let mut z = (seed ^ (i as u64).wrapping_mul(0xA24B_AED4_963E_E407))
-                .wrapping_add(0x9E37_79B9_7F4A_7C15);
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            let u = ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64; // in (0,1)
-            let w = weights.as_ref().map_or(1.0, |w| (w[i as usize] as f64).max(1e-12));
-            (u.ln() / w, i)
-        })
-        .collect();
-    keys.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap());
-    let mut idx: Vec<u32> = keys[..n].iter().map(|k| k.1).collect();
-    idx.sort_unstable();
-
-    let total_w: f64 = weights.as_ref().map_or(total as f64, |w| w.iter().map(|&x| x as f64).sum());
-    let kept_w: f64 = weights
-        .as_ref()
-        .map_or(n as f64, |w| idx.iter().map(|&i| w[i as usize] as f64).sum());
-    let mut new_pos = Vec::new();
-    let mut new_off = Vec::with_capacity(n + 1);
-    new_off.push(0u32);
-    for &i in &idx {
-        let (s0, e0) = (offsets[i as usize] as usize, offsets[i as usize + 1] as usize);
-        new_pos.extend_from_slice(&positions[s0..e0]);
-        new_off.push(new_pos.len() as u32);
-    }
-    println!(
-        "subsample: kept {n}/{total} streamlines (seed {seed}), {:.1}% of vertices, {:.1}% of weight -> uniform",
-        100.0 * new_pos.len() as f64 / positions.len().max(1) as f64,
-        100.0 * kept_w / total_w,
-    );
-    let new_weights = weights.map(|_| vec![(total_w / n as f64) as f32; n]);
-    (new_pos, new_off, new_weights)
+    let (p, o, w, stats) = crate::streamlines::subsample_streamlines(positions, offsets, weights, n, seed);
+    println!("{}", stats.summary(seed));
+    (p, o, w)
 }
 
 #[cfg(test)]

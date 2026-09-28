@@ -172,6 +172,26 @@ impl Compartments {
     /// Scale each compartment image by a per-compartment amplitude `[fiber, gm, csf]`
     /// (proton density x T1 saturation). Lets a caller match a real acquisition's tissue b0
     /// levels without touching the physics. No-op for an all-ones factor.
+    /// The compartment images restricted to the given local slices (in that order), as a new
+    /// `Compartments` on an `[nx, ny, slices.len()]` grid.
+    pub fn select_slices(&self, slices: &[usize]) -> Compartments {
+        let [nx, ny, nz] = self.dims;
+        let per = nx * ny * self.ngrad;
+        let images = self
+            .images
+            .iter()
+            .map(|img| {
+                let mut out = Vec::with_capacity(per * slices.len());
+                for &z in slices {
+                    assert!(z < nz, "slice {z} out of range for {nz} slices");
+                    out.extend_from_slice(&img[z * per..(z + 1) * per]);
+                }
+                out
+            })
+            .collect();
+        Compartments { dims: [nx, ny, slices.len()], ngrad: self.ngrad, images, t2: self.t2.clone() }
+    }
+
     pub fn apply_s0(&mut self, s0: [f32; 3]) {
         for (img, &a) in self.images.iter_mut().zip(s0.iter()) {
             if (a - 1.0).abs() > f32::EPSILON {
@@ -380,6 +400,7 @@ pub fn generate_mixture(
     // `signal_from_mixture`, which is the O(nvox·nvert·ngrad) half and writes disjoint chunks.
     let mut hist = vec![0.0f64; nvox * nvert];
     let mut kern: Vec<(usize, f64)> = Vec::with_capacity(nvert);
+    let (mut ts_buf, mut hits) = (Vec::with_capacity(16), Vec::with_capacity(16));
     for s in 0..n_streamlines {
         let w_s = weights.map_or(1.0, |w| w.get(s).copied().unwrap_or(1.0) as f64);
         if w_s == 0.0 {
@@ -392,7 +413,7 @@ pub fn generate_mixture(
             if mat::norm(dir) < 0.5 {
                 continue;
             }
-            let hits = grid.intersect_segment(a, b);
+            grid.intersect_segment_into(a, b, &mut ts_buf, &mut hits);
             if hits.is_empty() {
                 continue;
             }
@@ -455,6 +476,97 @@ pub fn generate_mixture(
 
     crate::mixture::MixtureField {
         dims: grid.dims,
+        sphere,
+        odf: hist.iter().map(|&x| x as f32).collect(),
+        wm,
+        gm,
+        csf,
+        fallback,
+        params: *params,
+        myelin: None,
+    }
+}
+
+/// Build a [`crate::mixture::MixtureField`] from an explicit fibre list instead of rasterized
+/// streamlines: entry `i` deposits `weight[i]` of orientation mass along `dir[i]` into voxel
+/// `voxel[i]` (flat `x + nx*(y + ny*z)`), through the same nearest-vertex / Watson-κ kernel as
+/// [`generate_mixture`]. Tissue normalisation and the hindered fallback are identical, so a
+/// synthetic object (a box with one crossing, a single voxel) goes through exactly the signal
+/// and ground-truth code paths real anatomy does.
+pub fn mixture_from_fibers(
+    dims: [usize; 3],
+    voxel: &[u32],
+    dir: &[[f64; 3]],
+    weight: &[f64],
+    tissue: &TissueFractions,
+    params: &CompartmentParams,
+    kappa: Option<f64>,
+    sphere: crate::sphere::HemiSphere,
+) -> crate::mixture::MixtureField {
+    assert_eq!(voxel.len(), dir.len());
+    assert_eq!(voxel.len(), weight.len());
+    assert_eq!(tissue.dims, dims, "tissue fractions are not on the requested grid");
+    let [nx, ny, nz] = dims;
+    let nvox = nx * ny * nz;
+    let nvert = sphere.len();
+    let mut hist = vec![0.0f64; nvox * nvert];
+    let mut kern: Vec<(usize, f64)> = Vec::with_capacity(nvert);
+    for ((&v, d), &w) in voxel.iter().zip(dir).zip(weight) {
+        let v = v as usize;
+        assert!(v < nvox, "fibre voxel index {v} out of range for {dims:?}");
+        let d = mat::normalize(*d);
+        if mat::norm(d) < 0.5 || w == 0.0 {
+            continue;
+        }
+        kern.clear();
+        match kappa {
+            None => kern.push((sphere.nearest(d), 1.0)),
+            Some(k) => {
+                let mut sum = 0.0;
+                for (i, vert) in sphere.verts.iter().enumerate() {
+                    let c = mat::dot(*vert, d);
+                    let kv = (k * (c * c - 1.0)).exp();
+                    if kv < 1e-8 {
+                        continue;
+                    }
+                    kern.push((i, kv));
+                    sum += kv;
+                }
+                if sum > 0.0 {
+                    for e in kern.iter_mut() {
+                        e.1 /= sum;
+                    }
+                } else {
+                    kern.push((sphere.nearest(d), 1.0));
+                }
+            }
+        }
+        for &(i, kv) in &kern {
+            hist[v * nvert + i] += w * kv;
+        }
+    }
+    let (mut wm, mut gm, mut csf) = (vec![0.0f32; nvox], vec![0.0f32; nvox], vec![0.0f32; nvox]);
+    let mut fallback = vec![0u8; nvox];
+    for vox in 0..nvox {
+        if tissue.mask[vox] == 0 {
+            continue;
+        }
+        let (mut wf, mut gf, mut cf) = (tissue.wm[vox] as f64, tissue.gm[vox] as f64, tissue.csf[vox] as f64);
+        let tot = wf + gf + cf;
+        if tot <= 1e-9 {
+            continue;
+        }
+        wf /= tot;
+        gf /= tot;
+        cf /= tot;
+        wm[vox] = wf as f32;
+        gm[vox] = gf as f32;
+        csf[vox] = cf as f32;
+        let row: f64 = hist[vox * nvert..(vox + 1) * nvert].iter().sum();
+        fallback[vox] = (wf > 0.0 && row < 1e-12) as u8;
+    }
+    crate::mixture::MixtureField {
+        dims,
         sphere,
         odf: hist.iter().map(|&x| x as f32).collect(),
         wm,
@@ -750,6 +862,7 @@ pub fn generate_compartments_moving(
         // re-rasterize the moved streamlines, accumulate the fiber signal for this gradient
         let mut fiber = vec![0.0f64; nvox];
         let mut ivol = vec![0.0f64; nvox];
+        let (mut ts_buf, mut hits) = (Vec::with_capacity(16), Vec::with_capacity(16));
         for s in 0..n_streamlines {
             let (lo, hi) = (offsets[s] as usize, offsets[s + 1] as usize);
             for j in lo..hi.saturating_sub(1) {
@@ -758,7 +871,7 @@ pub fn generate_compartments_moving(
                 if mat::norm(dir) < 0.5 {
                     continue;
                 }
-                let hits = grid.intersect_segment(a, b);
+                grid.intersect_segment_into(a, b, &mut ts_buf, &mut hits);
                 let resp = params.intra_frac * stick.simulate(grad, dir)
                     + params.extra_frac * extra.simulate(grad, dir);
                 for h in &hits {
@@ -1027,5 +1140,32 @@ mod tests {
         assert_eq!(c.images[2][0], 0.0); // csf zeroed
         // the mixed signal is the sum of the scaled compartments
         assert_eq!(c.mixed().data[0], 3.5);
+    }
+
+    #[test]
+    fn mixture_from_fibers_matches_a_rasterized_single_segment() {
+        // One streamline segment along +x through one voxel vs. an explicit fibre with the same
+        // orientation mass: identical histograms, fractions and fallback flags.
+        use crate::sphere::HemiSphere;
+        let dims = [3usize, 3, 1];
+        let grid = Grid { dims, voxel_to_world: [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] };
+        let nvox = 9;
+        let tissue = TissueFractions {
+            dims, wm: vec![0.7; nvox], gm: vec![0.2; nvox], csf: vec![0.1; nvox], mask: vec![1; nvox],
+        };
+        let params = CompartmentParams { b_value: 1000.0, ..CompartmentParams::adult() };
+        // segment from (1.0, 1.5, 0.5) to (2.0, 1.5, 0.5): 1 mm inside voxel (1,1,0)
+        let positions = vec![[1.0, 1.5, 0.5], [2.0, 1.5, 0.5]];
+        let offsets = vec![0u32, 2];
+        let a = generate_mixture(&grid, &positions, &offsets, None, &tissue, &params, None, HemiSphere::icosphere(3));
+        let seg_area = PI * params.fiber_radius_mm * params.fiber_radius_mm;
+        let b = mixture_from_fibers(dims, &[4], &[[1.0, 0.0, 0.0]], &[1.0 * seg_area], &tissue, &params, None, HemiSphere::icosphere(3));
+        assert_eq!(a.odf, b.odf);
+        assert_eq!(a.wm, b.wm);
+        assert_eq!(a.fallback, b.fallback);
+        assert_eq!(b.fallback.iter().filter(|&&f| f == 1).count(), 8, "every WM voxel without a fibre falls back");
+        let sa = signal_from_mixture(&a, &GradientScheme::from_str("0 1000 1000", "0 1 0\n0 0 1\n0 0 0").unwrap());
+        let sb = signal_from_mixture(&b, &GradientScheme::from_str("0 1000 1000", "0 1 0\n0 0 1\n0 0 0").unwrap());
+        assert_eq!(sa.images, sb.images);
     }
 }
