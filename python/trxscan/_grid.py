@@ -28,7 +28,13 @@ def _resample(img: nib.Nifti1Image, target: tuple[tuple[int, int, int], np.ndarr
     return np.clip(a, 0, None) if clip else a
 
 
-def grid_phantom(phantom: "Phantom", voxel_mm: tuple[float, float, float], oversample: int, pad: tuple[int, int, int]) -> "Object":
+def grid_phantom(
+    phantom: "Phantom", voxel_mm: tuple[float, float, float], oversample: int, pad: tuple[int, int, int],
+    matrix: tuple[int, int, int] | None = None,
+) -> "Object":
+    """``matrix`` fixes the acquired matrix instead of bounding box + ``pad``: the tissue
+    bounding box is centred in it (the FOV of a real scan). An axis the object overruns is
+    cropped, centred, with a warning (a scanner would wrap it)."""
     from .phantom import Object
 
     if oversample < 1:
@@ -51,10 +57,21 @@ def grid_phantom(phantom: "Phantom", voxel_mm: tuple[float, float, float], overs
     if not np.allclose(gram, np.eye(3), atol=1e-6):
         raise ValueError("source affine is sheared; an isotropic target voxel is not well defined")
     step = VOX / zooms
-    shape = tuple(int(np.ceil(s / k)) + 2 * p for s, k, p in zip(hi - lo, step, PAD))
+    bbox = np.array([int(np.ceil(s / k)) for s, k in zip(hi - lo, step)])
+    if matrix is None:
+        shape = tuple(int(b + 2 * p) for b, p in zip(bbox, PAD))
+        pad_lo = PAD.astype(np.float64)
+    else:
+        shape = tuple(int(v) for v in matrix)
+        over = [i for i in range(3) if bbox[i] > shape[i]]
+        if over:
+            import warnings
+
+            warnings.warn(f"object spans {tuple(bbox)} voxels but the matrix is {shape}: cropping axis {over}", stacklevel=3)
+        pad_lo = (np.asarray(shape) - bbox) / 2.0
     M = np.eye(4)
     M[:3, :3] = np.diag(step)
-    M[:3, 3] = lo + (step - 1) / 2.0 - step * PAD
+    M[:3, 3] = lo + (step - 1) / 2.0 - step * pad_lo
     affine = A @ M
     got = np.linalg.norm(affine[:3, :3], axis=0)
     if not np.allclose(got, VOX, rtol=1e-6, atol=1e-6):

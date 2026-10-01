@@ -17,7 +17,7 @@ from importlib.metadata import PackageNotFoundError, version as _version
 
 from . import _core, objects
 from .artifacts import Artifacts, Gre
-from .bids import BidsDwi
+from .bids import BidsDwi, Dataset
 from .kspace import KSpace
 from .motion import Motion
 from .phantom import Fibers, Object, Phantom, Streamlines
@@ -44,7 +44,7 @@ def scalar_names() -> list[str]:
 
 
 __all__ = [
-    "Artifacts", "BidsDwi", "DroppedShot", "EpiReadout", "Fibers", "GnlResult", "Gre", "GreResult", "KSpace", "Motion", "Object",
+    "Artifacts", "BidsDwi", "Dataset", "DroppedShot", "EpiReadout", "Fibers", "GnlResult", "Gre", "GreResult", "KSpace", "Motion", "Object",
     "Phantom", "Protocol", "Simulation", "Streamlines", "Tissue", "TrxscanError", "Voxel", "VoxelSignal", "VoxelTruth",
     "data", "objects", "scalar_names", "set_threads", "__version__",
 ]

@@ -50,6 +50,43 @@ real = ts.BidsDwi.load("sub-01/dwi/sub-01_dir-AP_dwi.nii.gz")   # sidecar + head
 sim = phantom.simulate(real.gtab, real.protocol, ts.Artifacts(noise=1e-4), slices=40)
 ```
 
+`Protocol.from_bids` takes the modeled settings from the sidecar and header (voxel size and
+matrix, TE, readout, phase-encode polarity, partial Fourier, GRAPPA, multiband) and records the
+rest (`RepetitionTime`, `FlipAngle`, `SliceTiming`, `MagneticFieldStrength`, the scanner and
+sequence descriptors) so the simulated run's sidecar documents the scan it stands in for. The
+signal model has no TR, T1 or flip-angle term; `Protocol(tr_s=4.8, flip_angle_deg=78, mb=3)`
+sets the recorded values by hand, and `SliceTiming` is derived from TR and the multiband
+factor in the Siemens interleaved order (or given explicitly).
+
+### A BIDS dataset
+
+```python
+ds = ts.Dataset("out/ds", name="my simulation", authors=("A. Person",))
+ds.add_dwi(sim, "01", ses="a", run="01")        # sub-01/ses-a/dwi/sub-01_ses-a_dir-AP_run-01_part-{mag,phase}_dwi.*
+ds.add_phantom_anat(phantom, "01", ses="a")     # anat/: the phantom's T1w/T2w (or synthetic tissue contrast)
+ds.validate()                                   # runs bids-validator when it is on PATH
+```
+
+`Dataset` writes `dataset_description.json`, `participants.tsv`, the session lists and BIDS
+entity-ordered names; a GRE fieldmap simulated with the run goes to `fmap/` with
+`B0FieldIdentifier`/`IntendedFor`; the ground truth (noise sigma, truth peaks, GNL fields,
+dropped shots) goes to `derivatives/trxscan` so the raw tree holds only what a scanner would
+produce. Every sidecar carries `SimulationSoftware`.
+
+To simulate a real study, point at it:
+
+```python
+ds = ts.Dataset.mirror("/data/study", phantom, "out/study-sim", artifacts=ts.Artifacts(noise=2e-4),
+                       protocol=lambda p: p.replace(coils=32, accel=2))
+```
+
+Every DWI run of every subject and session is simulated with its own gradient table, voxel
+size, matrix (the phantom is centred in the source's FOV), timing, polarity and acceleration,
+and written under the same name; `sbref` runs, PEPOLAR `_epi` fieldmaps and GRE fieldmaps are
+reproduced from their sidecars; the anatomical images come from the phantom, resampled to the
+source's voxel size and axis order. Only the ids make it into `participants.tsv`, never the
+source's demographics. A `{subject: Phantom}` mapping gives each subject its own anatomy.
+
 ### Single voxels
 
 The `Voxel` API follows `dipy.sims`: one voxel, a gradient table, a signal. It adds the tissue

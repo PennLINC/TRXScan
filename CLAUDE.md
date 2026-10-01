@@ -187,7 +187,17 @@ TRXSCAN_RUN_PHANTOM=1 TRXSCAN_DATA=/path TRXSCAN_CLI=target/release/trxscan pyte
 ```
 
 `tests/test_phantom.py::test_bids_parity_with_the_cli` pins Python-vs-CLI bit-identity on the
-real phantom. Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
+real phantom (the Python sidecar is a superset of the CLI's: it adds the recorded-only
+`RepetitionTime`/`FlipAngle`/`SliceTiming`/scanner descriptors and a `SimulationSoftware`
+stamp). BIDS output lives in `python/trxscan/bids.py`: `Dataset` (dataset-level files,
+entity-ordered names, `fmap/` for GRE/PEPOLAR, ground truth under `derivatives/trxscan`, never
+in the raw tree) and `Dataset.mirror(source, phantom, out)`, which simulates every DWI/sbref/epi
+run of a real BIDS dataset under `Protocol.from_bids` (voxel + `matrix` from the header, timing
+and acceleration from the sidecar; `Protocol.metadata` carries the `SIDECAR_PASSTHROUGH`
+descriptors, never conversion/series keys or demographics). `Protocol.pe` names the polarity in
+the *written* frame: under `fsl_orientation` an LPS phantom's native polarity is flipped so
+`"j-"` is always a posterior shift. `Phantom.t1w`/`t2w` are pass-through anatomy for `anat/`
+(synthetic tissue contrast when absent). Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
 CLI build's HDF5 compile. Release: tag `X.Y.Z` (no `v`) matching `[workspace.package].version`
 (`.github/workflows/release.yml` builds manylinux/musllinux/macOS/Windows wheels and publishes).
 

@@ -105,21 +105,28 @@ class Simulation:
     def n_vol(self) -> int:
         return int(self.bvals.size)
 
+    def _image(self, flat: np.ndarray) -> nib.Nifti1Image:
+        img = nifti(series(flat, self.dims, self.n_vol), self.affine)
+        if self.protocol.tr_s is not None:
+            img.header.set_zooms(tuple(img.header.get_zooms()[:3]) + (float(self.protocol.tr_s),))
+            img.header.set_xyzt_units("mm", "sec")
+        return img
+
     @property
     def magnitude(self) -> nib.Nifti1Image:
-        return nifti(series(self.mag, self.dims, self.n_vol), self.affine)
+        return self._image(self.mag)
 
     @property
     def phase(self) -> nib.Nifti1Image:
-        return nifti(series(self.ph, self.dims, self.n_vol), self.affine)
+        return self._image(self.ph)
 
     @property
     def real(self) -> nib.Nifti1Image:
-        return nifti(series(self.re, self.dims, self.n_vol), self.affine)
+        return self._image(self.re)
 
     @property
     def imag(self) -> nib.Nifti1Image:
-        return nifti(series(self.im, self.dims, self.n_vol), self.affine)
+        return self._image(self.im)
 
     @property
     def complex(self) -> np.ndarray:
@@ -398,6 +405,11 @@ def run(
         per = nx * ny
         noise_sigma = np.concatenate([noise_sigma[int(z) * per : (int(z) + 1) * per] for z in sel])
     acq = {**protocol.acquisition(ny), **artifacts.acquisition()}
+    # `pe` names the phase-encode polarity in the WRITTEN frame (BIDS "j-"/"j" of the file the
+    # caller gets). With fsl_orientation the written frame is LAS; if that reorientation flips
+    # the native j axis (an LPS phantom), the simulation's native polarity is the opposite.
+    pe_flip = protocol.fsl_orientation and _core.out_ped(_core.reorient_to_las(obj.affine, obj.dims), 1, -1) == "j"
+    acq["reverse_phase"] = bool(protocol.reverse_phase) != pe_flip
     te_pv = None
     if artifacts.te_per_volume is not None:
         te_pv = [float(v) for v in np.asarray(artifacts.te_per_volume).reshape(-1)]
@@ -430,7 +442,7 @@ def run(
     if artifacts.isocenter is not None:
         out_affine[:3, 3] -= np.asarray(artifacts.isocenter, dtype=np.float64)
     reo = _core.reorient_to_las(out_affine, out_dims) if protocol.fsl_orientation else _core.reorient_identity(out_dims)
-    in_pe_sign = 1 if protocol.reverse_phase else -1
+    in_pe_sign = 1 if acq["reverse_phase"] else -1
     ped = _core.out_ped(reo, 1, in_pe_sign)
     re_, im_, mag_, ph_ = out["re"], out["im"], out["mag"], out["phase"]
     if protocol.fsl_orientation:
@@ -441,10 +453,13 @@ def run(
         out_affine = _core.reorient_affine(out_affine, reo).reshape(4, 4)
         out_dims = tuple(int(v) for v in reo["out_dims"])
     bvecs_fsl = _core.fsl_bvecs(np.ascontiguousarray(bvecs), out_affine).reshape(-1, 3)
-    sidecar = {"Manufacturer": "TRXScan", "PhaseEncodingDirection": ped, **protocol.sidecar(ny)}
+    sidecar = {**protocol.sidecar(ny, nz=nz_full, nx=nx), "PhaseEncodingDirection": ped}
     # EffectiveEchoSpacing follows the CLI: TotalReadoutTime / (n_PE - 1) along the WRITTEN PE axis.
     pe_axis = {"i": 0, "j": 1, "k": 2}[ped[0]]
     sidecar["EffectiveEchoSpacing"] = round(sidecar["TotalReadoutTime"] / max(out_dims[pe_axis] - 1, 1), 8)
+    if "SliceTiming" in sidecar:
+        # the written image holds `global_z` of the full volume's slices
+        sidecar["SliceTiming"] = [sidecar["SliceTiming"][z] for z in global_z]
     if gre_result is not None:
         sidecar["B0FieldSource"] = gre_result.b0_field
 

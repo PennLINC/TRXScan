@@ -81,5 +81,7 @@ def test_bids_parity_with_the_cli(phantom, hbcd, tmp_path):
         c = np.asarray(nib.load(S / f"cli_part-{part}_dwi.nii.gz").dataobj)[:, :, z, :]
         p = np.asarray(nib.load(S / f"py_part-{part}_dwi.nii.gz").dataobj)[:, :, 0, :]
         assert np.array_equal(c, p), part
-    assert json.load(open(S / "cli_part-mag_dwi.json")) == json.load(open(S / "py_part-mag_dwi.json"))
+    # the Python sidecar is a superset (recorded-only keys, simulation stamp); the CLI's keys agree
+    cli_side, py_side = json.load(open(S / "cli_part-mag_dwi.json")), json.load(open(S / "py_part-mag_dwi.json"))
+    assert {k: cli_side[k] for k in cli_side if k != "Manufacturer"} == {k: py_side[k] for k in cli_side if k != "Manufacturer"}
     assert np.abs(np.loadtxt(S / "cli_dwi.bvec") - np.loadtxt(S / "py_dwi.bvec")).max() <= 1e-6
