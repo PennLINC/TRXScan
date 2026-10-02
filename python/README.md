@@ -9,7 +9,7 @@ ground truth of the same object.
 
 ```bash
 pip install trxscan                  # binary wheels for Linux, macOS and Windows
-pip install "trxscan[dipy,trx,viz]"  # dipy gradient tables, TRX streamlines, ODX export for TRXViz
+pip install "trxscan[dipy,viz]"      # dipy gradient tables, ODX export for TRXViz (TRX reading is built in)
 ```
 
 ## Overview

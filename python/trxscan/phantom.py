@@ -57,7 +57,7 @@ class Streamlines:
             try:
                 from trx.trx_file_memmap import load as trx_load
             except ImportError as e:  # pragma: no cover
-                raise ImportError("loading .trx needs trx-python: pip install trxscan[trx]") from e
+                raise ImportError("loading .trx needs trx-python: pip install trx-python") from e
             t = trx_load(str(path))
             try:
                 # trx-python hands out memory maps: copy everything before closing the file, or

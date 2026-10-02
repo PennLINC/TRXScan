@@ -1,7 +1,7 @@
 """Visualisation hand-offs: write what TRXViz renders (TRX tractograms, ODX orientation files
 built from the simulator's own mixture and truth peaks) and drive ``trxviz-cli`` to a PNG.
 
-Needs ``trx-python`` for TRX writing (``pip install trxscan[trx]``) and the ``odx`` package (the
+Needs ``trx-python`` for TRX writing (a base dependency since 0.2.1) and the ``odx`` package (the
 Python binding of odx-rs, TRXViz's orientation-data reader) for ODX (``pip install
 trxscan[viz]``). Rendering needs a ``trxviz-cli`` binary: ``$TRXVIZ_CLI``, ``trxviz-cli`` on
 PATH, or one installed with :func:`install_trxviz`.
@@ -34,7 +34,7 @@ def write_trx(streamlines: "Streamlines", path: str | Path, *, reference: Any = 
     try:
         from trx.trx_file_memmap import TrxFile
     except ImportError as e:  # pragma: no cover
-        raise ImportError("write_trx needs trx-python: pip install trxscan[trx]") from e
+        raise ImportError("write_trx needs trx-python: pip install trx-python") from e
     from nibabel.streamlines import ArraySequence, Tractogram
 
     try:  # trx-python type-checks against dipy's StatefulTractogram without importing it

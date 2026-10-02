@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
 
         from ..viz import write_trx
     except ImportError as e:  # pragma: no cover
-        raise SystemExit("make_slab needs trx-python (pip install trxscan[trx])") from e
+        raise SystemExit("make_slab needs trx-python (pip install trx-python)") from e
     write_trx(sl, a.out / "slab_desc-actsift2_tracks.trx", reference=ph.wm)
     if "AP" in ph.motion:
         src = ph.motion["AP"].source
