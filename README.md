@@ -86,7 +86,7 @@ The `trxscan` package on PyPI wraps the same simulator and is the recommended wa
 from notebooks and scripts:
 
 ```bash
-pip install "trxscan[dipy,trx,viz]"    # binary wheels for Linux, macOS and Windows; no Rust toolchain needed
+pip install "trxscan[dipy,viz]"        # binary wheels for Linux, macOS and Windows; no Rust toolchain needed (TRX reading is built in)
 ```
 
 ```python
