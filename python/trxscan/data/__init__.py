@@ -145,6 +145,23 @@ def load_phantom(name: str = "sub-60501", *, weights: str | None = "sift2_weight
     return Phantom(**{**{f.name: getattr(ph, f.name) for f in ph.__dataclass_fields__.values() if f.name != "_grids"}, "path": root})
 
 
+def fetch(name: str = "sub-60501") -> Path:
+    """Download (or locate) a bundle without loading it; returns the directory holding it.
+    ``trxscan-fetch`` on the command line, for prewarming a CI cache."""
+    return _resolve(name)["root"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="trxscan-fetch", description="Fetch hosted TRXScan phantom bundles into the cache.")
+    ap.add_argument("names", nargs="*", default=["sub-60501"], help=f"bundles to fetch (known: {', '.join(sorted(BUNDLES))})")
+    a = ap.parse_args(argv)
+    for n in a.names:
+        print(f"{n}: {fetch(n)}")
+    return 0
+
+
 def scheme_files(name: str = "sub-60501", pe: str = "AP") -> tuple[Path, Path]:
     """``(bval, bvec)`` paths of the example acquisition that ships with a bundle (feed to
     dipy's ``read_bvals_bvecs``/``gradient_table``)."""

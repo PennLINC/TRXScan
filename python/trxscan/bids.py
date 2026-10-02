@@ -187,7 +187,7 @@ class BidsDwi:
 ENTITY_ORDER: tuple[str, ...] = (
     "sub", "ses", "sample", "task", "tracksys", "acq", "nuc", "voi", "ce", "trc", "stain", "rec", "dir", "run",
     "mod", "echo", "flip", "inv", "mt", "part", "proc", "hemi", "space", "split", "recording", "chunk", "seg",
-    "res", "den", "label", "desc",
+    "res", "den", "label", "from", "to", "mode", "desc",
 )
 _EXTS = (".nii.gz", ".nii", ".json", ".bval", ".bvec", ".tsv", ".grad")
 
@@ -283,6 +283,94 @@ def match_geometry(img: nib.Nifti1Image, zooms: Sequence[float] | None = None, a
 
 # keys of a real anatomical sidecar worth carrying into the stand-in's sidecar
 _ANAT_PASSTHROUGH = SIDECAR_PASSTHROUGH + ("EchoTime", "RepetitionTime", "InversionTime", "FlipAngle", "EchoTrainLength")
+
+
+def itk_displacement(img: nib.Nifti1Image) -> nib.Nifti1Image:
+    """A 4-D RAS displacement image (three volumes, mm) as the ITK/ANTs displacement-field
+    layout: 5-D ``(nx, ny, nz, 1, 3)`` float32, LPS components, intent ``vector``."""
+    d = np.asanyarray(img.dataobj, dtype=np.float32)
+    if d.ndim != 4 or d.shape[-1] != 3:
+        raise ValueError(f"expected a (nx, ny, nz, 3) displacement image, got {d.shape}")
+    lps = d * np.array([-1.0, -1.0, 1.0], np.float32)
+    out = nib.Nifti1Image(lps[:, :, :, None, :], img.affine)
+    out.header.set_intent("vector")
+    out.header.set_qform(img.affine, code=1)
+    out.header.set_sform(img.affine, code=1)
+    out.header.set_xyzt_units("mm")
+    return out
+
+
+def rigid_offset(trans_mm: Sequence[float] = (0.0, 0.0, 0.0), rot_deg: Sequence[float] = (0.0, 0.0, 0.0), center: Sequence[float] = (0.0, 0.0, 0.0)) -> np.ndarray:
+    """A 4x4 world (RAS mm) rigid transform: rotate by ``rot_deg`` about the RAS axes (x, then
+    y, then z) around ``center``, then translate by ``trans_mm``."""
+    rx, ry, rz = np.radians(np.asarray(rot_deg, dtype=np.float64))
+    cx, sx, cy, sy, cz, sz = np.cos(rx), np.sin(rx), np.cos(ry), np.sin(ry), np.cos(rz), np.sin(rz)
+    R = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]) @ np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    c = np.asarray(center, dtype=np.float64)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = c - R @ c + np.asarray(trans_mm, dtype=np.float64)
+    return T
+
+
+def offset_image(img: nib.Nifti1Image, T: np.ndarray, mode: str = "resample", phase: str | None = None) -> nib.Nifti1Image:
+    """``img`` as seen after the object moved by ``T`` (world RAS). ``mode="header"`` keeps the
+    voxels and pre-multiplies the affine (exact, but a pipeline that drops header obliquity
+    never sees the movement); ``mode="resample"`` (default) keeps the original grid and
+    resamples the moved object into it (trilinear), which is what a scanner would record.
+    ``phase`` resamples a wrapped phase image through its complex representation:
+    ``"siemens"`` for int16 0..4095 phase difference images, ``"rad"`` for radians."""
+    T = np.asarray(T, dtype=np.float64)
+    if mode == "header":
+        out = nib.Nifti1Image(np.asanyarray(img.dataobj), T @ img.affine, img.header)
+        out.header.set_qform(out.affine, code=1)
+        out.header.set_sform(out.affine, code=1)
+        return out
+    if mode != "resample":
+        raise ValueError("mode must be 'resample' or 'header'")
+    from nibabel.processing import resample_from_to
+
+    moved = nib.Nifti1Image(np.asanyarray(img.dataobj), T @ img.affine)
+    target = (img.shape[:3], img.affine)
+    if phase is None:
+        data = resample_from_to(moved, target, order=1).get_fdata().astype(np.float32)
+    else:
+        raw = np.asanyarray(img.dataobj, dtype=np.float64)
+        rad = raw / 4096.0 * 2 * np.pi - np.pi if phase == "siemens" else raw
+        re = resample_from_to(nib.Nifti1Image(np.cos(rad).astype(np.float32), T @ img.affine), target, order=1).get_fdata()
+        im = resample_from_to(nib.Nifti1Image(np.sin(rad).astype(np.float32), T @ img.affine), target, order=1).get_fdata()
+        ang = np.arctan2(im, re)
+        data = np.round((ang + np.pi) / (2 * np.pi) * 4096.0).clip(0, 4095).astype(np.int16) if phase == "siemens" else ang.astype(np.float32)
+    out = nib.Nifti1Image(data, img.affine)
+    out.header.set_qform(img.affine, code=1)
+    out.header.set_sform(img.affine, code=1)
+    out.header.set_xyzt_units("mm")
+    return out
+
+
+def itk_transform_text(T_ras: np.ndarray) -> str:
+    """An ITK text transform (``AffineTransform_double_3_3``, LPS) that maps a point of the
+    un-moved frame to the same tissue in the frame moved by ``T_ras``: the transform
+    ``antsApplyTransforms`` needs to resample the moved image back onto the un-moved grid."""
+    LPS = np.diag([-1.0, -1.0, 1.0])
+    A = LPS @ T_ras[:3, :3] @ LPS
+    t = LPS @ T_ras[:3, 3]
+    params = " ".join(f"{v:.10g}" for v in np.concatenate([A.ravel(), t]))
+    return f"#Insight Transform File V1.0\n#Transform 0\nTransform: AffineTransform_double_3_3\nParameters: {params}\nFixedParameters: 0 0 0\n"
+
+
+def _offset_of(offset: Any, img: nib.Nifti1Image) -> np.ndarray | None:
+    """``offset`` as a 4x4: None, a 4x4, or six numbers ``(tx, ty, tz, rx, ry, rz)`` (mm, deg)
+    about the image's volume centre."""
+    if offset is None:
+        return None
+    o = np.asarray(offset, dtype=np.float64)
+    if o.shape == (4, 4):
+        return o
+    if o.size != 6:
+        raise ValueError("offset must be a 4x4 world transform or (tx, ty, tz, rx, ry, rz)")
+    centre = img.affine @ np.append((np.asarray(img.shape[:3]) - 1) / 2.0, 1.0)
+    return rigid_offset(o[:3], o[3:], centre[:3])
 
 
 # ─── Dataset ────────────────────────────────────────────────────────────────
@@ -420,19 +508,27 @@ class Dataset:
     def add_dwi(
         self, sim: "Simulation", sub: str, ses: str | None = None, *, suffix: str = "dwi",
         parts: Sequence[str] | None = ("mag", "phase"), truth: bool = True, b0_field: str | None = None,
-        intended_for: Sequence[str | Path] | None = None, fmap_entities: dict[str, Any] | None = None, **entities: Any,
+        b0_identifier: str | None = None, intended_for: Sequence[str | Path] | None = None,
+        fmap_entities: dict[str, Any] | None = None, fmap_offset: Any = None, dwi_offset: Any = None, **entities: Any,
     ) -> list[Path]:
         """Write a simulated run. ``suffix`` is ``"dwi"`` (+ bval/bvec), ``"sbref"`` or ``"epi"``
         (a PEPOLAR fieldmap: goes to ``fmap/``, magnitude only, with ``IntendedFor`` =
         ``intended_for``). ``parts`` ``("mag", "phase")`` writes complex data as ``part-mag`` /
         ``part-phase`` (one bval/bvec pair without the ``part`` entity serves both); ``None``
-        or ``("mag",)`` writes the magnitude alone without a ``part`` entity. ``dir`` defaults to the protocol's phase-encode polarity. A GRE fieldmap
+        or ``("mag",)`` writes the magnitude alone without a ``part`` entity. ``dir`` defaults to the protocol's phase-encode polarity; ``dir=None`` leaves it out. A GRE fieldmap
         simulated with the run is written to ``fmap/`` (``fmap_entities`` names it) and
-        ``b0_field`` stamps ``B0FieldSource`` on a run whose fieldmap another run carries.
+        ``b0_field`` stamps ``B0FieldSource`` on a run whose fieldmap another run carries;
+        ``b0_identifier`` also stamps ``B0FieldIdentifier``, for a DWI that is itself a source
+        of a PEPOLAR estimation (a reverse-PE pair needs both members under one identifier).
+        ``fmap_offset`` moves the subject between the DWI and the fieldmap written here (the
+        GRE carried by the run, or this run itself when ``suffix="epi"``); ``dwi_offset`` moves
+        this DWI run itself relative to the dataset's other runs (the bvecs stay in the image
+        axes, so a pipeline aligning runs must rotate them); see :meth:`add_anat`.
         Ground truth goes to the derivatives tree when ``truth``. Returns the raw files written."""
         ent: dict[str, Any] = {"sub": self._label(sub, "sub"), "ses": self._label(ses, "ses")}
+        if "dir" not in entities:  # default the polarity entity; an explicit dir=None leaves it out
+            entities["dir"] = _dir_of(sim.protocol)
         ent.update({k: v for k, v in entities.items() if v is not None})
-        ent.setdefault("dir", _dir_of(sim.protocol))
         is_fmap = suffix == "epi"
         datatype = "fmap" if is_fmap else "dwi"
         out_dir = self.folder(sub, ses, datatype)
@@ -440,6 +536,8 @@ class Dataset:
         side.pop("ImageComparison", None)
         if b0_field is not None:
             side["B0FieldSource"] = b0_field
+        if b0_identifier is not None:
+            side["B0FieldIdentifier"] = b0_identifier
         if is_fmap:
             side.pop("B0FieldSource", None)
             if intended_for:
@@ -450,10 +548,13 @@ class Dataset:
         use_parts = [p for p in (parts or ("mag",)) if p in ("mag", "phase")]
         complex_out = len(use_parts) > 1 and not is_fmap
         mag_stem: Path | None = None
+        T_epi = _offset_of(fmap_offset, sim.magnitude) if is_fmap else _offset_of(dwi_offset, sim.magnitude)
         for part in use_parts if complex_out else ["mag"]:
             e = {**ent, "part": part if complex_out else None}
             stem = out_dir / bids_name(e, suffix)
             img = sim.magnitude if part == "mag" else sim.phase
+            if T_epi is not None:
+                img = offset_image(img, T_epi, "resample")
             written.append(self._write_img(Path(f"{stem}.nii.gz"), img))
             meta = dict(side)
             if part == "phase":
@@ -467,22 +568,28 @@ class Dataset:
             bval_p, bvec_p = write_bval_bvec(out_dir / bids_name({**ent, "part": None}, suffix), sim.bvals, sim.bvecs_fsl)
             written += [bval_p, bvec_p]
             self.written += [bval_p, bvec_p]
+        if T_epi is not None:
+            written += self.add_offset_truth(sub, ses, datatype, "epi" if is_fmap else (f"dir{ent['dir']}" if ent.get("dir") else "run"), T_epi,
+                                             **{k: v for k, v in ent.items() if k not in ("sub", "ses")})
         if sim.gre is not None and not is_fmap:
-            written += self.add_gre(sim, sub, ses, intended_for=[written[0]], **(fmap_entities or {k: ent[k] for k in ("run",) if ent.get(k)}))
+            written += self.add_gre(sim, sub, ses, intended_for=[written[0]], offset=fmap_offset, **(fmap_entities or {k: ent[k] for k in ("run",) if ent.get(k)}))
         if truth:
             self._add_truth(sim, sub, ses, {**ent, "part": None}, suffix)
         return written
 
-    def add_gre(self, sim: "Simulation", sub: str, ses: str | None = None, *, intended_for: Sequence[str | Path] | None = None, **entities: Any) -> list[Path]:
+    def add_gre(self, sim: "Simulation", sub: str, ses: str | None = None, *, intended_for: Sequence[str | Path] | None = None, offset: Any = None, offset_mode: str = "resample", **entities: Any) -> list[Path]:
         """Write the GRE fieldmap simulated with ``sim`` (``magnitude1``/``magnitude2`` +
         ``phasediff`` or ``phase1``/``phase2``) to ``fmap/`` with ``B0FieldIdentifier`` and
-        ``IntendedFor``."""
+        ``IntendedFor``. ``offset`` moves the subject between the DWI and the fieldmap (see
+        :meth:`add_anat`); the field moves with the head."""
         g = sim.gre
         if g is None:
             raise ValueError("the simulation carries no GRE fieldmap (run with gre=Gre())")
         ent: dict[str, Any] = {"sub": self._label(sub, "sub"), "ses": self._label(ses, "ses")}
         ent.update({k: v for k, v in entities.items() if v is not None})
         out_dir = self.folder(sub, ses, "fmap")
+        T = _offset_of(offset, g.magnitude1)
+        mv = (lambda im, ph=None: offset_image(im, T, offset_mode, ph)) if T is not None else (lambda im, ph=None: im)
         base: dict[str, Any] = {"B0FieldIdentifier": g.b0_field, **simulation_stamp()}
         for k in ("Manufacturer", "ManufacturersModelName", "MagneticFieldStrength"):
             if k in sim.sidecar:
@@ -493,7 +600,7 @@ class Dataset:
         written: list[Path] = []
         for i, img in enumerate((g.magnitude1, g.magnitude2), start=1):
             stem = out_dir / bids_name(ent, f"magnitude{i}")
-            written.append(self._write_img(Path(f"{stem}.nii.gz"), img))
+            written.append(self._write_img(Path(f"{stem}.nii.gz"), mv(img)))
             written.append(self._write_json(Path(f"{stem}.json"), {**base, "EchoTime": te[i - 1]}))
         for name, img in g.phase.items():
             stem = out_dir / bids_name(ent, name)
@@ -502,12 +609,15 @@ class Dataset:
                 meta.update({"EchoTime1": te[0], "EchoTime2": te[1]})
             else:
                 meta["EchoTime"] = te[0] if name == "phase1" else te[1]
-            written.append(self._write_img(Path(f"{stem}.nii.gz"), img))
+            written.append(self._write_img(Path(f"{stem}.nii.gz"), mv(img, "siemens")))
             written.append(self._write_json(Path(f"{stem}.json"), meta))
+        if T is not None:
+            written += self.add_offset_truth(sub, ses, "fmap", "fmap", T, **{k: v for k, v in ent.items() if k not in ("sub", "ses")})
         return written
 
     def _add_truth(self, sim: "Simulation", sub: str, ses: str | None, ent: dict[str, Any], suffix: str) -> list[Path]:
-        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout:
+        has_field = sim.fieldmap is not None and bool(np.any(np.asanyarray(sim.fieldmap.dataobj)))
+        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout and sim.clean_b0 is None and not has_field:
             return []
         out_dir = self.folder(sub, ses, "dwi", derivative=True)
         written: list[Path] = []
@@ -525,6 +635,13 @@ class Dataset:
             if meta is not None:
                 written.append(self._write_json(Path(f"{stem}.json"), {**meta, **stamp}))
 
+        if sim.clean_b0 is not None:
+            put("cleanb0", sim.clean_b0, {"Description": "b=0 volume of the same object and protocol with every geometric and noise artifact off (no susceptibility distortion, gradient nonlinearity, eddy, ghost, spikes, noise, motion or dropout): what a corrected b=0 should converge to."})
+        if has_field:
+            put("fieldmap", sim.fieldmap, {"Units": "Hz", "Description": "Off-resonance field the acquisition applied, on the acquisition grid (a +field shifts signal toward +PhaseEncodingDirection)."})
+            disp = sim.displacement
+            if disp is not None:
+                put("displacement", disp, {"Units": "mm", "Description": "Susceptibility displacement applied: three volumes = RAS x,y,z of where tissue at each true position appears (apparent minus true), fieldmap x TotalReadoutTime along the phase-encode axis."})
         if sim.noise_sigma is not None:
             put("noisesigma", sim.noise_sigma, {"Description": "Per-voxel magnitude noise SD applied by the simulation."})
         if sim.truth_peaks is not None:
@@ -533,6 +650,7 @@ class Dataset:
             put("gnlcoeff", text=sim.gnl.coeff_text, ext=".grad")
             put("gnldisp", sim.gnl.disp, {"Description": "Ground-truth gradient-nonlinearity displacement d(r) = phi(r) - r at each voxel centre r, three volumes = RAS x,y,z in mm (apparent minus true position)."})
             put("gnlinvdisp", sim.gnl.invdisp, {"Description": "Inverse gradient-nonlinearity displacement phi^-1(x) - x at each voxel centre x, three volumes = RAS x,y,z in mm (true minus apparent position)."})
+            put("gnldispitk", itk_displacement(sim.gnl.disp), {"Description": "The gradient-nonlinearity displacement d(r) = phi(r) - r as an ITK displacement field (5-D vector image, LPS mm, NIFTI_INTENT_VECTOR): at each output (true) point the vector to the input (apparent) point, i.e. the correction warp to pull the apparent image into the true frame."})
             put("gnlgraddev", sim.gnl.graddev, {
                 "Description": "Ground-truth gradient deviation: 9 volumes, HCP/FSL layout; read row-major into T, the applied gradient in this image's voxel axes is T.T @ g; identity included.",
                 "GradientNonlinearity": sim.gnl.spec, "GradientNonlinearityScale": sim.gnl.scale,
@@ -544,30 +662,58 @@ class Dataset:
 
     def add_anat(
         self, img: nib.Nifti1Image, sub: str, ses: str | None = None, *, suffix: str = "T1w",
-        sidecar: dict[str, Any] | None = None, **entities: Any,
+        sidecar: dict[str, Any] | None = None, offset: Any = None, offset_mode: str = "resample", **entities: Any,
     ) -> list[Path]:
         """Write an anatomical image to ``anat/`` with its sidecar (``sidecar`` keys plus the
-        simulation stamp)."""
+        simulation stamp). ``offset`` (``(tx, ty, tz, rx, ry, rz)`` in mm and degrees, or a
+        4x4 world transform) moves the subject between this scan and the DWI, by resampling
+        the moved head into the scan's grid (``offset_mode="resample"``) or by rotating the
+        header (``"header"``); the truth transform is written to the derivatives (see
+        :meth:`add_offset_truth`)."""
         ent: dict[str, Any] = {"sub": self._label(sub, "sub"), "ses": self._label(ses, "ses")}
         ent.update({k: v for k, v in entities.items() if v is not None})
         out_dir = self.folder(sub, ses, "anat")
         stem = out_dir / bids_name(ent, suffix)
         meta = {"Manufacturer": "TRXScan", **(sidecar or {}), **simulation_stamp()}
-        return [self._write_img(Path(f"{stem}.nii.gz"), img), self._write_json(Path(f"{stem}.json"), meta)]
+        T = _offset_of(offset, img)
+        files = []
+        if T is not None:
+            img = offset_image(img, T, offset_mode)
+            files += self.add_offset_truth(sub, ses, "anat", suffix, T, **{k: v for k, v in ent.items() if k not in ("sub", "ses")})
+        return [self._write_img(Path(f"{stem}.nii.gz"), img), self._write_json(Path(f"{stem}.json"), meta)] + files
+
+    def add_offset_truth(self, sub: str, ses: str | None, datatype: str, from_label: str, T: np.ndarray, **entities: Any) -> list[Path]:
+        """Record a between-scan movement ``T`` (world RAS, 4x4) as ground truth: an ITK text
+        transform ``from-<label>_to-dwi`` that resamples the moved image onto the DWI frame,
+        plus its JSON (the 4x4, and translation/rotation magnitudes)."""
+        out_dir = self.folder(sub, ses, datatype, derivative=True)
+        ent = {"sub": self._label(sub, "sub"), "ses": self._label(ses, "ses"), **entities, "from": from_label, "to": "dwi", "mode": "image", "desc": "truth"}
+        stem = out_dir / bids_name(ent, "xfm")
+        p = Path(f"{stem}.txt")
+        p.write_text(itk_transform_text(T))
+        self.written.append(p)
+        R = T[:3, :3]
+        meta = {
+            "Description": f"Rigid movement of the subject between the DWI and this {from_label}: the ITK transform maps DWI-frame points to the same tissue in the {from_label} frame (what antsApplyTransforms needs to pull the {from_label} onto the DWI grid). WorldTransformRAS is the 4x4 applied to the {from_label} affine.",
+            "WorldTransformRAS": T.tolist(), "RotationDeg": float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))), "TranslationMm": float(np.linalg.norm(T[:3, 3])),
+            **simulation_stamp(),
+        }
+        return [p, self._write_json(Path(f"{stem}.json"), meta)]
 
     def add_phantom_anat(
         self, phantom: "Phantom", sub: str, ses: str | None = None, *, suffixes: Sequence[str] = ("T1w", "T2w"),
         mode: str = "auto", zooms: Sequence[float] | None = None, axcodes: Sequence[str] | None = None,
-        sidecar: dict[str, Any] | None = None, **entities: Any,
+        sidecar: dict[str, Any] | None = None, offset: Any = None, offset_mode: str = "resample", **entities: Any,
     ) -> list[Path]:
         """Write the phantom's T1w/T2w (or synthetic stand-ins, see :func:`phantom_anat`),
-        resampled to ``zooms`` / reordered to ``axcodes`` when given."""
+        resampled to ``zooms`` / reordered to ``axcodes`` when given, moved by ``offset``
+        (see :meth:`add_anat`) when given."""
         out: list[Path] = []
         for suffix in suffixes:
             img, note = phantom_anat(phantom, suffix, mode)
             img = match_geometry(img, zooms, axcodes)
             meta = {"Description": note, **(sidecar or {})}
-            out += self.add_anat(img, sub, ses, suffix=suffix, sidecar=meta, **entities)
+            out += self.add_anat(img, sub, ses, suffix=suffix, sidecar=meta, offset=offset, offset_mode=offset_mode, **entities)
         return out
 
     # -- checks --------------------------------------------------------------
@@ -588,7 +734,7 @@ class Dataset:
         cls, source: str | Path, phantom: Any, out: str | Path, *, subjects: Iterable[str] | None = None,
         sessions: Iterable[str] | None = None, artifacts: "Artifacts | None" = None,
         protocol: Callable[[Protocol], Protocol] | None = None, anat: str | None = "auto", fmap: bool = True,
-        sbref: bool = True, truth: bool = True, slices: Any = "all", kspace: bool = False,
+        sbref: bool = True, truth: bool = True, slices: Any = "all", kspace: bool = False, chunk: int | None = 8,
         log: Callable[[str], None] | None = print, name: str | None = None, **simulate_kw: Any,
     ) -> "Dataset":
         """Simulate every DWI run of a real BIDS dataset and write the result as a dataset of the
@@ -608,7 +754,8 @@ class Dataset:
         or a callable of the subject label. ``protocol`` adjusts each derived protocol
         (``lambda p: p.replace(tissue="infant", coils=32)``). Remaining keywords go to
         :meth:`Object.simulate` (``context=``, ``progress=``, ...). ``slices`` restricts every
-        run to a slab (for a quick look); the sidecars then describe the slab.
+        run to a slab (for a quick look); the sidecars then describe the slab. ``chunk`` runs
+        each volume ``chunk`` slices at a time so memory stays at a slab's worth.
         """
         from .artifacts import Artifacts, Gre
         from .phantom import Phantom
@@ -622,6 +769,7 @@ class Dataset:
         if (src / "dataset_description.json").exists():
             with open(src / "dataset_description.json") as f:
                 src_desc = json.load(f)
+        simulate_kw = {"chunk": chunk, **simulate_kw}
         ds = cls(Path(out), name=name or f"TRXScan simulation of {src_desc.get('Name', src.name)}",
                  description={"SourceDatasets": [{"URL": src.resolve().as_uri(), "Name": src_desc.get("Name", src.name)}]})
         want_subs = None if subjects is None else {f"sub-{cls._label(s, 'sub')}" for s in subjects}
@@ -651,6 +799,8 @@ def _runs_in(folder: Path, suffix: str) -> dict[str, dict[str | None, Path]]:
     """``{stem-without-part: {part: nifti}}`` for the ``_<suffix>.nii[.gz]`` files in a folder."""
     groups: dict[str, dict[str | None, Path]] = {}
     for p in sorted(list(folder.glob(f"*_{suffix}.nii.gz")) + list(folder.glob(f"*_{suffix}.nii"))):
+        if p.name.startswith("."):  # macOS AppleDouble `._*` siblings and other dot-files
+            continue
         ents, suf, _ = split_name(p)
         part = ents.pop("part", None)
         key = bids_name(ents, suf)
@@ -703,19 +853,21 @@ def _mirror_session(ds, base, sub, ses, ph, arts, protocol, anat, fmap, sbref, t
             codes = nib.aff2axcodes(nib.load(str(nii)).affine)
             warnings.warn(f"{nii.name}: source axes are {''.join(codes)}; the simulation is written in the phantom's native axes (only LAS is matched)", stacklevel=3)
         use_parts = ("mag", "phase") if "phase" in parts else ("mag",)
+        dir_ent = ents.get("dir")
         gre_kw = {}
         if i == 0 and gre_specs:
             gre_kw["gre"] = gre_specs[0][1]
         say(f"{tag}: dwi {key} ({real.gtab[0].size if isinstance(real.gtab, tuple) else real.gtab.bvals.size} volumes, {proto.voxel[0]:g} mm, matrix {proto.matrix})")
         sim = ph.simulate(real.gtab, proto, arts, slices=slices, kspace=kspace, truth_peaks=truth, **gre_kw, **simulate_kw)
-        files = ds.add_dwi(sim, sub, ses, parts=use_parts, truth=truth, b0_field=b0_field, fmap_entities=gre_specs[0][0] if gre_specs else None, **ents)
+        files = ds.add_dwi(sim, sub, ses, parts=use_parts, truth=truth, b0_field=real.sidecar.get("B0FieldSource", b0_field),
+                           b0_identifier=real.sidecar.get("B0FieldIdentifier"), fmap_entities=gre_specs[0][0] if gre_specs else None, dir=ents.pop("dir", None), **ents)
         first_dwi_files.append(files[0])
         if sbref:
             sb = _runs_in(dwi_dir, "sbref").get(key.replace("_dwi", "_sbref"))
             if sb:
                 say(f"{tag}: sbref for {key}")
                 sim_sb = ph.simulate(_b0_gtab(1), proto, arts, slices=slices, kspace=False, truth_peaks=False, **simulate_kw)
-                ds.add_dwi(sim_sb, sub, ses, suffix="sbref", parts=("mag", "phase") if "phase" in sb else ("mag",), truth=False, b0_field=b0_field, **ents)
+                ds.add_dwi(sim_sb, sub, ses, suffix="sbref", parts=("mag", "phase") if "phase" in sb else ("mag",), truth=False, b0_field=b0_field, dir=dir_ent, **ents)
     # -- PEPOLAR fieldmaps
     if fmap and (base / "fmap").is_dir():
         for key, parts in _runs_in(base / "fmap", "epi").items():
@@ -729,9 +881,12 @@ def _mirror_session(ds, base, sub, ses, ph, arts, protocol, anat, fmap, sbref, t
             n = real.n_vol
             say(f"{tag}: fmap epi {key} ({n} b=0 volumes)")
             sim = ph.simulate(_b0_gtab(n), proto, arts, slices=slices, kspace=False, truth_peaks=False, **simulate_kw)
-            ds.add_dwi(sim, sub, ses, suffix="epi", parts=("mag",), truth=False, intended_for=first_dwi_files,
-                       b0_field=real.sidecar.get("B0FieldIdentifier"), **ents)
-        skipped = sorted({split_name(p)[1] for p in (base / "fmap").glob("*.nii*")} - {"epi", "magnitude1", "magnitude2", "phasediff", "phase1", "phase2"})
+            # the source's IntendedFor, matched by file name to what was written; else every DWI
+            wanted = {Path(str(p)).name for p in (real.sidecar.get("IntendedFor") or [])}
+            targets = [p for p in first_dwi_files if p.name in wanted] or first_dwi_files
+            ds.add_dwi(sim, sub, ses, suffix="epi", parts=("mag",), truth=False, intended_for=targets,
+                       b0_field=real.sidecar.get("B0FieldIdentifier"), dir=ents.pop("dir", None), **ents)
+        skipped = sorted({split_name(p)[1] for p in (base / "fmap").glob("*.nii*") if not p.name.startswith(".")} - {"epi", "magnitude1", "magnitude2", "phasediff", "phase1", "phase2"})
         if skipped:
             say(f"{tag}: fmap types not simulated: {', '.join(skipped)}")
 
@@ -743,6 +898,8 @@ def _gre_specs(fmap_dir: Path) -> list[tuple[dict[str, Any], Any]]:
     out: list[tuple[dict[str, Any], Gre]] = []
     seen: set[str] = set()
     for p in sorted(fmap_dir.glob("*_phasediff.nii*")) + sorted(fmap_dir.glob("*_phase1.nii*")):
+        if p.name.startswith("."):
+            continue
         ents, suf, _ = split_name(p)
         ents.pop("sub", None); ents.pop("ses", None)
         key = bids_name(ents, "gre")

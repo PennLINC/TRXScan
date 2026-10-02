@@ -364,6 +364,25 @@ class Phantom:
     def anatomical_affine(self) -> np.ndarray:
         return np.asarray(self.wm.affine, dtype=np.float64)
 
+    def moved(self, T: Any, name: str | None = None) -> "Phantom":
+        """The same subject after a rigid movement ``T`` (4x4 world RAS, or
+        ``(tx, ty, tz, rx, ry, rz)`` in mm and degrees about the anatomy's centre): every
+        image's affine is pre-multiplied by ``T`` and the streamlines are moved with it, so the
+        head (and its field) sits at ``T·x``. Grid it ``like=`` another run's object to put the
+        moved head inside that run's fixed field of view."""
+        from .bids import _offset_of, offset_image
+
+        T = _offset_of(T, self.wm)
+        if T is None or np.allclose(T, np.eye(4)):
+            return self
+        pos = self.streamlines.positions @ T[:3, :3].T + T[:3, 3]
+        sl = Streamlines(pos, self.streamlines.offsets, self.streamlines.weights)
+        mv = lambda img: None if img is None else offset_image(img, T)  # noqa: E731
+        return dataclasses.replace(
+            self, wm=mv(self.wm), gm=mv(self.gm), csf=mv(self.csf), mask=mv(self.mask), fieldmap=mv(self.fieldmap),
+            t1w=mv(self.t1w), t2w=mv(self.t2w), streamlines=sl, name=name if name is not None else (f"{self.name}+moved" if self.name else ""), _grids={},
+        )
+
     def subsample(self, n: int, *, seed: int = 0) -> "Phantom":
         """Keep ``n`` streamlines sampled proportionally to weight (deterministic in ``seed``);
         survivors get uniform weights. The only place subsampling happens, so every
@@ -373,11 +392,12 @@ class Phantom:
 
     def grid(
         self, protocol: Protocol | None = None, *, voxel_mm: Any = None, oversample: int | None = None, pad: Any = None,
-        matrix: Any = None,
+        matrix: Any = None, like: "Object | None" = None,
     ) -> Object:
         """The phantom resampled onto the acquisition grid (and the finer simulation grid) a
-        protocol implies: its own bounding box plus ``pad``, or centred in a fixed ``matrix``
-        (``Protocol.matrix``). Cached per ``(voxel_mm, oversample, pad, matrix)``."""
+        protocol implies: its own bounding box plus ``pad``, centred in a fixed ``matrix``
+        (``Protocol.matrix``), or exactly the grid of another run's object (``like``). Cached
+        per ``(voxel_mm, oversample, pad, matrix, like)``."""
         from ._grid import grid_phantom
 
         p = protocol or Protocol.DEFAULT
@@ -386,10 +406,11 @@ class Phantom:
         o = int(p.oversample if oversample is None else oversample)
         pd = tuple(int(v) for v in (p.pad if pad is None else pad))
         mt = p.matrix if matrix is None else tuple(int(v) for v in matrix)
-        key = (vox, o, pd, mt)
+        target = None if like is None else (tuple(like.dims), np.asarray(like.affine))
+        key = (vox, o, pd, mt, None if like is None else (target[0], tuple(np.round(target[1].ravel(), 9))), p.oblique_deg)
         obj = self._grids.get(key)
         if obj is None:
-            obj = grid_phantom(self, vox, o, pd, mt)
+            obj = grid_phantom(self, vox, o, pd, mt, target, p.oblique_deg)
             self._grids[key] = obj
         return obj
 

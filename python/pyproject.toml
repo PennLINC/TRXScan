@@ -44,6 +44,10 @@ ismrmrd = ["ismrmrd>=1.14"]
 test = ["pytest>=8", "dipy>=1.12", "trx-python>=0.6"]
 all = ["trxscan[dipy,trx,viz,ismrmrd]"]
 
+[project.scripts]
+trxscan-fixture = "trxscan.recipes:main"
+trxscan-fetch = "trxscan.data:main"
+
 [project.urls]
 Homepage = "https://github.com/PennLINC/TRXScan"
 Repository = "https://github.com/PennLINC/TRXScan"

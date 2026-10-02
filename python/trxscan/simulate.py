@@ -94,6 +94,12 @@ class Simulation:
     gnl: GnlResult | None = None
     dropout: list[DroppedShot] = field(default_factory=list)
     noise_sigma: nib.Nifti1Image | None = None
+    #: The off-resonance field the acquisition applied (Hz, acquisition grid, written slices).
+    fieldmap: nib.Nifti1Image | None = None
+    #: A b=0 volume of the same object and protocol with every geometric and noise artifact
+    #: off (no susceptibility distortion, GNL, eddy, ghost, spikes, noise, motion, dropout):
+    #: the reference a distortion-correction result should converge to.
+    clean_b0: nib.Nifti1Image | None = None
     mixture: Any = None
     compartments: Any = None
     object: Any = None
@@ -144,6 +150,25 @@ class Simulation:
         if kind == "complex":
             return self.complex[x, y, z]
         raise ValueError("kind must be magnitude, phase or complex")
+
+    @property
+    def pe_axis(self) -> int:
+        """Index of the phase-encode axis in the written frame (from the sidecar's PED)."""
+        return {"i": 0, "j": 1, "k": 2}[self.sidecar["PhaseEncodingDirection"][0]]
+
+    @property
+    def displacement(self) -> nib.Nifti1Image | None:
+        """The susceptibility displacement the acquisition applied: where tissue at each true
+        position appears, as apparent-minus-true RAS vectors in mm (three volumes), from the
+        applied fieldmap, the sidecar's ``TotalReadoutTime`` and ``PhaseEncodingDirection``
+        (a +field shifts toward +PED). None without a fieldmap or with distortion off."""
+        if self.fieldmap is None or not self.artifacts.distortion:
+            return None
+        ped = self.sidecar["PhaseEncodingDirection"]
+        sign = -1.0 if ped.endswith("-") else 1.0
+        shift_vox = sign * np.asanyarray(self.fieldmap.dataobj, dtype=np.float64) * float(self.sidecar["TotalReadoutTime"])
+        disp = shift_vox[..., None] * self.affine[:3, self.pe_axis]
+        return nifti(disp.astype(np.float32), self.affine)
 
     def dropout_table(self) -> str:
         """The ``_desc-dropout_slices.tsv`` text the CLI writes."""
@@ -234,6 +259,8 @@ def run(
     kspace_capture: Sequence[str] = ("acquired", "reconstructed"),
     gre: Gre | None = None,
     truth_peaks: bool = False,
+    clean_b0: bool = True,
+    chunk: int | None = None,
     progress: Progress | None = None,
 ) -> Simulation:
     """Simulate ``obj`` under ``gtab``/``protocol``/``artifacts`` on the requested slices.
@@ -244,8 +271,15 @@ def run(
     needed, else 0). ``kspace`` captures per-coil k-space for the requested slices (default: when
     at most 8 slices are requested); ``kspace_capture`` picks ``"acquired"``,
     ``"reconstructed"``, ``"coil_images"``. ``gre`` also synthesizes a GRE fieldmap;
-    ``truth_peaks`` writes up to three ground-truth fibre peaks per voxel. ``progress`` is
-    called as ``progress(stage, done, total)``.
+    ``truth_peaks`` writes up to three ground-truth fibre peaks per voxel. ``clean_b0`` also
+    acquires one artifact-free b=0 of the same object (:attr:`Simulation.clean_b0`; it reuses
+    the run's orientation mixture, so it costs one extra volume). ``chunk`` simulates the
+    requested slices in slabs of that many (each with its own context), bounding memory by the
+    slab's orientation histogram instead of the whole volume's. The result equals the unchunked
+    run exactly, except that the GNL warp agrees only to float rounding and within-volume
+    dropout jumps (which resample across slices) agree to the extent ``context`` covers the
+    jump, as for any slab run. k-space capture is not available chunked. ``progress`` is called as
+    ``progress(stage, done, total)``.
     """
     t_start = time.perf_counter()
     timing: dict[str, float] = {}
@@ -257,6 +291,10 @@ def run(
     say = progress or (lambda *_: None)
 
     sel = _resolve_slices(slices, z_mm, obj)
+    if chunk is not None and len(sel) > int(chunk):
+        if kspace:
+            raise ValueError("k-space capture is not available with chunk=; run the slices of interest unchunked")
+        return _run_chunked(obj, gtab, protocol, artifacts, sel, int(chunk), context, gre, truth_peaks, clean_b0, progress)
     ctx = int(context) if context is not None else (3 if artifacts.needs_context else 0)
     z0, z1 = max(0, int(sel[0]) - ctx), min(nz, int(sel[-1]) + ctx + 1)
     sub = obj.slab(z0, z1)
@@ -361,37 +399,8 @@ def run(
     gre_result = None
     if gre is not None:
         t = time.perf_counter()
-        g = _core.gre_synthesize(
-            sub.sim_dims, sim_affine, sub.dims, acq_affine, sub.sim_wm, sub.sim_gm, sub.sim_csf,
-            tuple(float(v) for v in protocol.tissue_s0), list(comp.t2), fmap_sim, float(protocol.signal_scale), seed,
-            te_s=tuple(gre.te_s), snr=gre.snr, res_mm=gre.res_mm, snr_vol_exp=gre.snr_vol_exp, output=gre.output,
-            rx_phase_rad=gre.rx_phase_rad, b0_field=gre.b0_field,
-            warp=gnl_field if (gnl_field is not None and artifacts.gnl_warp) else None, warp_modulate=bool(artifacts.gnl_jacobian),
-        )
-        gdims = tuple(int(v) for v in g["dims"])
-        gaff = g["affine"].reshape(4, 4)
-        # On the acquisition grid (no res_mm) keep only the requested slices, like the DWI.
-        gsel = local if (gdims == tuple(sub.dims) and local != list(range(z1 - z0))) else None
-
-        def gvol(flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-            v = volume(flat, gdims)
-            if gsel is None:
-                return v, gaff
-            a = gaff.copy()
-            a[:3, 3] += gaff[:3, 2] * gsel[0]
-            return np.ascontiguousarray(v[:, :, gsel[0] : gsel[-1] + 1]), a
-
-        phases = {}
-        names = ["phasediff"] if g["output"] == "phasediff" else ["phase1", "phase2"]
-        for name, arr in zip(names, g["phase"]):
-            v, a = gvol(arr)
-            phases[name] = nifti(v, a, dtype=np.int16)
-        m1, a1 = gvol(g["magnitude1"])
-        m2, a2 = gvol(g["magnitude2"])
-        gre_result = GreResult(
-            magnitude1=nifti(m1, a1), magnitude2=nifti(m2, a2),
-            phase=phases, te_s=tuple(g["te_s"]), output=g["output"], b0_field=g["b0_field"], sigma=float(g["sigma"]), stamped=bool(g["stamped"]),
-        )
+        gre_result = _synthesize_gre(sub, local, z0, z1, sim_affine, acq_affine, fmap_sim, list(comp.t2), protocol, artifacts, gre,
+                                     gnl_field if (gnl_field is not None and artifacts.gnl_warp) else None, seed)
         timing["gre"] = time.perf_counter() - t
 
     # ---- acquisition on the requested slices ----
@@ -435,6 +444,33 @@ def run(
         raise
     timing["acquire"] = time.perf_counter() - t
 
+    # ---- artifact-free b=0 and the applied fieldmap (ground truth) ----
+    clean_mag = None
+    if clean_b0:
+        t = time.perf_counter()
+        b0_bvals, b0_bvecs = np.zeros(1), np.zeros((1, 3))
+        if mixture is not None:
+            comp_c = _core.signal_from_mixture(mixture, b0_bvals, b0_bvecs, None)
+            comp_c.apply_s0(tuple(float(v) for v in protocol.tissue_s0))
+            comp_c = comp_c if local == all_local else comp_c.select_slices(local)
+            acq_c = {**protocol.acquisition(ny), **Artifacts().acquisition(), "reverse_phase": acq["reverse_phase"], "do_distortions": False}
+            try:
+                out_c = _core.simulate_acquisition(
+                    comp_c, fmap_sel, (nx, ny, nsl), b0_bvals, b0_bvecs, acq_c, protocol.phase_model, seed, None, None,
+                    global_z, nz_full, None, (False, False, False), None,
+                )
+            except BaseException as e:  # pyo3 panics are BaseExceptions
+                if type(e).__name__ == "PanicException":
+                    raise TrxscanError(str(e)) from None
+                raise
+            clean_mag = out_c["mag"]
+        else:  # motion path: no mixture to reuse, run the static object once
+            clean_mag = run(obj, (b0_bvals, b0_bvecs), protocol.replace(fsl_orientation=False), Artifacts(), slices=sel, context=0, kspace=False, clean_b0=False).mag
+        timing["clean_b0"] = time.perf_counter() - t
+    # the applied field on the acquisition grid of the written slices (block mean of the sim grid)
+    fm = volume(fmap_sel, (snx, sny, nsl)).reshape(nx, o, ny, o, nsl).mean(axis=(1, 3)).astype(np.float32)
+    fmap_flat = np.ascontiguousarray(fm.transpose(2, 1, 0)).reshape(-1)  # F-order flat x + nx*(y + ny*z)
+
     # ---- output frame ----
     out_dims = (nx, ny, nsl)
     out_affine = obj.affine.copy()
@@ -450,6 +486,9 @@ def run(
         im_ = _core.apply_reorient(im_, ngrad, reo)
         mag_ = _core.apply_reorient(mag_, ngrad, reo)
         ph_ = _core.apply_reorient(ph_, ngrad, reo)
+        fmap_flat = _core.apply_reorient(fmap_flat, 1, reo)
+        if clean_mag is not None:
+            clean_mag = _core.apply_reorient(np.asarray(clean_mag, dtype=np.float32), 1, reo)
         out_affine = _core.reorient_affine(out_affine, reo).reshape(4, 4)
         out_dims = tuple(int(v) for v in reo["out_dims"])
     bvecs_fsl = _core.fsl_bvecs(np.ascontiguousarray(bvecs), out_affine).reshape(-1, 3)
@@ -505,14 +544,136 @@ def run(
     if noise_sigma is not None:
         ns = _core.apply_reorient(noise_sigma, 1, reo) if protocol.fsl_orientation else noise_sigma
         ns_img = nifti(volume(ns, out_dims), out_affine)
+    fmap_img = nifti(volume(fmap_flat, out_dims), out_affine)
+    clean_img = None if clean_mag is None else nifti(volume(np.asarray(clean_mag, dtype=np.float32), out_dims), out_affine)
 
     timing["total"] = time.perf_counter() - t_start
     return Simulation(
         re=re_, im=im_, mag=mag_, ph=ph_, dims=out_dims, affine=out_affine, slices=np.asarray(global_z),
         bvals=bvals, bvecs=bvecs, bvecs_fsl=bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
         readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped,
-        noise_sigma=ns_img, mixture=mixture, compartments=comp, object=sub, timing=timing,
+        noise_sigma=ns_img, fieldmap=fmap_img, clean_b0=clean_img, mixture=mixture, compartments=comp, object=sub, timing=timing,
     )
+
+
+def _synthesize_gre(sub, local, z0, z1, sim_affine, acq_affine, fmap_sim, t2, protocol, artifacts, gre, warp, seed) -> GreResult:
+    """The synthetic dual-echo GRE of the slab ``sub`` (its own slices ``z0:z1``; ``local`` are
+    the slices to keep when the fieldmap sits on the acquisition grid)."""
+    g = _core.gre_synthesize(
+        sub.sim_dims, sim_affine, sub.dims, acq_affine, sub.sim_wm, sub.sim_gm, sub.sim_csf,
+        tuple(float(v) for v in protocol.tissue_s0), t2, fmap_sim, float(protocol.signal_scale), seed,
+        te_s=tuple(gre.te_s), snr=gre.snr, res_mm=gre.res_mm, snr_vol_exp=gre.snr_vol_exp, output=gre.output,
+        rx_phase_rad=gre.rx_phase_rad, b0_field=gre.b0_field, warp=warp, warp_modulate=bool(artifacts.gnl_jacobian),
+    )
+    gdims = tuple(int(v) for v in g["dims"])
+    gaff = g["affine"].reshape(4, 4)
+    # On the acquisition grid (no res_mm) keep only the requested slices, like the DWI.
+    gsel = local if (gdims == tuple(sub.dims) and local != list(range(z1 - z0))) else None
+
+    def gvol(flat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        v = volume(flat, gdims)
+        if gsel is None:
+            return v, gaff
+        a = gaff.copy()
+        a[:3, 3] += gaff[:3, 2] * gsel[0]
+        return np.ascontiguousarray(v[:, :, gsel[0] : gsel[-1] + 1]), a
+
+    phases = {}
+    names = ["phasediff"] if g["output"] == "phasediff" else ["phase1", "phase2"]
+    for name, arr in zip(names, g["phase"]):
+        v, a = gvol(arr)
+        phases[name] = nifti(v, a, dtype=np.int16)
+    m1, a1 = gvol(g["magnitude1"])
+    m2, a2 = gvol(g["magnitude2"])
+    return GreResult(
+        magnitude1=nifti(m1, a1), magnitude2=nifti(m2, a2),
+        phase=phases, te_s=tuple(g["te_s"]), output=g["output"], b0_field=g["b0_field"], sigma=float(g["sigma"]), stamped=bool(g["stamped"]),
+    )
+
+
+def _cat_images(imgs: list) -> nib.Nifti1Image | None:
+    if any(i is None for i in imgs):
+        return None
+    data = np.concatenate([np.asanyarray(i.dataobj) for i in imgs], axis=2)
+    return nifti(data, imgs[0].affine)
+
+
+def _run_chunked(obj, gtab, protocol, artifacts, sel, chunk, context, gre, truth_peaks, clean_b0, progress) -> Simulation:
+    """Simulate ``sel`` in slabs of ``chunk`` slices and stitch the parts together."""
+    t_start = time.perf_counter()
+    pieces = [sel[i : i + chunk] for i in range(0, len(sel), chunk)]
+    parts: list[Simulation] = []
+    for k, piece in enumerate(pieces):
+        prog = (lambda stage, d, n, k=k: progress(f"slab {k + 1}/{len(pieces)} {stage}", d, n)) if progress is not None else None
+        part = run(obj, gtab, protocol, artifacts, slices=piece, context=context, kspace=False, gre=None,
+                   truth_peaks=truth_peaks, clean_b0=clean_b0, chunk=None, progress=prog)
+        # keep only the slab's results: its orientation histogram and compartments are the
+        # memory the chunking exists to bound
+        part.mixture = part.compartments = part.object = None
+        parts.append(part)
+    first = parts[0]
+    for part, piece in zip(parts, pieces):
+        if part.dims[2] != len(piece) or part.dims[:2] != first.dims[:2]:
+            raise ValueError("the written frame does not keep the acquisition slices as its third axis; run unchunked")
+    nz = sum(len(p) for p in pieces)
+    dims = (first.dims[0], first.dims[1], nz)
+    gnl = None
+    if first.gnl is not None:
+        gnl = GnlResult(coeff_text=first.gnl.coeff_text, disp=_cat_images([p.gnl.disp for p in parts]), invdisp=_cat_images([p.gnl.invdisp for p in parts]),
+                        graddev=_cat_images([p.gnl.graddev for p in parts]), spec=first.gnl.spec, scale=first.gnl.scale,
+                        warp=first.gnl.warp, encoding=first.gnl.encoding, jacobian=first.gnl.jacobian)
+    seen: set[tuple[int, int]] = set()
+    dropped: list[DroppedShot] = []
+    for p in parts:
+        for d in p.dropout:
+            if (d.volume, d.shot) not in seen:
+                seen.add((d.volume, d.shot))
+                dropped.append(d)
+    sidecar = dict(first.sidecar)
+    if "SliceTiming" in sidecar:
+        sidecar["SliceTiming"] = [t for p in parts for t in p.sidecar["SliceTiming"]]
+    timing: dict[str, float] = {}
+    for p in parts:
+        for k, v in p.timing.items():
+            timing[k] = timing.get(k, 0.0) + v
+    gre_result = None
+    if gre is not None:
+        t = time.perf_counter()
+        gre_result = _gre_for_object(obj, sel, protocol, artifacts, gre)
+        timing["gre"] = time.perf_counter() - t
+        sidecar["B0FieldSource"] = gre_result.b0_field
+    timing["total"] = time.perf_counter() - t_start
+    return Simulation(
+        re=np.concatenate([p.re for p in parts]), im=np.concatenate([p.im for p in parts]),
+        mag=np.concatenate([p.mag for p in parts]), ph=np.concatenate([p.ph for p in parts]),
+        dims=dims, affine=first.affine, slices=np.concatenate([p.slices for p in parts]),
+        bvals=first.bvals, bvecs=first.bvecs, bvecs_fsl=first.bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
+        readout=first.readout, kspace=None, truth_peaks=_cat_images([p.truth_peaks for p in parts]), gre=gre_result, gnl=gnl,
+        dropout=dropped, noise_sigma=_cat_images([p.noise_sigma for p in parts]), fieldmap=_cat_images([p.fieldmap for p in parts]),
+        clean_b0=_cat_images([p.clean_b0 for p in parts]), mixture=None, compartments=None, object=obj, timing=timing,
+    )
+
+
+def _gre_for_object(obj, sel, protocol, artifacts, gre) -> GreResult:
+    """The GRE fieldmap of the whole object (no signal stage needed): the compartment fractions,
+    the fieldmap (GNL-warped when the run warps) and the tissue T2s."""
+    sim_affine = obj.sim_affine
+    fmap_sim = obj.sim_fmap
+    warp = None
+    if artifacts.gnl is not None and artifacts.gnl_warp:
+        coef, _ = _coef_from(artifacts.gnl, artifacts.gnl_scale)
+        warp = _core.GnlField.on_grid(coef, obj.sim_dims, sim_affine if artifacts.isocenter is None else _shift_affine(sim_affine, artifacts.isocenter))
+        fmap_sim = warp.warp_volume(fmap_sim, False)
+    acq_affine = obj.affine if artifacts.isocenter is None else _shift_affine(obj.affine, artifacts.isocenter)
+    sim_aff = sim_affine if artifacts.isocenter is None else _shift_affine(sim_affine, artifacts.isocenter)
+    t2 = [float(v) for v in protocol.tissue.t2_ms]
+    return _synthesize_gre(obj, [int(z) for z in sel], 0, obj.dims[2], sim_aff, acq_affine, fmap_sim, t2, protocol, artifacts, gre, warp, int(artifacts.seed))
+
+
+def _shift_affine(affine: np.ndarray, isocenter) -> np.ndarray:
+    a = affine.copy()
+    a[:3, 3] -= np.asarray(isocenter, dtype=np.float64)
+    return a
 
 
 # ─── microstructure ─────────────────────────────────────────────────────────

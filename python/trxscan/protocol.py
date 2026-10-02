@@ -171,6 +171,7 @@ def _readout_from_acquisition(nx: int, ny: int, acq: dict[str, Any]) -> EpiReado
 # ─── protocol ───────────────────────────────────────────────────────────────
 
 _PE = {"AP": False, "j-": False, "PA": True, "j": True}
+_GNL_TAGS = ("ND", "DIS2D", "DIS3D")
 
 #: Descriptive sidecar keys :meth:`Protocol.from_bids` carries over into ``metadata`` (and so
 #: into the simulated run's sidecar): what scanner and sequence the run stands in for. Timing,
@@ -238,6 +239,9 @@ class Protocol:
 
     ``matrix`` fixes the acquired matrix ``(nx, ny, nz)``: the object is centred in it (the
     FOV of a real scan) instead of being gridded to its own bounding box plus ``pad``.
+    ``oblique_deg`` ``(rx, ry, rz)`` tilts the acquisition grid about its centre (degrees about
+    the RAS axes, applied x then y then z): an oblique acquisition, whose written header
+    carries the rotation while the object stays where it is in the scanner.
 
     **Recorded, not modeled.** ``tr_s``, ``flip_angle_deg``, ``field_strength_t``,
     ``slice_timing`` and ``metadata`` go into the BIDS sidecar so a simulated run documents
@@ -246,7 +250,18 @@ class Protocol:
     of the full volume) defaults to a Siemens-style interleaved multiband order derived from
     ``tr_s``, the slice count and ``mb``. ``metadata`` is extra sidecar keys written verbatim
     (``Manufacturer``, ``PulseSequenceDetails``, ...); :meth:`from_bids` fills it from a real
-    sidecar's descriptive keys.
+    sidecar's descriptive keys. ``gnl_tag`` is the Siemens gradient-nonlinearity tag written
+    into ``ImageType`` (``"ND"`` = not corrected, ``"DIS2D"``/``"DIS3D"`` = the scanner claims
+    to have corrected in-plane / in 3-D); it changes the sidecar only, so pairing ``"DIS3D"``
+    with ``Artifacts(gnl=...)`` deliberately mislabels a warped image for tests of a
+    pipeline's tag handling.
+
+    :meth:`replace` keeps the field of view: changing ``voxel_mm`` on a protocol that has a
+    ``matrix`` rescales the matrix (``Protocol.from_bids(...).replace(voxel_mm=3.0)`` is the
+    same scan at 3 mm, not a 3 mm scan with the 1.7 mm matrix). Pass ``matrix`` too to
+    override that. Presets that pin ``readout_ms`` (``HBCD``: 91.7 ms) keep it under
+    ``replace(voxel_mm=...)``, so the echo spacing, not the train length, follows the matrix;
+    the sidecar reports whichever results.
     """
 
     voxel_mm: float | tuple[float, float, float] = 2.5
@@ -271,11 +286,13 @@ class Protocol:
     fsl_orientation: bool = False
     signal_scale: float = 100.0
     matrix: tuple[int, int, int] | None = None
+    oblique_deg: tuple[float, float, float] | None = None
     tr_s: float | None = None
     flip_angle_deg: float | None = None
     field_strength_t: float | None = 3.0
     slice_timing: tuple[float, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    gnl_tag: Literal["ND", "DIS2D", "DIS3D"] = "ND"
     name: str = ""
 
     HBCD: ClassVar["Protocol"]
@@ -301,17 +318,33 @@ class Protocol:
             object.__setattr__(self, "matrix", m)
         if self.tr_s is not None and self.tr_s <= 0:
             raise ValueError("tr_s must be positive")
+        if self.oblique_deg is not None:
+            o = tuple(float(v) for v in self.oblique_deg)
+            if len(o) != 3:
+                raise ValueError("oblique_deg must be three angles (rx, ry, rz)")
+            object.__setattr__(self, "oblique_deg", o)
         if self.slice_timing is not None:
             object.__setattr__(self, "slice_timing", tuple(float(v) for v in self.slice_timing))
+        if self.gnl_tag not in _GNL_TAGS:
+            raise ValueError(f"gnl_tag must be one of {_GNL_TAGS}, got {self.gnl_tag!r}")
         object.__setattr__(self, "metadata", dict(self.metadata))
         object.__setattr__(self, "tissue", _as_tissue(self.tissue))
 
     def replace(self, **kw: Any) -> "Protocol":
         if kw and "name" not in kw and self.name:
             kw["name"] = f"{self.name}*"
+        if "voxel_mm" in kw and "matrix" not in kw and self.matrix is not None:
+            new = kw["voxel_mm"]
+            new = (float(new),) * 3 if np.isscalar(new) else tuple(float(v) for v in new)
+            kw["matrix"] = tuple(max(1, int(round(n * o / v))) for n, o, v in zip(self.matrix, self.voxel, new))
         return dataclasses.replace(self, **kw)
 
     # -- derived -------------------------------------------------------------
+
+    @property
+    def fov_mm(self) -> tuple[float, float, float] | None:
+        """The field of view ``matrix * voxel`` in mm, or None without a fixed matrix."""
+        return None if self.matrix is None else tuple(n * v for n, v in zip(self.matrix, self.voxel))
 
     @property
     def voxel(self) -> tuple[float, float, float]:
@@ -390,6 +423,7 @@ class Protocol:
             "SliceThickness": self.voxel[2],
             "SpacingBetweenSlices": self.voxel[2],
         })
+        side["ImageType"] = ["ORIGINAL", "PRIMARY", "DIFFUSION", "NONE"] + (["MB"] if self.mb > 1 else []) + [self.gnl_tag]
         if self.partial_fourier < 1.0:
             side["PartialFourierDirection"] = "PHASE"
         if self.accel > 1:
@@ -487,6 +521,9 @@ class Protocol:
             kw["field_strength_t"] = float(side["MagneticFieldStrength"])
         if isinstance(side.get("SliceTiming"), list):
             kw["slice_timing"] = tuple(float(v) for v in side["SliceTiming"])
+        tags = [t for t in side.get("ImageType", []) if t in _GNL_TAGS] if isinstance(side.get("ImageType"), list) else []
+        if tags:
+            kw["gnl_tag"] = tags[-1]
         kw["metadata"] = {k: side[k] for k in SIDECAR_PASSTHROUGH if k in side}
         if missing:
             warnings.warn(f"{json_path.name}: no {', '.join(missing)}; using Protocol.DEFAULT values for those", stacklevel=2)
@@ -499,4 +536,6 @@ Protocol.DEFAULT = Protocol(name="default")
 # The CLI's shipping protocol (`Acquisition::hbcd`): TE 88 ms, PE train pinned to HBCD's
 # TotalReadoutTime 91.7 ms, 6/8 scanner-style partial Fourier, 24 ACS lines, 1.7 mm. The CLI also
 # adds a subtle Nyquist ghost (0.015), which is an artifact here: `Artifacts(ghost=0.015)`.
+# `readout_ms` is pinned, so `HBCD.replace(voxel_mm=3.0)` keeps the 91.7 ms train and shortens
+# the echo spacing; give `readout_ms=None, echo_spacing_ms=...` to let the train follow the matrix.
 Protocol.HBCD = Protocol(voxel_mm=1.7, te_ms=88.0, readout_ms=91.7, partial_fourier=0.75, acs_lines=24, name="hbcd")

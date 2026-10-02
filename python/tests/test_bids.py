@@ -227,6 +227,25 @@ def test_mirror_reproduces_the_source_layout(tiny_phantom, tmp_path):
         assert ok, text
 
 
+def test_mirror_keeps_source_entities_and_intended_for(tiny_phantom, tmp_path):
+    src = _write_source(tmp_path / "src", complex_parts=False)
+    dwi = src / "sub-01/ses-a/dwi"
+    for p in list(dwi.iterdir()):  # drop the dir entity from the AP run, like a dataset with one series
+        if "dir-AP" in p.name:
+            p.rename(p.with_name(p.name.replace("_dir-AP", "")))
+        elif "dir-PA" in p.name:
+            p.unlink()
+    epi_j = src / "sub-01/ses-a/fmap/sub-01_ses-a_dir-PA_epi.json"
+    d = json.loads(epi_j.read_text()); d["IntendedFor"] = ["ses-a/dwi/sub-01_ses-a_acq-test_run-01_dwi.nii.gz"]; epi_j.write_text(json.dumps(d))
+    ts.Dataset.mirror(src, tiny_phantom, tmp_path / "out", log=None, sbref=False, truth=False, anat=None, protocol=lambda p: p.replace(oversample=1))
+    out = tmp_path / "out/sub-01/ses-a"
+    assert (out / "dwi/sub-01_ses-a_acq-test_run-01_dwi.nii.gz").exists() and not list((out / "dwi").glob("*dir-*"))
+    assert json.load(open(out / "fmap/sub-01_ses-a_dir-PA_epi.json"))["IntendedFor"] == ["bids::sub-01/ses-a/dwi/sub-01_ses-a_acq-test_run-01_dwi.nii.gz"]
+    box = ts.objects.box(6, matrix=16, oversample=1)
+    sim = box.simulate((np.zeros(1), np.zeros((1, 3))), ts.Protocol.HBCD.replace(voxel_mm=2.0), ts.Artifacts(), kspace=False, clean_b0=False)
+    assert ts.Dataset(tmp_path / "ds2").add_dwi(sim, "02", parts=None, truth=False, dir=None)[0].name == "sub-02_dwi.nii.gz"
+
+
 def test_mirror_magnitude_only_and_synthetic_anat(tiny_phantom, tmp_path):
     src = _write_source(tmp_path / "src", complex_parts=False)
     ph = ts.Phantom(wm=tiny_phantom.wm, gm=tiny_phantom.gm, csf=tiny_phantom.csf, mask=tiny_phantom.mask, streamlines=tiny_phantom.streamlines)

@@ -197,7 +197,25 @@ and acceleration from the sidecar; `Protocol.metadata` carries the `SIDECAR_PASS
 descriptors, never conversion/series keys or demographics). `Protocol.pe` names the polarity in
 the *written* frame: under `fsl_orientation` an LPS phantom's native polarity is flipped so
 `"j-"` is always a posterior shift. `Phantom.t1w`/`t2w` are pass-through anatomy for `anat/`
-(synthetic tissue contrast when absent). Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
+(synthetic tissue contrast when absent). `Protocol.replace(voxel_mm=...)` on a protocol with a
+`matrix` keeps the FOV (rescales the matrix). Every `run` also acquires a `clean_b0` (reusing
+the orientation mixture; `clean_b0=False` skips it) and exposes the applied `fieldmap` and
+`displacement`; `Dataset` writes them, the GNL field in ITK form and `ImageType` (from
+`Protocol.gnl_tag`) as ground truth. `python/trxscan/recipes.py` (named fixture generators,
+`trxscan-fixture`/`trxscan-fetch` console scripts, `recipe.json` digests for CI caches) and
+`python/trxscan/score.py` (generic truth comparisons) exist for qsiprep's CI; keep the
+pipeline-specific transform handling out of them. **Memory is the dense orientation histogram**
+(`MixtureField.odf`, sim voxels × 321 vertices, several GB at 2 mm whole-brain), not the 4-D
+output; `run(..., chunk=N)` simulates N-slice slabs and stitches them (identical results,
+except dropout jumps/GNL warp within the context's reach), dropping each slab's mixture as it
+goes. Recipes and `mirror` default to `chunk=8`. A sparse or per-slab histogram in Rust would
+be the next step if that is not enough. Between-scan movement truths: `Dataset.add_anat/add_gre/add_dwi`
+take `offset` (resampled into the scan's grid by default; `offset_mode="header"` rotates the
+header, which qsiprep's anatomical `Conform(deoblique_header=True)` silently discards),
+`Phantom.moved(T)` + `Phantom.grid(like=obj)` put a moved head inside another run's FOV, and
+`Protocol.oblique_deg` tilts the acquisition grid; truths go to `derivatives/trxscan` as ITK
+text transforms, readable with `score.read_itk_transform`. ITK conventions live in Python
+there on purpose: `itk-transforms-rs` would drag a static HDF5 build into the wheel. Use `CARGO_TARGET_DIR=python/target` for wheel builds so they do not block on the
 CLI build's HDF5 compile. Release: tag `X.Y.Z` (no `v`) matching `[workspace.package].version`
 (`.github/workflows/release.yml` builds manylinux/musllinux/macOS/Windows wheels and publishes).
 
