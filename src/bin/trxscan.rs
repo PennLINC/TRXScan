@@ -15,7 +15,7 @@ use trxscan::compartments::{
 use trxscan::gnl::{GnlField, GnlPreset, GradCoef};
 use trxscan::io;
 use trxscan::kspace::{
-    simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, KspaceWindow,
+    simulate_acquisition_legacy, simulate_acquisition_oversampled, Acquisition, EchoFormation, KspaceWindow,
     PartialFourierMode, T2Volume,
 };
 use trxscan::phase::PhaseModel;
@@ -855,6 +855,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         accel: cli.accel,
         acs_lines: 24,
         seed: cli.seed,
+        echo: EchoFormation::Spin,
     };
     // per-volume eddy gradient = unit bvec × b-value (b0 → zero → no eddy)
     let gradients: Vec<[f64; 3]> = (0..scheme.len())
