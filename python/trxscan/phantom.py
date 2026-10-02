@@ -293,8 +293,9 @@ def _load_img(x: Any) -> nib.Nifti1Image:
 @dataclass(frozen=True, eq=False)
 class Phantom:
     """Real anatomy to simulate: WM/GM/CSF fraction maps and a brain mask on the anatomical
-    grid, a tractogram in the same world (RAS mm) frame, an off-resonance fieldmap (Hz), and
-    the subject's measured head-motion traces (``motion["AP"]``, a :class:`Motion`).
+    grid, a tractogram in the same world (RAS mm) frame, an off-resonance fieldmap (Hz), the
+    subject's measured head-motion traces (``motion["AP"]``, a :class:`Motion`) and,
+    optionally, its T1w/T2w images for the ``anat/`` folder of a simulated dataset.
 
     Build with :meth:`load` (the hosted phantoms), :meth:`from_files`, or directly from
     images and a :class:`Streamlines`. Grid it for a protocol with :meth:`grid`, or simply call
@@ -308,6 +309,10 @@ class Phantom:
     mask: nib.Nifti1Image | None = None
     fieldmap: nib.Nifti1Image | None = None
     motion: dict[str, Motion] = field(default_factory=dict)
+    #: The subject's anatomical images in the same world frame (written to BIDS ``anat/`` by
+    #: :class:`~trxscan.bids.Dataset`; nothing in the simulation reads them).
+    t1w: nib.Nifti1Image | None = None
+    t2w: nib.Nifti1Image | None = None
     name: str = ""
     path: Path | None = None
     _grids: dict[Any, Object] = field(default_factory=dict, repr=False)
@@ -325,11 +330,13 @@ class Phantom:
     @classmethod
     def from_files(
         cls, *, wm: Any, gm: Any, csf: Any, streamlines: Any, mask: Any = None, fieldmap: Any = None,
-        weights: str | np.ndarray | None = "sift2_weights", motion: dict[str, Any] | None = None, name: str = "",
+        weights: str | np.ndarray | None = "sift2_weights", motion: dict[str, Any] | None = None,
+        t1w: Any = None, t2w: Any = None, name: str = "",
     ) -> "Phantom":
         """From NIfTI paths/images and a tractogram path (TRX/TRK/TCK) or :class:`Streamlines`.
         ``weights`` is a TRX per-streamline field name or an explicit array; ``motion`` maps
-        labels to confounds TSV paths or :class:`Motion` objects."""
+        labels to confounds TSV paths or :class:`Motion` objects; ``t1w``/``t2w`` are the
+        subject's anatomical images (same world frame)."""
         if isinstance(streamlines, Streamlines):
             sl = streamlines
             if isinstance(weights, np.ndarray):
@@ -344,7 +351,7 @@ class Phantom:
         return cls(
             wm=_load_img(wm), gm=_load_img(gm), csf=_load_img(csf), streamlines=sl,
             mask=None if mask is None else _load_img(mask), fieldmap=None if fieldmap is None else _load_img(fieldmap),
-            motion=mot, name=name,
+            motion=mot, t1w=None if t1w is None else _load_img(t1w), t2w=None if t2w is None else _load_img(t2w), name=name,
         )
 
     # -- derived -------------------------------------------------------------
@@ -357,6 +364,25 @@ class Phantom:
     def anatomical_affine(self) -> np.ndarray:
         return np.asarray(self.wm.affine, dtype=np.float64)
 
+    def moved(self, T: Any, name: str | None = None) -> "Phantom":
+        """The same subject after a rigid movement ``T`` (4x4 world RAS, or
+        ``(tx, ty, tz, rx, ry, rz)`` in mm and degrees about the anatomy's centre): every
+        image's affine is pre-multiplied by ``T`` and the streamlines are moved with it, so the
+        head (and its field) sits at ``T·x``. Grid it ``like=`` another run's object to put the
+        moved head inside that run's fixed field of view."""
+        from .bids import _offset_of, offset_image
+
+        T = _offset_of(T, self.wm)
+        if T is None or np.allclose(T, np.eye(4)):
+            return self
+        pos = self.streamlines.positions @ T[:3, :3].T + T[:3, 3]
+        sl = Streamlines(pos, self.streamlines.offsets, self.streamlines.weights)
+        mv = lambda img: None if img is None else offset_image(img, T)  # noqa: E731
+        return dataclasses.replace(
+            self, wm=mv(self.wm), gm=mv(self.gm), csf=mv(self.csf), mask=mv(self.mask), fieldmap=mv(self.fieldmap),
+            t1w=mv(self.t1w), t2w=mv(self.t2w), streamlines=sl, name=name if name is not None else (f"{self.name}+moved" if self.name else ""), _grids={},
+        )
+
     def subsample(self, n: int, *, seed: int = 0) -> "Phantom":
         """Keep ``n`` streamlines sampled proportionally to weight (deterministic in ``seed``);
         survivors get uniform weights. The only place subsampling happens, so every
@@ -364,9 +390,14 @@ class Phantom:
         sl, _ = self.streamlines.subsample(n, seed=seed)
         return dataclasses.replace(self, streamlines=sl, name=f"{self.name}[{n}@{seed}]" if self.name else "", _grids={})
 
-    def grid(self, protocol: Protocol | None = None, *, voxel_mm: Any = None, oversample: int | None = None, pad: Any = None) -> Object:
+    def grid(
+        self, protocol: Protocol | None = None, *, voxel_mm: Any = None, oversample: int | None = None, pad: Any = None,
+        matrix: Any = None, like: "Object | None" = None,
+    ) -> Object:
         """The phantom resampled onto the acquisition grid (and the finer simulation grid) a
-        protocol implies. Cached per ``(voxel_mm, oversample, pad)``."""
+        protocol implies: its own bounding box plus ``pad``, centred in a fixed ``matrix``
+        (``Protocol.matrix``), or exactly the grid of another run's object (``like``). Cached
+        per ``(voxel_mm, oversample, pad, matrix, like)``."""
         from ._grid import grid_phantom
 
         p = protocol or Protocol.DEFAULT
@@ -374,10 +405,12 @@ class Phantom:
         vox = (float(vox),) * 3 if np.isscalar(vox) else tuple(float(v) for v in vox)
         o = int(p.oversample if oversample is None else oversample)
         pd = tuple(int(v) for v in (p.pad if pad is None else pad))
-        key = (vox, o, pd)
+        mt = p.matrix if matrix is None else tuple(int(v) for v in matrix)
+        target = None if like is None else (tuple(like.dims), np.asarray(like.affine))
+        key = (vox, o, pd, mt, None if like is None else (target[0], tuple(np.round(target[1].ravel(), 9))), p.oblique_deg)
         obj = self._grids.get(key)
         if obj is None:
-            obj = grid_phantom(self, vox, o, pd)
+            obj = grid_phantom(self, vox, o, pd, mt, target, p.oblique_deg)
             self._grids[key] = obj
         return obj
 

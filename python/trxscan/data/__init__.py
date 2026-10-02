@@ -18,6 +18,9 @@ from ..phantom import Phantom
 
 REPO = "PennLINC/trxscan-phantoms"
 
+#: Files a bundle may lack (skipped when absent locally or missing from the release registry).
+OPTIONAL_FILES = ("t1w", "t2w", "motion_AP", "motion_PA")
+
 #: bundle name -> (release tag, registry file, layout)
 BUNDLES: dict[str, dict[str, Any]] = {
     "sub-60501": {
@@ -34,9 +37,12 @@ BUNDLES: dict[str, dict[str, Any]] = {
             "motion_AP": "sub-60501_ses-01_dir-AP_desc-confounds_timeseries.tsv",
             "motion_PA": "sub-60501_ses-01_dir-PA_desc-confounds_timeseries.tsv",
             "bval_AP": "hbcd75_ap.bval", "bvec_AP": "hbcd75_ap.bvec", "bval_PA": "hbcd75_pa.bval", "bvec_PA": "hbcd75_pa.bvec",
+            "t1w": "{p}_desc-preproc_T1w.nii.gz", "t2w": "{p}_desc-preproc_T2w.nii.gz",
         },
         # the original kit's nested layout, accepted under $TRXSCAN_DATA
         "kit_layout": {
+            "t1w": "sub-60501/ses-01/anat/{p}_desc-preproc_T1w.nii.gz",
+            "t2w": "sub-60501/ses-01/anat/{p}_desc-preproc_T2w.nii.gz",
             "wm": "sub-60501/ses-01/anat/{p}_label-WM_probseg.nii.gz",
             "gm": "sub-60501/ses-01/anat/{p}_label-GM_probseg.nii.gz",
             "csf": "sub-60501/ses-01/anat/{p}_label-CSF_probseg.nii.gz",
@@ -116,7 +122,8 @@ def _resolve(name: str) -> dict[str, Path]:
         base_url=f"https://github.com/{REPO}/releases/download/{b['tag']}/",
         registry=reg,
     )
-    paths = {k: Path(fetcher.fetch(v.format(p=b["prefix"]))) for k, v in b["files"].items()}
+    paths = {k: Path(fetcher.fetch(v.format(p=b["prefix"]))) for k, v in b["files"].items()
+             if k not in OPTIONAL_FILES or v.format(p=b["prefix"]) in reg}
     paths["root"] = Path(fetcher.abspath)
     return paths
 
@@ -130,11 +137,29 @@ def load_phantom(name: str = "sub-60501", *, weights: str | None = "sift2_weight
     paths = _resolve(name)
     motion = {k.split("_", 1)[1]: Motion.from_confounds(v) for k, v in paths.items() if k.startswith("motion_") and v.exists()}
     root = paths["root"]
+    anat = {k: paths[k] for k in ("t1w", "t2w") if k in paths and paths[k].exists()}
     ph = Phantom.from_files(
         wm=paths["wm"], gm=paths["gm"], csf=paths["csf"], mask=paths.get("mask"), fieldmap=paths.get("fieldmap"),
-        streamlines=paths["streamlines"], weights=weights, motion=motion, name=name,
+        streamlines=paths["streamlines"], weights=weights, motion=motion, name=name, **anat,
     )
     return Phantom(**{**{f.name: getattr(ph, f.name) for f in ph.__dataclass_fields__.values() if f.name != "_grids"}, "path": root})
+
+
+def fetch(name: str = "sub-60501") -> Path:
+    """Download (or locate) a bundle without loading it; returns the directory holding it.
+    ``trxscan-fetch`` on the command line, for prewarming a CI cache."""
+    return _resolve(name)["root"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="trxscan-fetch", description="Fetch hosted TRXScan phantom bundles into the cache.")
+    ap.add_argument("names", nargs="*", default=["sub-60501"], help=f"bundles to fetch (known: {', '.join(sorted(BUNDLES))})")
+    a = ap.parse_args(argv)
+    for n in a.names:
+        print(f"{n}: {fetch(n)}")
+    return 0
 
 
 def scheme_files(name: str = "sub-60501", pe: str = "AP") -> tuple[Path, Path]:

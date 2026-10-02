@@ -13,3 +13,6 @@ __pycache__/
 /python/.venv
 *.egg-info
 .pytest_cache/
+
+# a locally built core dropped next to the sources for PYTHONPATH=python development
+/python/trxscan/*.so

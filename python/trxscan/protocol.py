@@ -171,6 +171,44 @@ def _readout_from_acquisition(nx: int, ny: int, acq: dict[str, Any]) -> EpiReado
 # ─── protocol ───────────────────────────────────────────────────────────────
 
 _PE = {"AP": False, "j-": False, "PA": True, "j": True}
+_GNL_TAGS = ("ND", "DIS2D", "DIS3D")
+
+#: Descriptive sidecar keys :meth:`Protocol.from_bids` carries over into ``metadata`` (and so
+#: into the simulated run's sidecar): what scanner and sequence the run stands in for. Timing,
+#: matrix and acceleration keys are never copied; they are derived from the simulation.
+SIDECAR_PASSTHROUGH: tuple[str, ...] = (
+    "Manufacturer", "ManufacturersModelName", "MagneticFieldStrength", "ImagingFrequency",
+    "ReceiveCoilName", "ReceiveCoilActiveElements", "CoilCombinationMethod", "MatrixCoilMode",
+    "PulseSequenceType", "PulseSequenceDetails", "ScanningSequence", "SequenceVariant", "SequenceName",
+    "ScanOptions", "MRAcquisitionType", "DiffusionScheme",
+    "BodyPartExamined", "PatientPosition", "ProtocolName", "SeriesDescription", "InstitutionName",
+    "InstitutionAddress", "StationName", "SoftwareVersions", "PixelBandwidth",
+    "NonlinearGradientCorrection", "DwellTime",
+)
+
+
+def simulation_stamp() -> dict[str, Any]:
+    """The keys every simulated sidecar carries so a reader can tell it from a scan."""
+    from . import __version__
+
+    return {"SimulationSoftware": "TRXScan", "SimulationSoftwareVersion": __version__,
+            "ConversionSoftware": "trxscan", "ConversionSoftwareVersion": __version__}
+
+
+def siemens_slice_timing(nz: int, mb: int, tr_s: float) -> tuple[float, ...]:
+    """Idealised Siemens/CMRR interleaved multiband slice timing: ``nz // mb`` shots of
+    ``tr_s / n_shots`` each; slice ``z`` is excited in the shot of its in-group position
+    ``z % n_shots``; an odd number of shots runs even positions first (0, 2, ..., 1, 3, ...),
+    an even number odd first. Matches dcm2niix's ``SliceTiming`` for the CMRR diffusion
+    sequence up to the sequence's dead time at the end of the TR."""
+    n_shots = nz // mb
+    if n_shots < 1 or nz % mb:
+        raise ValueError(f"{nz} slices do not split into multiband groups of {mb}")
+    first = 0 if n_shots % 2 else 1
+    order = list(range(first, n_shots, 2)) + list(range(1 - first, n_shots, 2))
+    shot_of = {pos: k for k, pos in enumerate(order)}
+    dt = tr_s / n_shots
+    return tuple(shot_of[z % n_shots] * dt for z in range(nz))
 _PF_MODES = ("scanner", "contiguous", "fiberfox")
 _PHASE_MODELS = ("hbcd", "none")
 
@@ -184,8 +222,10 @@ class Protocol:
 
     The phase-encode axis is the grid's ``j`` axis. ``pe`` is ``"AP"`` (``"j-"``, the forward
     scan: a positive off-resonance field displaces signal toward -j) or ``"PA"`` (``"j"``, the
-    reversed polarity of a blip-up/blip-down pair). What ``PhaseEncodingDirection`` the sidecar
-    finally carries is decided by the written voxel frame (see ``fsl_orientation``).
+    reversed polarity of a blip-up/blip-down pair), named in the frame of the file you get:
+    the object's native voxel axes, or LAS with ``fsl_orientation`` (then ``"j-"`` always
+    means a posterior shift, whatever the phantom's native axes, and the sidecar's
+    ``PhaseEncodingDirection`` equals ``pe``).
 
     ``readout_ms`` is the phase-encode train duration (BIDS ``TotalReadoutTime`` in ms); the
     per-line time is derived from it and the matrix at simulation time. Give
@@ -196,6 +236,32 @@ class Protocol:
     readout is shorter; ``te_ms`` is still what you set, so lower it to bank the TE gain.
     ``pf_mode="contiguous"`` drops the *last* lines instead with unchanged timing (the legacy
     TRXScan rule) and ``"fiberfox"`` is the ported Fiberfox rule.
+
+    ``matrix`` fixes the acquired matrix ``(nx, ny, nz)``: the object is centred in it (the
+    FOV of a real scan) instead of being gridded to its own bounding box plus ``pad``.
+    ``oblique_deg`` ``(rx, ry, rz)`` tilts the acquisition grid about its centre (degrees about
+    the RAS axes, applied x then y then z): an oblique acquisition, whose written header
+    carries the rotation while the object stays where it is in the scanner.
+
+    **Recorded, not modeled.** ``tr_s``, ``flip_angle_deg``, ``field_strength_t``,
+    ``slice_timing`` and ``metadata`` go into the BIDS sidecar so a simulated run documents
+    the scan it stands in for, but the signal model has no TR, T1 or flip-angle term and the
+    acquisition has no slice clock. ``slice_timing`` (seconds per slice, one entry per slice
+    of the full volume) defaults to a Siemens-style interleaved multiband order derived from
+    ``tr_s``, the slice count and ``mb``. ``metadata`` is extra sidecar keys written verbatim
+    (``Manufacturer``, ``PulseSequenceDetails``, ...); :meth:`from_bids` fills it from a real
+    sidecar's descriptive keys. ``gnl_tag`` is the Siemens gradient-nonlinearity tag written
+    into ``ImageType`` (``"ND"`` = not corrected, ``"DIS2D"``/``"DIS3D"`` = the scanner claims
+    to have corrected in-plane / in 3-D); it changes the sidecar only, so pairing ``"DIS3D"``
+    with ``Artifacts(gnl=...)`` deliberately mislabels a warped image for tests of a
+    pipeline's tag handling.
+
+    :meth:`replace` keeps the field of view: changing ``voxel_mm`` on a protocol that has a
+    ``matrix`` rescales the matrix (``Protocol.from_bids(...).replace(voxel_mm=3.0)`` is the
+    same scan at 3 mm, not a 3 mm scan with the 1.7 mm matrix). Pass ``matrix`` too to
+    override that. Presets that pin ``readout_ms`` (``HBCD``: 91.7 ms) keep it under
+    ``replace(voxel_mm=...)``, so the echo spacing, not the train length, follows the matrix;
+    the sidecar reports whichever results.
     """
 
     voxel_mm: float | tuple[float, float, float] = 2.5
@@ -219,6 +285,14 @@ class Protocol:
     phase_model: Literal["hbcd", "none"] = "hbcd"
     fsl_orientation: bool = False
     signal_scale: float = 100.0
+    matrix: tuple[int, int, int] | None = None
+    oblique_deg: tuple[float, float, float] | None = None
+    tr_s: float | None = None
+    flip_angle_deg: float | None = None
+    field_strength_t: float | None = 3.0
+    slice_timing: tuple[float, ...] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    gnl_tag: Literal["ND", "DIS2D", "DIS3D"] = "ND"
     name: str = ""
 
     HBCD: ClassVar["Protocol"]
@@ -237,14 +311,40 @@ class Protocol:
             raise ValueError("oversample, coils, accel and mb must be >= 1")
         if self.readout_ms is not None and self.echo_spacing_ms is not None:
             raise ValueError("give readout_ms or echo_spacing_ms, not both")
+        if self.matrix is not None:
+            m = tuple(int(v) for v in self.matrix)
+            if len(m) != 3 or min(m) < 1:
+                raise ValueError(f"matrix must be three positive ints, got {self.matrix!r}")
+            object.__setattr__(self, "matrix", m)
+        if self.tr_s is not None and self.tr_s <= 0:
+            raise ValueError("tr_s must be positive")
+        if self.oblique_deg is not None:
+            o = tuple(float(v) for v in self.oblique_deg)
+            if len(o) != 3:
+                raise ValueError("oblique_deg must be three angles (rx, ry, rz)")
+            object.__setattr__(self, "oblique_deg", o)
+        if self.slice_timing is not None:
+            object.__setattr__(self, "slice_timing", tuple(float(v) for v in self.slice_timing))
+        if self.gnl_tag not in _GNL_TAGS:
+            raise ValueError(f"gnl_tag must be one of {_GNL_TAGS}, got {self.gnl_tag!r}")
+        object.__setattr__(self, "metadata", dict(self.metadata))
         object.__setattr__(self, "tissue", _as_tissue(self.tissue))
 
     def replace(self, **kw: Any) -> "Protocol":
         if kw and "name" not in kw and self.name:
             kw["name"] = f"{self.name}*"
+        if "voxel_mm" in kw and "matrix" not in kw and self.matrix is not None:
+            new = kw["voxel_mm"]
+            new = (float(new),) * 3 if np.isscalar(new) else tuple(float(v) for v in new)
+            kw["matrix"] = tuple(max(1, int(round(n * o / v))) for n, o, v in zip(self.matrix, self.voxel, new))
         return dataclasses.replace(self, **kw)
 
     # -- derived -------------------------------------------------------------
+
+    @property
+    def fov_mm(self) -> tuple[float, float, float] | None:
+        """The field of view ``matrix * voxel`` in mm, or None without a fixed matrix."""
+        return None if self.matrix is None else tuple(n * v for n, v in zip(self.matrix, self.voxel))
 
     @property
     def voxel(self) -> tuple[float, float, float]:
@@ -283,19 +383,63 @@ class Protocol:
         """The EPI readout timing on an ``nx`` x ``ny`` matrix."""
         return _readout_from_acquisition(nx, ny, self.acquisition(ny))
 
-    def sidecar(self, ny: int) -> dict[str, Any]:
-        """The protocol part of the BIDS sidecar (``PhaseEncodingDirection`` is added at write
-        time from the written frame)."""
+    def slice_timing_for(self, nz: int) -> tuple[float, ...] | None:
+        """Seconds from the volume's start to each of ``nz`` slices (BIDS ``SliceTiming``):
+        the explicit ``slice_timing`` when it has ``nz`` entries, else the Siemens interleaved
+        multiband order derived from ``tr_s`` and ``mb`` (``nz`` must divide into ``mb``
+        slice groups), else None."""
+        if self.slice_timing is not None:
+            return self.slice_timing if len(self.slice_timing) == nz else None
+        if self.tr_s is None or nz < 1 or nz % self.mb:
+            return None
+        return siemens_slice_timing(nz, self.mb, self.tr_s)
+
+    def sidecar(self, ny: int, nz: int | None = None, nx: int | None = None) -> dict[str, Any]:
+        """The protocol part of the BIDS DWI sidecar for an ``nx`` x ``ny`` x ``nz`` acquisition
+        (``PhaseEncodingDirection`` is added at write time from the written frame). Timing keys
+        are the simulated readout; the recorded-only fields (TR, flip angle, slice timing,
+        ``metadata``) are included when set."""
         t_line = self.t_line_ms(ny)
         trt = round(t_line * ny / 1000.0, 6)
-        return {
+        ees = round(trt / max(ny - 1, 1), 8)
+        n_lines = int(round(ny * self.partial_fourier))
+        side: dict[str, Any] = {"Manufacturer": "TRXScan"}
+        side.update(self.metadata)
+        side.update({
+            "PulseSequenceType": "Single-shot spin-echo EPI",
+            "ScanningSequence": "EP",
+            "MRAcquisitionType": "2D",
             "TotalReadoutTime": trt,
-            "EffectiveEchoSpacing": round(trt / max(ny - 1, 1), 8),
+            "EffectiveEchoSpacing": ees,
+            "BandwidthPerPixelPhaseEncode": round(1.0 / (ees * ny), 4) if ees > 0 else None,
             "EchoTime": round(self.te_ms / 1000.0, 4),
             "PartialFourier": self.partial_fourier,
             "ParallelReductionFactorInPlane": self.accel,
             "MultibandAccelerationFactor": self.mb,
-        }
+            "ReconMatrixPE": int(ny),
+            "AcquisitionMatrixPE": int(ny),
+            "PhaseEncodingSteps": n_lines,
+            "EchoTrainLength": n_lines,
+            "SliceThickness": self.voxel[2],
+            "SpacingBetweenSlices": self.voxel[2],
+        })
+        side["ImageType"] = ["ORIGINAL", "PRIMARY", "DIFFUSION", "NONE"] + (["MB"] if self.mb > 1 else []) + [self.gnl_tag]
+        if self.partial_fourier < 1.0:
+            side["PartialFourierDirection"] = "PHASE"
+        if self.accel > 1:
+            side["ParallelAcquisitionTechnique"] = "GRAPPA"
+        if self.tr_s is not None:
+            side["RepetitionTime"] = float(self.tr_s)
+        if self.flip_angle_deg is not None:
+            side["FlipAngle"] = float(self.flip_angle_deg)
+        if self.field_strength_t is not None:
+            side["MagneticFieldStrength"] = float(self.field_strength_t)
+        if nz is not None:
+            st = self.slice_timing_for(nz)
+            if st is not None:
+                side["SliceTiming"] = [round(v, 6) for v in st]
+        side.update(simulation_stamp())
+        return {k: v for k, v in side.items() if v is not None}
 
     # -- from a real acquisition ---------------------------------------------
 
@@ -307,8 +451,13 @@ class Protocol:
         x (``ReconMatrixPE`` or the header's PE dimension)) -> ``readout_ms``;
         ``PhaseEncodingDirection`` -> ``pe``; ``PartialFourier`` -> ``partial_fourier``;
         ``ParallelReductionFactorInPlane`` -> ``accel``; ``MultibandAccelerationFactor`` ->
-        ``mb``; ``pixdim`` -> ``voxel_mm``. Keys that are absent keep :attr:`DEFAULT`'s values
-        and are listed in one warning. Nothing is inferred about artifacts.
+        ``mb``; ``pixdim`` -> ``voxel_mm``; the header's shape -> ``matrix`` (so the simulated
+        FOV matches); an LAS header -> ``fsl_orientation``. Recorded only: ``RepetitionTime``
+        -> ``tr_s``, ``FlipAngle`` -> ``flip_angle_deg``, ``MagneticFieldStrength`` ->
+        ``field_strength_t``, ``SliceTiming`` -> ``slice_timing``, and the scanner/sequence
+        descriptors in :data:`SIDECAR_PASSTHROUGH` -> ``metadata``. Keys that are absent keep
+        :attr:`DEFAULT`'s values and are listed in one warning. Nothing is inferred about
+        artifacts.
         """
         import warnings
 
@@ -332,7 +481,9 @@ class Protocol:
 
             img = nib.load(str(nifti_path))
             zooms = img.header.get_zooms()[:3]
-            kw["voxel_mm"] = tuple(float(z) for z in zooms)
+            kw["voxel_mm"] = tuple(round(float(z), 6) for z in zooms)  # float32 pixdims -> clean mm
+            kw["matrix"] = tuple(int(v) for v in img.shape[:3])
+            kw["fsl_orientation"] = nib.aff2axcodes(img.affine) == ("L", "A", "S")
             ny = int(img.shape[1])
         else:
             missing.append("voxel size (no NIfTI found)")
@@ -362,6 +513,18 @@ class Protocol:
             kw["accel"] = int(round(float(side["ParallelReductionFactorInPlane"])))
         if "MultibandAccelerationFactor" in side:
             kw["mb"] = int(round(float(side["MultibandAccelerationFactor"])))
+        if "RepetitionTime" in side:
+            kw["tr_s"] = float(side["RepetitionTime"])
+        if "FlipAngle" in side:
+            kw["flip_angle_deg"] = float(side["FlipAngle"])
+        if "MagneticFieldStrength" in side:
+            kw["field_strength_t"] = float(side["MagneticFieldStrength"])
+        if isinstance(side.get("SliceTiming"), list):
+            kw["slice_timing"] = tuple(float(v) for v in side["SliceTiming"])
+        tags = [t for t in side.get("ImageType", []) if t in _GNL_TAGS] if isinstance(side.get("ImageType"), list) else []
+        if tags:
+            kw["gnl_tag"] = tags[-1]
+        kw["metadata"] = {k: side[k] for k in SIDECAR_PASSTHROUGH if k in side}
         if missing:
             warnings.warn(f"{json_path.name}: no {', '.join(missing)}; using Protocol.DEFAULT values for those", stacklevel=2)
         kw["name"] = json_path.name.replace(".json", "")
@@ -373,4 +536,6 @@ Protocol.DEFAULT = Protocol(name="default")
 # The CLI's shipping protocol (`Acquisition::hbcd`): TE 88 ms, PE train pinned to HBCD's
 # TotalReadoutTime 91.7 ms, 6/8 scanner-style partial Fourier, 24 ACS lines, 1.7 mm. The CLI also
 # adds a subtle Nyquist ghost (0.015), which is an artifact here: `Artifacts(ghost=0.015)`.
+# `readout_ms` is pinned, so `HBCD.replace(voxel_mm=3.0)` keeps the 91.7 ms train and shortens
+# the echo spacing; give `readout_ms=None, echo_spacing_ms=...` to let the train follow the matrix.
 Protocol.HBCD = Protocol(voxel_mm=1.7, te_ms=88.0, readout_ms=91.7, partial_fourier=0.75, acs_lines=24, name="hbcd")
