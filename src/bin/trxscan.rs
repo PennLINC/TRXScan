@@ -269,6 +269,17 @@ struct Cli {
     /// Compartment T1s (ms) for the GRE steady state: fiber,gm,csf.
     #[arg(long, value_delimiter = ',', num_args = 3, default_values_t = [830.0f32, 1330.0, 4000.0], value_name = "MS", requires = "gre_out")]
     gre_t1: Vec<f32>,
+    /// Compartment proton densities for the GRE: fiber,gm,csf (flattens the brain like a real
+    /// fieldmap magnitude; 1,1,1 = pure T1 weighting).
+    #[arg(long, value_delimiter = ',', num_args = 3, default_values_t = [0.7f32, 0.85, 1.0], value_name = "PD", requires = "gre_out")]
+    gre_pd: Vec<f32>,
+    /// Receive-coil bias of the GRE magnitude: centre 1-bias, periphery 1+bias. 0 = none.
+    #[arg(long, default_value_t = 0.3, value_name = "FRAC", requires = "gre_out")]
+    gre_bias: f64,
+    /// Reconstruct the GRE acquisition matrix by box averaging instead of Fourier truncation
+    /// (no Gibbs ringing).
+    #[arg(long, requires = "gre_out")]
+    gre_no_ringing: bool,
 
     /// Also write the ground-truth fibre orientations per acquisition voxel: up to three peaks
     /// of the orientation mixture (aggregated over the oversampled cells, refined to sub-bin
@@ -606,6 +617,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tr_s: cli.gre_tr,
             flip_deg: cli.gre_flip,
             t1_ms: [cli.gre_t1[0], cli.gre_t1[1], cli.gre_t1[2]],
+            pd: [cli.gre_pd[0], cli.gre_pd[1], cli.gre_pd[2]],
+            bias: cli.gre_bias,
+            ringing: !cli.gre_no_ringing,
             ..Default::default()
         };
         let g = gre::synthesize(&GreObject {
@@ -618,6 +632,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             warp: gnl_warp,
             signal_scale: acq.signal_scale,
             seed: cli.seed,
+            head: None,
+            z_offset: 0,
+            nz_full: grid.dims[2],
         }, &p);
         println!(
             "GRE fieldmap: TE {:.2}/{:.2} ms, TR {:.3} s, FA {:.0} deg, {}, {}, tissue SNR {} (sigma {:.3}){}",

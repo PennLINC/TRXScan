@@ -566,7 +566,11 @@ def _synthesize_gre(sub, local, z0, z1, sim_affine, acq_affine, fmap_sim, t2, pr
         tuple(float(v) for v in protocol.tissue_s0), t2, fmap_sim, float(protocol.signal_scale), seed,
         te_s=tuple(gre.te_s), snr=gre.snr, res_mm=gre.res_mm, snr_vol_exp=gre.snr_vol_exp, output=gre.output,
         rx_phase_rad=gre.rx_phase_rad, b0_field=gre.b0_field, tr_s=float(gre.tr_s), flip_deg=float(gre.flip_deg),
-        t1_ms=tuple(float(v) for v in gre.t1_ms), warp=warp, warp_modulate=bool(artifacts.gnl_jacobian),
+        t1_ms=tuple(float(v) for v in gre.t1_ms), pd=tuple(float(v) for v in gre.pd), bias=float(gre.bias), ringing=bool(gre.ringing),
+        t2_head_ms=float(gre.t2_head_ms),
+        head=None if not gre.head or getattr(sub, "sim_head", None) is None else np.ascontiguousarray(sub.sim_head * np.float32(gre.head_level), dtype=np.float32),
+        z_offset=int(getattr(sub, "z_offset", 0)), nz_full=int(getattr(sub, "nz_full", None) or sub.dims[2]),
+        warp=warp, warp_modulate=bool(artifacts.gnl_jacobian),
     )
     gdims = tuple(int(v) for v in g["dims"])
     gaff = g["affine"].reshape(4, 4)

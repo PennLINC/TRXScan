@@ -114,8 +114,8 @@ def test_gre_magnitude_is_t1_weighted(gtab6, tmp_path):
     T1-weighted, WM bright); TR = inf at 90 deg is the proton-density limit."""
     box = ts.objects.box(8, matrix=24, oversample=1, nz=2)
     proto = ts.Protocol.HBCD.replace(voxel_mm=2.0, oversample=1)
-    t1 = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0), kspace=False)
-    pd = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, tr_s=float("inf"), flip_deg=90.0), kspace=False)
+    t1 = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, pd=(1, 1, 1), bias=0.0), kspace=False)
+    pd = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, pd=(1, 1, 1), bias=0.0, tr_s=float("inf"), flip_deg=90.0), kspace=False)
     m1 = np.asarray(t1.gre.magnitude1.dataobj); m0 = np.asarray(pd.gre.magnitude1.dataobj)
     inside = m0 > 0.5 * m0.max()
     a = np.radians(60.0); e1 = np.exp(-500.0 / 830.0)
@@ -150,3 +150,26 @@ def test_b0_only_scheme_is_finite():
     assert np.isfinite(m).all() and m.max() > 0
     v = ts.Voxel(fibers=[((1, 0, 0), 1.0)]).signal(g).total
     assert np.allclose(v, 1.0)
+
+
+def test_gre_bias_and_ringing_are_switchable(gtab6):
+    """The receive bias darkens the centre relative to the periphery; Fourier reconstruction rings
+    at the box edge where box averaging does not."""
+    # 8 slices so the middle ones sit near the volume centre (a 2-slice volume is all edge)
+    box = ts.objects.box(8, matrix=24, oversample=2, nz=8)
+    proto = ts.Protocol.HBCD.replace(voxel_mm=2.0, oversample=2)
+    flat = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, bias=0.0, ringing=False), kspace=False)
+    biased = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, bias=0.3, ringing=False), kspace=False)
+    ringed = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, bias=0.0, ringing=True), kspace=False)
+    f = np.asarray(flat.gre.magnitude1.dataobj); b = np.asarray(biased.gre.magnitude1.dataobj); r = np.asarray(ringed.gre.magnitude1.dataobj)
+    inside = f > 0.5 * f.max()
+    ratio = b[inside] / f[inside]
+    assert ratio.min() < 0.8 and ratio.max() > ratio.min() + 0.05
+    # slab runs see the volume's gain, not their own: the middle slices alone equal the whole run
+    part = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, bias=0.3, ringing=False), kspace=False, slices=slice(3, 5))
+    assert np.allclose(np.asarray(part.gre.magnitude1.dataobj), np.asarray(biased.gre.magnitude1.dataobj)[:, :, 3:5], atol=1e-4)
+    # box averaging never exceeds the plateau; the truncated series overshoots next to the edge
+    # (the magnitude is |signal|, so the undershoot shows as a positive ripple, not a negative dip)
+    assert r.max() > f.max() * 1.005
+    plateau = inside.copy(); plateau[:, :, :2] = False; plateau[:, :, -2:] = False
+    assert r[plateau].std() > f[plateau].std() + 0.5

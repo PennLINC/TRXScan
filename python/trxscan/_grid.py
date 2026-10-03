@@ -106,10 +106,21 @@ def grid_phantom(
         sim_affine, sim_shape = affine, shape
         sim, sim_mask, sim_fmap = acq, mask, fmap
 
+    # Non-brain head for the GRE magnitude: the subject's T1w outside the (soft) brain, in units
+    # of the brain's own T1w level, so scalp/skull/neck ride along with the tissue mixture.
+    sim_head = None
+    if phantom.t1w is not None:
+        t1 = _resample(phantom.t1w, (tuple(sim_shape), sim_affine), True)
+        brain = np.clip(sim["wm"] + sim["gm"] + sim["csf"], 0.0, 1.0)
+        inside = t1[brain > 0.5]
+        level = float(np.median(inside)) if inside.size else 0.0
+        if level > 0:
+            sim_head = np.clip(t1 / level, 0.0, None) * (1.0 - brain)
+
     return Object(
         dims=shape, affine=affine, oversample=oversample, sim_dims=tuple(sim_shape), sim_affine=sim_affine,
         wm=flat_f32(acq["wm"]), gm=flat_f32(acq["gm"]), csf=flat_f32(acq["csf"]), mask=flat_f32(mask),
         sim_wm=flat_f32(sim["wm"]), sim_gm=flat_f32(sim["gm"]), sim_csf=flat_f32(sim["csf"]), sim_mask=flat_f32(sim_mask),
         sim_fmap=flat_f32(sim_fmap), fmap=flat_f32(fmap), streamlines=phantom.streamlines, fibers=None,
-        voxel_mm=tuple(float(v) for v in VOX), name=phantom.name,
+        sim_head=None if sim_head is None else flat_f32(sim_head), voxel_mm=tuple(float(v) for v in VOX), name=phantom.name,
     )
