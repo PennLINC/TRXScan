@@ -186,7 +186,7 @@ sidecars (`PhaseEncodingDirection`, `TotalReadoutTime`, `EchoTime`, …). Option
 | `--motion <tsv>` | — | qsiprep/eddy confounds TSV (`trans_x/y/z` mm, `rot_x/y/z` rad); per-volume re-simulation |
 | `--mb <f>` / `--dropout-rate <p>` | 1 / 0 | multiband factor and per-volume within-volume dropout probability; writes `<out>_desc-dropout_slices.tsv` |
 | `--gnl <preset\|file>` | — | gradient nonlinearity: `whole-body-80`, `connectom-300` or a Siemens `.grad`; `--gnl-scale`, `--isocenter x,y,z`, `--gnl-no-warp`, `--gnl-no-encoding`, `--gnl-no-jacobian-modulation`, `--gnl-info` |
-| `--gre-out <prefix>` | — | also synthesize a dual-echo GRE fieldmap; `--gre-snr` [50], `--gre-res <mm>`, `--gre-output phasediff\|phase`, `--gre-rx-phase`, `--gre-snr-vol-exp`, `--gre-b0field` [b0gre] |
+| `--gre-out <prefix>` | — | also synthesize a dual-echo GRE fieldmap; `--gre-snr` [50], `--gre-res <mm>`, `--gre-output phasediff\|phase`, `--gre-rx-phase`, `--gre-snr-vol-exp`, `--gre-b0field` [b0gre], `--gre-tr` [0.5 s] / `--gre-flip` [60°] / `--gre-t1` [830,1330,4000 ms] (spoiled-GRE T1 steady state: the magnitude has WM > GM ≫ CSF contrast; `--gre-tr inf --gre-flip 90` is proton density) |
 | `--truth-peaks` | off | write up to three ground-truth fibre peaks per voxel, `<out>_desc-truth_peaks.nii.gz` (9 volumes) |
 | `--weights <spec>` | — | SIFT2 weights: a TRX `dps` name, or an MRtrix `tcksift2` text file |
 | `--kappa <κ>` | — | Watson dispersion applied to the orientation histogram |

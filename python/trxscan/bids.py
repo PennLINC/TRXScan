@@ -101,7 +101,7 @@ def write_bids(sim: "Simulation", prefix: str | Path) -> list[Path]:
         te = g.te_s
         for i, img in enumerate((g.magnitude1, g.magnitude2), start=1):
             img.to_filename(str(p(f"_gre_magnitude{i}.nii.gz")))
-            Path(f"{gp}_magnitude{i}.json").write_text(_json({"EchoTime": te[i - 1], "B0FieldIdentifier": g.b0_field}))
+            Path(f"{gp}_magnitude{i}.json").write_text(_json({"EchoTime": te[i - 1], "RepetitionTime": g.tr_s, "FlipAngle": g.flip_deg, "B0FieldIdentifier": g.b0_field}))
             out.append(Path(f"{gp}_magnitude{i}.json"))
         for name, img in g.phase.items():
             img.to_filename(str(p(f"_gre_{name}.nii.gz")))
@@ -590,7 +590,7 @@ class Dataset:
         out_dir = self.folder(sub, ses, "fmap")
         T = _offset_of(offset, g.magnitude1)
         mv = (lambda im, ph=None: offset_image(im, T, offset_mode, ph)) if T is not None else (lambda im, ph=None: im)
-        base: dict[str, Any] = {"B0FieldIdentifier": g.b0_field, **simulation_stamp()}
+        base: dict[str, Any] = {"B0FieldIdentifier": g.b0_field, "RepetitionTime": g.tr_s, "FlipAngle": g.flip_deg, **simulation_stamp()}
         for k in ("Manufacturer", "ManufacturersModelName", "MagneticFieldStrength"):
             if k in sim.sidecar:
                 base[k] = sim.sidecar[k]

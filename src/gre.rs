@@ -52,6 +52,17 @@ pub struct GreParams {
     pub rx_phase_rad: f64,
     /// BIDS `B0FieldIdentifier` written to every sidecar; the DWI carries it as `B0FieldSource`.
     pub b0_field: String,
+    /// Repetition time (s) of the spoiled GRE. With `flip_deg` and `t1_ms` it sets the T1
+    /// steady state `sin α (1 − E1) / (1 − cos α · E1)`, `E1 = exp(−TR/T1)`, per compartment —
+    /// the WM > GM ≫ CSF contrast of a real fieldmap magnitude (Siemens `gre_field_mapping`:
+    /// TR ≈ 0.4–0.7 s, FA 60°). Without it the echoes at TE ≈ 5 ms collapse to the tissue
+    /// fraction sum (a flat head), which gives magnitude→EPI registrations nothing to lock onto.
+    pub tr_s: f64,
+    /// Flip angle (degrees).
+    pub flip_deg: f64,
+    /// Per-compartment T1 (ms) `[fiber, gm, csf]`; default adult 3 T (Wansapura 1999: WM 830,
+    /// GM 1330; CSF ~4000).
+    pub t1_ms: [f32; 3],
 }
 
 impl Default for GreParams {
@@ -64,8 +75,23 @@ impl Default for GreParams {
             output: GreOutput::Phasediff,
             rx_phase_rad: 6.0,
             b0_field: "b0gre".to_string(),
+            tr_s: 0.5,
+            flip_deg: 60.0,
+            t1_ms: [830.0, 1330.0, 4000.0],
         }
     }
+}
+
+/// Spoiled-GRE steady-state factor per compartment: `sin α (1 − E1) / (1 − cos α · E1)` with
+/// `E1 = exp(−TR/T1)`. `tr_s = ∞` with `flip_deg = 90` gives 1 = pure proton density.
+pub fn steady_state(p: &GreParams) -> [f64; 3] {
+    let a = p.flip_deg.to_radians();
+    let mut out = [1.0f64; 3];
+    for (c, o) in out.iter_mut().enumerate() {
+        let e1 = (-(p.tr_s * 1000.0) / p.t1_ms[c] as f64).exp();
+        *o = a.sin() * (1.0 - e1) / (1.0 - a.cos() * e1);
+    }
+    out
 }
 
 /// The object the GRE is synthesized from, on the signal (simulation) grid.
@@ -108,7 +134,8 @@ pub struct GreFieldmap {
 }
 
 /// Synthesize the GRE from the object. Magnitudes come from the tissue fractions with the
-/// compartment T2s (and the same GNL warp as the DWI); the phase from the (already warped) field.
+/// compartment T1 steady state (`steady_state`) and T2 decay (and the same GNL warp as the DWI);
+/// the phase from the (already warped) field.
 pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     let sig = obj.sig_grid;
     let o = (sig.dims[0] / obj.acq_grid.dims[0].max(1)).max(1);
@@ -119,14 +146,16 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     assert_eq!(obj.fmap_hz.len(), nvox_sig, "fieldmap is not on the signal grid");
     assert_eq!(obj.t2_ms.len(), 3, "three compartment T2s");
 
-    // per-echo magnitude on the fine signal grid (compartment-T2 decay + the same GNL warp)
+    // per-echo magnitude on the fine signal grid (compartment T1 steady state × T2 decay + the
+    // same GNL warp)
+    let ss = steady_state(p);
     let mut fine_mag: Vec<Vec<f32>> = Vec::new();
     for te in [te1, te2] {
         let mut m = vec![0.0f32; nvox_sig];
         for (v, mv) in m.iter_mut().enumerate() {
             let mut acc = 0.0f64;
             for (c, frac) in obj.fractions.iter().enumerate() {
-                acc += frac[v] as f64 * obj.s0[c] as f64 * (-(te * 1000.0) / obj.t2_ms[c] as f64).exp();
+                acc += frac[v] as f64 * obj.s0[c] as f64 * ss[c] * (-(te * 1000.0) / obj.t2_ms[c] as f64).exp();
             }
             *mv = (acc * obj.signal_scale) as f32;
         }
@@ -208,13 +237,15 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     // uniformly wherever there is no signal. The per-voxel signal is a mean of the fine grid
     // (resolution-independent), so cross-resolution SNR realism comes from scaling σ: a larger
     // GRE voxel collects proportionally more signal, SNR ∝ V^exp ⇒ σ ∝ (V_dwi / V_gre)^exp,
-    // referenced to the DWI acquisition voxel (V_gre == V_dwi ⇒ scale 1).
+    // referenced to the DWI acquisition voxel (V_gre == V_dwi ⇒ scale 1). `snr` is the SNR of
+    // the brightest compartment at its steady state, so the T1 weighting does not change it.
+    let ss_max = ss.iter().cloned().fold(0.0f64, f64::max).max(f64::MIN_POSITIVE);
     let sigma = if p.snr > 0.0 {
         let det3 = |m: &[[f64; 4]; 4]| (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
             - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
             + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])).abs();
         let scale = (det3(&obj.acq_grid.voxel_to_world) / det3(&gre_grid.voxel_to_world)).powf(p.snr_vol_exp);
-        obj.signal_scale / p.snr * scale
+        obj.signal_scale * ss_max / p.snr * scale
     } else {
         0.0
     };
@@ -390,7 +421,7 @@ mod tests {
             sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &zero, &zero], s0: [1.0; 3],
             t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0,
         };
-        let p = GreParams { snr: 0.0, ..Default::default() };
+        let p = GreParams { snr: 0.0, tr_s: f64::INFINITY, ..Default::default() };
         let g = synthesize(&obj, &p);
         assert_eq!(g.grid.dims, [2, 2, 1]);
         assert_eq!(g.phase.len(), 1);
@@ -408,6 +439,37 @@ mod tests {
     }
 
     #[test]
+    fn the_steady_state_gives_a_t1_weighted_magnitude() {
+        // pure WM / GM / CSF voxels in one row; defaults TR 0.5 s, FA 60°
+        let acq = grid([3, 1, 1], 1.0);
+        let sig = grid([3, 1, 1], 1.0);
+        let wm = vec![1.0f32, 0.0, 0.0];
+        let gm = vec![0.0f32, 1.0, 0.0];
+        let csf = vec![0.0f32, 0.0, 1.0];
+        let fmap = vec![0.0f32; 3];
+        let obj = GreObject {
+            sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &gm, &csf], s0: [1.0; 3],
+            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0,
+        };
+        let p = GreParams { snr: 0.0, ..Default::default() };
+        let ss = steady_state(&p);
+        let a = 60f64.to_radians();
+        let e1 = (-500.0f64 / 830.0).exp();
+        assert!((ss[0] - a.sin() * (1.0 - e1) / (1.0 - a.cos() * e1)).abs() < 1e-12);
+        // WM > GM > CSF, and CSF far below WM (a real fieldmap magnitude)
+        assert!(ss[0] > ss[1] && ss[1] > ss[2] && ss[2] < 0.4 * ss[0], "{ss:?}");
+        let g = synthesize(&obj, &p);
+        let m = &g.magnitude[0];
+        let want = |c: usize| (100.0 * ss[c] * (-(p.te_s[0] * 1000.0) / [70.0, 100.0, 2000.0][c]).exp()) as f32;
+        for c in 0..3 {
+            assert!((m[c] - want(c)).abs() < 1e-3 * want(c), "compartment {c}: {} vs {}", m[c], want(c));
+        }
+        // TR = ∞ at 90° is proton density (the pre-T1 behaviour)
+        let pd = steady_state(&GreParams { tr_s: f64::INFINITY, flip_deg: 90.0, ..Default::default() });
+        assert!(pd.iter().all(|&v| (v - 1.0).abs() < 1e-12), "{pd:?}");
+    }
+
+    #[test]
     fn the_two_phase_route_differences_back_to_the_same_field() {
         let acq = grid([4, 4, 1], 2.0);
         let sig = grid([4, 4, 1], 2.0);
@@ -419,7 +481,7 @@ mod tests {
             sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &zero, &zero], s0: [1.0; 3],
             t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0,
         };
-        let p = GreParams { snr: 0.0, output: GreOutput::Phase, ..Default::default() };
+        let p = GreParams { snr: 0.0, output: GreOutput::Phase, tr_s: f64::INFINITY, ..Default::default() };
         let g = synthesize(&obj, &p);
         assert_eq!(g.phase.len(), 2);
         let tau = std::f64::consts::TAU;

@@ -109,6 +109,25 @@ def test_multiband_dropout_and_gre(gtab6):
     assert "phasediff" in sim.gre.phase and sim.sidecar["B0FieldSource"] == "b0gre"
 
 
+def test_gre_magnitude_is_t1_weighted(gtab6, tmp_path):
+    """The GRE magnitude carries the spoiled-GRE steady state (a real fieldmap magnitude is
+    T1-weighted, WM bright); TR = inf at 90 deg is the proton-density limit."""
+    box = ts.objects.box(8, matrix=24, oversample=1, nz=2)
+    proto = ts.Protocol.HBCD.replace(voxel_mm=2.0, oversample=1)
+    t1 = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0), kspace=False)
+    pd = box.simulate(gtab6, proto, ts.Artifacts(), gre=ts.Gre(snr=0.0, tr_s=float("inf"), flip_deg=90.0), kspace=False)
+    m1 = np.asarray(t1.gre.magnitude1.dataobj); m0 = np.asarray(pd.gre.magnitude1.dataobj)
+    inside = m0 > 0.5 * m0.max()
+    a = np.radians(60.0); e1 = np.exp(-500.0 / 830.0)
+    ss_wm = np.sin(a) * (1 - e1) / (1 - np.cos(a) * e1)
+    assert np.allclose(m1[inside] / m0[inside], ss_wm, rtol=1e-4)
+    assert t1.gre.tr_s == 0.5 and t1.gre.flip_deg == 60.0
+    files = {p.name: p for p in t1.to_bids(tmp_path / "sub-01_dir-AP")}
+    import json
+    meta = json.loads(files["sub-01_dir-AP_gre_magnitude1.json"].read_text())
+    assert meta["RepetitionTime"] == 0.5 and meta["FlipAngle"] == 60.0
+
+
 def test_gnl_and_bids_writer(gtab6, tmp_path):
     box = ts.objects.box(8, matrix=24, oversample=1, nz=2)
     proto = ts.Protocol.HBCD.replace(voxel_mm=2.0, oversample=1, fsl_orientation=True)

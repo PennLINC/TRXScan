@@ -1124,7 +1124,7 @@ fn acquisition_hbcd<'py>(py: Python<'py>, ny: usize) -> PyResult<Bound<'py, PyDi
 #[pyfunction]
 #[pyo3(signature = (sig_dims, sig_affine, acq_dims, acq_affine, fiber, gm, csf, s0, t2, fmap, signal_scale, seed,
                     te_s=(4.92e-3, 7.38e-3), snr=50.0, res_mm=None, snr_vol_exp=1.0, output="phasediff", rx_phase_rad=6.0,
-                    b0_field="b0gre", warp=None, warp_modulate=true))]
+                    b0_field="b0gre", tr_s=0.5, flip_deg=60.0, t1_ms=(830.0, 1330.0, 4000.0), warp=None, warp_modulate=true))]
 #[allow(clippy::too_many_arguments)]
 fn gre_synthesize<'py>(
     py: Python<'py>,
@@ -1133,7 +1133,7 @@ fn gre_synthesize<'py>(
     fiber: PyReadonlyArray1<'_, f32>, gm: PyReadonlyArray1<'_, f32>, csf: PyReadonlyArray1<'_, f32>,
     s0: (f32, f32, f32), t2: Vec<f32>, fmap: PyReadonlyArray1<'_, f32>, signal_scale: f64, seed: u64,
     te_s: (f64, f64), snr: f64, res_mm: Option<f64>, snr_vol_exp: f64, output: &str, rx_phase_rad: f64, b0_field: &str,
-    warp: Option<&GnlField>, warp_modulate: bool,
+    tr_s: f64, flip_deg: f64, t1_ms: (f32, f32, f32), warp: Option<&GnlField>, warp_modulate: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let sig = Grid { dims: dims_of(sig_dims), voxel_to_world: affine4(&sig_affine)? };
     let acq = Grid { dims: dims_of(acq_dims), voxel_to_world: affine4(&acq_affine)? };
@@ -1151,8 +1151,9 @@ fn gre_synthesize<'py>(
     };
     let p = gre::GreParams {
         te_s: [te_s.0, te_s.1], snr, res_mm, snr_vol_exp, output, rx_phase_rad, b0_field: b0_field.to_string(),
-        ..Default::default()
+        tr_s, flip_deg, t1_ms: [t1_ms.0, t1_ms.1, t1_ms.2],
     };
+    let (tr_s_out, flip_deg_out) = (p.tr_s, p.flip_deg);
     let warp_field = warp.map(|w| w.inner.clone());
     if let Some(w) = &warp_field {
         if w.dims != sig.dims {
@@ -1187,6 +1188,8 @@ fn gre_synthesize<'py>(
     }
     d.set_item("phase", phases)?;
     d.set_item("te_s", (g.te_s[0], g.te_s[1]))?;
+    d.set_item("tr_s", tr_s_out)?;
+    d.set_item("flip_deg", flip_deg_out)?;
     d.set_item("output", match g.output { gre::GreOutput::Phasediff => "phasediff", gre::GreOutput::Phase => "phase" })?;
     d.set_item("b0_field", g.b0_field)?;
     d.set_item("sigma", g.sigma)?;

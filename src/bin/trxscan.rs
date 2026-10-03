@@ -258,6 +258,17 @@ struct Cli {
     /// phases (`--gre-output phase`). Larger → more fringes. Cancels in the phase difference.
     #[arg(long, default_value_t = 6.0, value_name = "RAD", requires = "gre_out")]
     gre_rx_phase: f64,
+    /// Repetition time (s) of the spoiled GRE: with `--gre-flip` and `--gre-t1` it sets the T1
+    /// steady state per compartment (WM > GM ≫ CSF, as in a real fieldmap magnitude). `inf` =
+    /// proton density only.
+    #[arg(long, default_value_t = 0.5, value_name = "S", requires = "gre_out")]
+    gre_tr: f64,
+    /// GRE flip angle (degrees).
+    #[arg(long, default_value_t = 60.0, value_name = "DEG", requires = "gre_out")]
+    gre_flip: f64,
+    /// Compartment T1s (ms) for the GRE steady state: fiber,gm,csf.
+    #[arg(long, value_delimiter = ',', num_args = 3, default_values_t = [830.0f32, 1330.0, 4000.0], value_name = "MS", requires = "gre_out")]
+    gre_t1: Vec<f32>,
 
     /// Also write the ground-truth fibre orientations per acquisition voxel: up to three peaks
     /// of the orientation mixture (aggregated over the oversampled cells, refined to sub-bin
@@ -592,6 +603,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output: cli.gre_output,
             rx_phase_rad: cli.gre_rx_phase,
             b0_field: cli.gre_b0field.clone(),
+            tr_s: cli.gre_tr,
+            flip_deg: cli.gre_flip,
+            t1_ms: [cli.gre_t1[0], cli.gre_t1[1], cli.gre_t1[2]],
             ..Default::default()
         };
         let g = gre::synthesize(&GreObject {
@@ -606,8 +620,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             seed: cli.seed,
         }, &p);
         println!(
-            "GRE fieldmap: TE {:.2}/{:.2} ms, {}, {}, tissue SNR {} (sigma {:.3}){}",
-            p.te_s[0] * 1e3, p.te_s[1] * 1e3,
+            "GRE fieldmap: TE {:.2}/{:.2} ms, TR {:.3} s, FA {:.0} deg, {}, {}, tissue SNR {} (sigma {:.3}){}",
+            p.te_s[0] * 1e3, p.te_s[1] * 1e3, p.tr_s, p.flip_deg,
             match p.output {
                 GreOutput::Phase => format!("phase1/phase2 (rx-phase {:.1} rad)", p.rx_phase_rad),
                 GreOutput::Phasediff => "phasediff".to_string(),
