@@ -16,7 +16,23 @@ Window = str | tuple[str, float] | tuple[str, float, float] | None
 @dataclass(frozen=True)
 class Gre:
     """Synthetic dual-echo GRE fieldmap of the same object (Siemens conventions), requested
-    with ``Object.simulate(..., gre=Gre())``."""
+    with ``Object.simulate(..., gre=Gre())``.
+
+    The magnitudes are spoiled-GRE steady states: per compartment
+    ``sin(flip) (1 - E1) / (1 - cos(flip) E1)``, ``E1 = exp(-tr_s / T1)``, times the T2 decay at
+    each echo, so with the defaults (TR 0.5 s, FA 60 deg, adult 3 T T1 of 830/1330/4000 ms for
+    fiber/GM/CSF) the image carries the WM > GM >> CSF contrast of a real fieldmap magnitude.
+    ``tr_s=float("inf")`` with ``flip_deg=90`` gives pure proton density (the tissue-fraction
+    sum). ``snr`` is the SNR of the brightest compartment.
+
+    Realism of a scanner fieldmap magnitude (modelled on a Prisma ``B0map``, TR 0.52 s, FA 45):
+    ``pd`` proton densities flatten the brain to its real near-uniform look; ``bias`` is the
+    periphery-bright receive profile of a head array (centre ``1-bias``, corners ``1+bias``);
+    ``ringing`` reconstructs the acquisition matrix by Fourier truncation of the fine grid
+    (Gibbs ringing at edges) instead of box averaging; ``head`` adds the non-brain head
+    (scalp, skull, neck) from the phantom's T1w outside the brain, ``head_level`` times as
+    bright as WM, with ``t2_head_ms``. A phantom without a T1w (or a synthetic object) has no
+    head."""
 
     te_s: tuple[float, float] = (4.92e-3, 7.38e-3)
     snr: float = 50.0
@@ -25,6 +41,15 @@ class Gre:
     output: Literal["phasediff", "phase"] = "phasediff"
     rx_phase_rad: float = 6.0
     b0_field: str = "b0gre"
+    tr_s: float = 0.5
+    flip_deg: float = 60.0
+    t1_ms: tuple[float, float, float] = (830.0, 1330.0, 4000.0)
+    pd: tuple[float, float, float] = (0.7, 0.85, 1.0)
+    bias: float = 0.3
+    ringing: bool = True
+    head: bool = True
+    head_level: float = 1.0
+    t2_head_ms: float = 70.0
 
     def replace(self, **kw: Any) -> "Gre":
         return dataclasses.replace(self, **kw)

@@ -52,6 +52,32 @@ pub struct GreParams {
     pub rx_phase_rad: f64,
     /// BIDS `B0FieldIdentifier` written to every sidecar; the DWI carries it as `B0FieldSource`.
     pub b0_field: String,
+    /// Repetition time (s) of the spoiled GRE. With `flip_deg` and `t1_ms` it sets the T1
+    /// steady state `sin α (1 − E1) / (1 − cos α · E1)`, `E1 = exp(−TR/T1)`, per compartment —
+    /// the WM > GM ≫ CSF contrast of a real fieldmap magnitude (Siemens `gre_field_mapping`:
+    /// TR ≈ 0.4–0.7 s, FA 60°). Without it the echoes at TE ≈ 5 ms collapse to the tissue
+    /// fraction sum (a flat head), which gives magnitude→EPI registrations nothing to lock onto.
+    pub tr_s: f64,
+    /// Flip angle (degrees).
+    pub flip_deg: f64,
+    /// Per-compartment T1 (ms) `[fiber, gm, csf]`; default adult 3 T (Wansapura 1999: WM 830,
+    /// GM 1330; CSF ~4000).
+    pub t1_ms: [f32; 3],
+    /// Per-compartment proton density `[fiber, gm, csf]` multiplying the steady state (the DWI's
+    /// `s0` is applied on top). The default 0.7/0.85/1.0 with TR 0.5 s / FA 60° gives the nearly
+    /// flat brain of a real fieldmap magnitude (GM/WM ≈ 0.9, CSF/WM ≈ 0.5); `[1, 1, 1]` is the
+    /// pure T1 weighting.
+    pub pd: [f32; 3],
+    /// Receive-coil bias: multiplicative gain `1 − bias + 2·bias·d²` with `d` the normalised
+    /// distance from the FOV centre (0 at the centre, 1 at the corners), i.e. centre `1 − bias`,
+    /// periphery `1 + bias` — the periphery-bright profile of a head array. 0 = none.
+    pub bias: f64,
+    /// Go from the fine signal grid to the acquisition matrix by Fourier truncation (keep the
+    /// central `n` of `n·o` k-space lines in-plane, sample at the voxel centres) instead of box
+    /// averaging, so edges ring the way a reconstructed GRE does. Only acts when `o > 1`.
+    pub ringing: bool,
+    /// T2 (ms) of the non-brain head given in `GreObject::head` (scalp fat/muscle; ~70 ms).
+    pub t2_head_ms: f32,
 }
 
 impl Default for GreParams {
@@ -64,8 +90,27 @@ impl Default for GreParams {
             output: GreOutput::Phasediff,
             rx_phase_rad: 6.0,
             b0_field: "b0gre".to_string(),
+            tr_s: 0.5,
+            flip_deg: 60.0,
+            t1_ms: [830.0, 1330.0, 4000.0],
+            pd: [0.7, 0.85, 1.0],
+            bias: 0.3,
+            ringing: true,
+            t2_head_ms: 70.0,
         }
     }
+}
+
+/// Spoiled-GRE steady-state factor per compartment: `sin α (1 − E1) / (1 − cos α · E1)` with
+/// `E1 = exp(−TR/T1)`. `tr_s = ∞` with `flip_deg = 90` gives 1 = pure proton density.
+pub fn steady_state(p: &GreParams) -> [f64; 3] {
+    let a = p.flip_deg.to_radians();
+    let mut out = [1.0f64; 3];
+    for (c, o) in out.iter_mut().enumerate() {
+        let e1 = (-(p.tr_s * 1000.0) / p.t1_ms[c] as f64).exp();
+        *o = a.sin() * (1.0 - e1) / (1.0 - a.cos() * e1);
+    }
+    out
 }
 
 /// The object the GRE is synthesized from, on the signal (simulation) grid.
@@ -88,6 +133,15 @@ pub struct GreObject<'a> {
     /// The DWI acquisition's nominal signal scale (`Acquisition::signal_scale`).
     pub signal_scale: f64,
     pub seed: u64,
+    /// Non-brain head (scalp, skull, neck) on `sig_grid`, in units of the fiber compartment's
+    /// brain signal (1 = as bright as WM), typically the subject's T1w outside the brain mask.
+    /// Added to both echoes with `GreParams::t2_head_ms`. `None`: brain only.
+    pub head: Option<&'a [f32]>,
+    /// When `sig_grid` is a slab of a larger volume: its first slice in the full volume and the
+    /// full slice count, so the receive bias is the full volume's (slab runs then equal whole
+    /// runs). `(0, sig_grid.dims[2])` for a whole volume.
+    pub z_offset: usize,
+    pub nz_full: usize,
 }
 
 /// A synthesized GRE fieldmap.
@@ -108,7 +162,8 @@ pub struct GreFieldmap {
 }
 
 /// Synthesize the GRE from the object. Magnitudes come from the tissue fractions with the
-/// compartment T2s (and the same GNL warp as the DWI); the phase from the (already warped) field.
+/// compartment T1 steady state (`steady_state`) and T2 decay (and the same GNL warp as the DWI);
+/// the phase from the (already warped) field.
 pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     let sig = obj.sig_grid;
     let o = (sig.dims[0] / obj.acq_grid.dims[0].max(1)).max(1);
@@ -119,16 +174,27 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     assert_eq!(obj.fmap_hz.len(), nvox_sig, "fieldmap is not on the signal grid");
     assert_eq!(obj.t2_ms.len(), 3, "three compartment T2s");
 
-    // per-echo magnitude on the fine signal grid (compartment-T2 decay + the same GNL warp)
+    // per-echo magnitude on the fine signal grid (compartment PD × T1 steady state × T2 decay,
+    // the non-brain head, the receive bias, then the same GNL warp)
+    let ss = steady_state(p);
+    let amp: Vec<f64> = (0..3).map(|c| obj.s0[c] as f64 * p.pd[c] as f64 * ss[c]).collect();
+    if let Some(h) = obj.head {
+        assert_eq!(h.len(), nvox_sig, "head is not on the signal grid");
+    }
+    let gain = bias_gain(sig.dims, p.bias, obj.z_offset, obj.nz_full.max(sig.dims[2]));
     let mut fine_mag: Vec<Vec<f32>> = Vec::new();
     for te in [te1, te2] {
         let mut m = vec![0.0f32; nvox_sig];
+        let head_decay = (-(te * 1000.0) / p.t2_head_ms as f64).exp();
         for (v, mv) in m.iter_mut().enumerate() {
             let mut acc = 0.0f64;
             for (c, frac) in obj.fractions.iter().enumerate() {
-                acc += frac[v] as f64 * obj.s0[c] as f64 * (-(te * 1000.0) / obj.t2_ms[c] as f64).exp();
+                acc += frac[v] as f64 * amp[c] * (-(te * 1000.0) / obj.t2_ms[c] as f64).exp();
             }
-            *mv = (acc * obj.signal_scale) as f32;
+            if let Some(h) = obj.head {
+                acc += h[v] as f64 * amp[0] * head_decay;
+            }
+            *mv = (acc * obj.signal_scale * gain[v]) as f32;
         }
         if let Some((field, modulate)) = obj.warp {
             m = field.warp_volume(&m, modulate);
@@ -184,7 +250,7 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
                 re[v] = (mag[v] as f64 * ph.cos()) as f32;
                 im[v] = (mag[v] as f64 * ph.sin()) as f32;
             }
-            (downsample_inplane(&re, sig.dims, o), downsample_inplane(&im, sig.dims, o))
+            (to_acq(&re, sig.dims, o, p.ringing), to_acq(&im, sig.dims, o, p.ringing))
         };
         let (r1, i1) = build(&fine_mag[0], te1);
         let (r2, i2) = build(&fine_mag[1], te2);
@@ -192,8 +258,8 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     } else {
         // Default: the DWI acquisition grid. Echo 1 carries no phase and echo 2 the whole phase
         // difference (2π·f·ΔTE) evaluated on the downsampled field.
-        let m1 = downsample_inplane(&fine_mag[0], sig.dims, o);
-        let m2 = downsample_inplane(&fine_mag[1], sig.dims, o);
+        let m1 = to_acq(&fine_mag[0], sig.dims, o, p.ringing);
+        let m2 = to_acq(&fine_mag[1], sig.dims, o, p.ringing);
         let fmap_acq = downsample_inplane(obj.fmap_hz, sig.dims, o);
         let n = m1.len();
         let (mut s2re, mut s2im) = (vec![0.0f32; n], vec![0.0f32; n]);
@@ -208,13 +274,15 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
     // uniformly wherever there is no signal. The per-voxel signal is a mean of the fine grid
     // (resolution-independent), so cross-resolution SNR realism comes from scaling σ: a larger
     // GRE voxel collects proportionally more signal, SNR ∝ V^exp ⇒ σ ∝ (V_dwi / V_gre)^exp,
-    // referenced to the DWI acquisition voxel (V_gre == V_dwi ⇒ scale 1).
+    // referenced to the DWI acquisition voxel (V_gre == V_dwi ⇒ scale 1). `snr` is the SNR of
+    // the brightest compartment (PD × steady state, unit s0), so the weighting does not change it.
+    let ss_max = (0..3).map(|c| p.pd[c] as f64 * ss[c]).fold(0.0f64, f64::max).max(f64::MIN_POSITIVE);
     let sigma = if p.snr > 0.0 {
         let det3 = |m: &[[f64; 4]; 4]| (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
             - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
             + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])).abs();
         let scale = (det3(&obj.acq_grid.voxel_to_world) / det3(&gre_grid.voxel_to_world)).powf(p.snr_vol_exp);
-        obj.signal_scale / p.snr * scale
+        obj.signal_scale * ss_max / p.snr * scale
     } else {
         0.0
     };
@@ -251,6 +319,101 @@ pub fn synthesize(obj: &GreObject, p: &GreParams) -> GreFieldmap {
         sigma,
         stamped,
     }
+}
+
+/// Receive-coil gain on a grid: `1 − bias + 2·bias·d²`, `d²` the mean over the axes (with more
+/// than one voxel) of the squared offset from the centre normalised to the half-extent. The z
+/// axis is the full volume's (`z_offset`, `nz_full`), so a slab gets the gain of its place in it.
+pub fn bias_gain(dims: [usize; 3], bias: f64, z_offset: usize, nz_full: usize) -> Vec<f64> {
+    let n = dims.iter().product::<usize>();
+    if bias == 0.0 {
+        return vec![1.0; n];
+    }
+    let full = [dims[0], dims[1], nz_full];
+    let axes: Vec<usize> = (0..3).filter(|&a| full[a] > 1).collect();
+    let mut g = vec![1.0; n];
+    for k in 0..dims[2] {
+        for j in 0..dims[1] {
+            for i in 0..dims[0] {
+                let idx = [i, j, k + z_offset];
+                let mut d2 = 0.0;
+                for &a in &axes {
+                    let c = (full[a] as f64 - 1.0) / 2.0;
+                    let u = (idx[a] as f64 - c) / c.max(0.5);
+                    d2 += u * u;
+                }
+                if !axes.is_empty() {
+                    d2 /= axes.len() as f64;
+                }
+                g[i + dims[0] * (j + dims[1] * k)] = 1.0 - bias + 2.0 * bias * d2;
+            }
+        }
+    }
+    g
+}
+
+/// Fine grid → acquisition grid in-plane: Fourier truncation (`ringing`) or box averaging.
+pub fn to_acq(v: &[f32], sim: [usize; 3], o: usize, ringing: bool) -> Vec<f32> {
+    if ringing && o > 1 { fourier_downsample_inplane(v, sim, o) } else { downsample_inplane(v, sim, o) }
+}
+
+/// One line: keep the central `n` of its `n·o` Fourier coefficients and evaluate the truncated
+/// series at the acquisition voxel centres `(m + ½)·o − ½` (the same centres box averaging
+/// uses). A constant line stays constant; an edge rings.
+fn truncate_line(x: &[f64], o: usize) -> Vec<f64> {
+    let big = x.len();
+    let n = big / o;
+    let tau = std::f64::consts::TAU;
+    // centred frequencies kept: −⌊n/2⌋ ..= ⌈n/2⌉−1
+    let fmin = -((n / 2) as i64);
+    let fmax = ((n + 1) / 2) as i64 - 1;
+    let mut coef: Vec<(f64, f64)> = Vec::with_capacity(n);
+    for f in fmin..=fmax {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (j, &xj) in x.iter().enumerate() {
+            let ang = -tau * (f as f64) * (j as f64) / big as f64;
+            re += xj * ang.cos();
+            im += xj * ang.sin();
+        }
+        coef.push((re, im));
+    }
+    (0..n)
+        .map(|m| {
+            let t = (m as f64 + 0.5) * o as f64 - 0.5;
+            let mut acc = 0.0;
+            for (idx, f) in (fmin..=fmax).enumerate() {
+                let ang = tau * (f as f64) * t / big as f64;
+                let (re, im) = coef[idx];
+                acc += re * ang.cos() - im * ang.sin();
+            }
+            acc / big as f64
+        })
+        .collect()
+}
+
+/// In-plane Fourier truncation of a fine-grid volume to the `o×` coarser acquisition matrix
+/// (separable: rows, then columns). Slices are untouched (the DWI is 2-D multislice).
+pub fn fourier_downsample_inplane(v: &[f32], sim: [usize; 3], o: usize) -> Vec<f32> {
+    let (sx, sy, sz) = (sim[0], sim[1], sim[2]);
+    let (nx, ny) = (sx / o, sy / o);
+    let mut out = vec![0.0f32; nx * ny * sz];
+    for k in 0..sz {
+        // rows: sx → nx for each of the sy fine rows
+        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(sy);
+        for j in 0..sy {
+            let row: Vec<f64> = (0..sx).map(|i| v[i + sx * (j + sy * k)] as f64).collect();
+            rows.push(truncate_line(&row, o));
+        }
+        // columns: sy → ny for each of the nx coarse columns
+        for i in 0..nx {
+            let col: Vec<f64> = (0..sy).map(|j| rows[j][i]).collect();
+            let c = truncate_line(&col, o);
+            for (jj, &val) in c.iter().enumerate() {
+                out[i + nx * (jj + ny * k)] = val as f32;
+            }
+        }
+    }
+    out
 }
 
 /// An isotropic `res`-mm grid covering `sig`'s field of view, sharing its world orientation
@@ -388,9 +551,9 @@ mod tests {
         let fmap = vec![30.0f32; n];
         let obj = GreObject {
             sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &zero, &zero], s0: [1.0; 3],
-            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0,
+            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0, head: None, z_offset: 0, nz_full: 1,
         };
-        let p = GreParams { snr: 0.0, ..Default::default() };
+        let p = GreParams { snr: 0.0, tr_s: f64::INFINITY, ..Default::default() };
         let g = synthesize(&obj, &p);
         assert_eq!(g.grid.dims, [2, 2, 1]);
         assert_eq!(g.phase.len(), 1);
@@ -408,6 +571,104 @@ mod tests {
     }
 
     #[test]
+    fn the_steady_state_gives_a_t1_weighted_magnitude() {
+        // pure WM / GM / CSF voxels in one row; defaults TR 0.5 s, FA 60°
+        let acq = grid([3, 1, 1], 1.0);
+        let sig = grid([3, 1, 1], 1.0);
+        let wm = vec![1.0f32, 0.0, 0.0];
+        let gm = vec![0.0f32, 1.0, 0.0];
+        let csf = vec![0.0f32, 0.0, 1.0];
+        let fmap = vec![0.0f32; 3];
+        let obj = GreObject {
+            sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &gm, &csf], s0: [1.0; 3],
+            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0, head: None, z_offset: 0, nz_full: 1,
+        };
+        let p = GreParams { snr: 0.0, pd: [1.0; 3], bias: 0.0, ..Default::default() };
+        let ss = steady_state(&p);
+        let a = 60f64.to_radians();
+        let e1 = (-500.0f64 / 830.0).exp();
+        assert!((ss[0] - a.sin() * (1.0 - e1) / (1.0 - a.cos() * e1)).abs() < 1e-12);
+        // WM > GM > CSF, and CSF far below WM (a real fieldmap magnitude)
+        assert!(ss[0] > ss[1] && ss[1] > ss[2] && ss[2] < 0.4 * ss[0], "{ss:?}");
+        let g = synthesize(&obj, &p);
+        let m = &g.magnitude[0];
+        let want = |c: usize| (100.0 * ss[c] * (-(p.te_s[0] * 1000.0) / [70.0, 100.0, 2000.0][c]).exp()) as f32;
+        for c in 0..3 {
+            assert!((m[c] - want(c)).abs() < 1e-3 * want(c), "compartment {c}: {} vs {}", m[c], want(c));
+        }
+        // TR = ∞ at 90° is proton density (the pre-T1 behaviour)
+        let pd = steady_state(&GreParams { tr_s: f64::INFINITY, flip_deg: 90.0, ..Default::default() });
+        assert!(pd.iter().all(|&v| (v - 1.0).abs() < 1e-12), "{pd:?}");
+    }
+
+    #[test]
+    fn proton_density_flattens_the_brain_and_the_head_adds_scalp() {
+        // defaults (PD 0.7/0.85/1.0): GM/WM near 0.9, CSF/WM near 0.5; a head voxel at 1.0 is as
+        // bright as WM at TE1 up to its own T2 decay
+        let acq = grid([4, 1, 1], 1.0);
+        let sig = grid([4, 1, 1], 1.0);
+        let wm = vec![1.0f32, 0.0, 0.0, 0.0];
+        let gm = vec![0.0f32, 1.0, 0.0, 0.0];
+        let csf = vec![0.0f32, 0.0, 1.0, 0.0];
+        let head = vec![0.0f32, 0.0, 0.0, 1.0];
+        let fmap = vec![0.0f32; 4];
+        let obj = GreObject {
+            sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &gm, &csf], s0: [1.0; 3],
+            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0, head: Some(&head), z_offset: 0, nz_full: 1,
+        };
+        let p = GreParams { snr: 0.0, bias: 0.0, ..Default::default() };
+        let g = synthesize(&obj, &p);
+        let m = &g.magnitude[0];
+        let (w, gmv, c, h) = (m[0], m[1], m[2], m[3]);
+        assert!(gmv / w > 0.85 && gmv / w < 1.0, "GM/WM {}", gmv / w);
+        assert!(c / w > 0.4 && c / w < 0.6, "CSF/WM {}", c / w);
+        let want_h = w * ((-(p.te_s[0] * 1000.0) / p.t2_head_ms as f64).exp() / (-(p.te_s[0] * 1000.0) / 70.0).exp()) as f32;
+        assert!((h - want_h).abs() < 1e-3 * w, "head {h} vs {want_h}");
+    }
+
+    #[test]
+    fn the_bias_field_is_dark_in_the_centre_and_bright_at_the_edge() {
+        let g = bias_gain([5, 5, 1], 0.3, 0, 1);
+        assert!((g[2 + 5 * 2] - 0.7).abs() < 1e-12);
+        assert!((g[0] - 1.3).abs() < 1e-12);
+        assert!((g[2] - 1.0).abs() < 1e-12, "{}", g[2]); // mid-edge: d² = ½
+        assert!(bias_gain([5, 5, 1], 0.0, 0, 1).iter().all(|&v| v == 1.0));
+        // a one-slice slab in the middle of a 9-slice volume gets the volume's central gain
+        let s = bias_gain([5, 5, 1], 0.3, 4, 9);
+        assert!((s[2 + 5 * 2] - 0.7).abs() < 1e-12, "{}", s[2 + 5 * 2]);
+        let e = bias_gain([5, 5, 1], 0.3, 0, 9);
+        assert!(e[2 + 5 * 2] > 0.7 + 0.1, "{}", e[2 + 5 * 2]);
+    }
+
+    #[test]
+    fn fourier_truncation_keeps_constants_and_rings_at_edges() {
+        let o = 2;
+        let flat = vec![3.0f32; 16 * 16];
+        let d = fourier_downsample_inplane(&flat, [16, 16, 1], o);
+        assert_eq!(d.len(), 64);
+        assert!(d.iter().all(|&v| (v - 3.0).abs() < 1e-6), "{d:?}");
+        // a vertical step (left half 0, right half 1): box averaging is monotone, the
+        // truncated series overshoots next to the edge
+        let mut step = vec![0.0f32; 32 * 8];
+        for j in 0..8 {
+            for i in 16..32 {
+                step[i + 32 * j] = 1.0;
+            }
+        }
+        let b = downsample_inplane(&step, [32, 8, 1], o);
+        let f = fourier_downsample_inplane(&step, [32, 8, 1], o);
+        let row_b: Vec<f32> = (0..16).map(|i| b[i]).collect();
+        let row_f: Vec<f32> = (0..16).map(|i| f[i]).collect();
+        assert!(row_b.iter().all(|&v| (0.0..=1.0).contains(&v)));
+        // sampled at the voxel centres (half-way between fine samples) the Gibbs oscillation is
+        // ~1 % here; it is the sign pattern next to the edge that box averaging never produces
+        assert!(row_f.iter().cloned().fold(f32::MIN, f32::max) > 1.005, "no overshoot: {row_f:?}");
+        assert!(row_f.iter().cloned().fold(f32::MAX, f32::min) < -0.005, "no undershoot: {row_f:?}");
+        // far from the edge both agree
+        assert!((row_f[0] - row_b[0]).abs() < 0.05 && (row_f[15] - row_b[15]).abs() < 0.05);
+    }
+
+    #[test]
     fn the_two_phase_route_differences_back_to_the_same_field() {
         let acq = grid([4, 4, 1], 2.0);
         let sig = grid([4, 4, 1], 2.0);
@@ -417,9 +678,9 @@ mod tests {
         let fmap: Vec<f32> = (0..n).map(|i| 5.0 * i as f32).collect();
         let obj = GreObject {
             sig_grid: &sig, acq_grid: &acq, fractions: [&wm, &zero, &zero], s0: [1.0; 3],
-            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0,
+            t2_ms: &[70.0, 100.0, 2000.0], fmap_hz: &fmap, warp: None, signal_scale: 100.0, seed: 0, head: None, z_offset: 0, nz_full: 1,
         };
-        let p = GreParams { snr: 0.0, output: GreOutput::Phase, ..Default::default() };
+        let p = GreParams { snr: 0.0, output: GreOutput::Phase, tr_s: f64::INFINITY, ..Default::default() };
         let g = synthesize(&obj, &p);
         assert_eq!(g.phase.len(), 2);
         let tau = std::f64::consts::TAU;

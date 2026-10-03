@@ -161,6 +161,7 @@ class Object:
     streamlines: Streamlines | None = None
     fibers: Fibers | None = None
     myelin: np.ndarray | None = None
+    sim_head: np.ndarray | None = None
     z_offset: int = 0
     nz_full: int | None = None
     voxel_mm: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -189,6 +190,11 @@ class Object:
             if m.size != ns:
                 raise ValueError("myelin must be on the simulation grid")
             object.__setattr__(self, "myelin", m)
+        if self.sim_head is not None:
+            h = np.ascontiguousarray(self.sim_head, dtype=np.float32).reshape(-1)
+            if h.size != ns:
+                raise ValueError("sim_head must be on the simulation grid")
+            object.__setattr__(self, "sim_head", h)
         if self.nz_full is None:
             object.__setattr__(self, "nz_full", self.dims[2])
         o = self.oversample
@@ -239,7 +245,8 @@ class Object:
             wm=cut(self.wm), gm=cut(self.gm), csf=cut(self.csf), mask=cut(self.mask),
             sim_wm=scut(self.sim_wm), sim_gm=scut(self.sim_gm), sim_csf=scut(self.sim_csf), sim_mask=scut(self.sim_mask),
             sim_fmap=scut(self.sim_fmap), fmap=None if self.fmap is None else cut(self.fmap),
-            myelin=None if self.myelin is None else scut(self.myelin), fibers=fibers, z_offset=self.z_offset + z0,
+            myelin=None if self.myelin is None else scut(self.myelin), sim_head=None if self.sim_head is None else scut(self.sim_head),
+            fibers=fibers, z_offset=self.z_offset + z0,
         )
 
     def image(self, name: str) -> nib.Nifti1Image:
