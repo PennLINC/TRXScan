@@ -142,11 +142,11 @@ fn get_str(d: &Bound<'_, PyDict>, key: &str, default: &str) -> PyResult<String> 
     }
 }
 
-/// `kspace::Acquisition` from a dict of its field names. Missing keys keep `Acquisition::default()`.
+/// `kspace::Acquisition` from a dict of its field names. Missing keys keep `kspace::default_acquisition()`.
 /// `window`: `None` | `"none"` | `"hann"` | `("tukey", alpha)` | `("fermi", radius, width)`;
 /// `pf_mode`: `"scanner"` (default) | `"contiguous"` | `"fiberfox"`.
 fn acquisition_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Acquisition> {
-    let base = Acquisition::default();
+    let base = kspace::default_acquisition();
     let window = match d.get_item("window")? {
         None => KspaceWindow::None,
         Some(v) if v.is_none() => KspaceWindow::None,
@@ -208,6 +208,8 @@ fn acquisition_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Acquisition> {
         accel: get_usize(d, "accel", base.accel)?,
         acs_lines: get_usize(d, "acs_lines", base.acs_lines)?,
         seed: get_usize(d, "seed", base.seed as usize)? as u64,
+        // mrsim-acq's fields TRXScan does not set (the echo formation: spin echo)
+        ..base
     })
 }
 
@@ -1102,10 +1104,10 @@ fn acquisition_defaults<'py>(py: Python<'py>, acquisition: &Bound<'_, PyDict>) -
     Ok(d)
 }
 
-/// `Acquisition::hbcd(ny)` field by field (the CLI protocol), for the Python `Protocol.HBCD` test.
+/// `kspace::hbcd_acquisition(ny)` field by field (the CLI protocol), for the Python `Protocol.HBCD` test.
 #[pyfunction]
 fn acquisition_hbcd<'py>(py: Python<'py>, ny: usize) -> PyResult<Bound<'py, PyDict>> {
-    let a = Acquisition::hbcd(ny);
+    let a = kspace::hbcd_acquisition(ny);
     let d = PyDict::new(py);
     d.set_item("t_line", a.t_line)?;
     d.set_item("t_echo", a.t_echo)?;

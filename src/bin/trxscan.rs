@@ -13,7 +13,7 @@ use trxscan::compartments::{
 use trxscan::gnl::{GnlField, GradCoef};
 use trxscan::gre::{self, GreObject, GreOutput, GreParams};
 use trxscan::io;
-use trxscan::kspace::{simulate_acquisition, Acquisition, PartialFourierMode, SimulationInput};
+use trxscan::kspace::{hbcd_acquisition, simulate_acquisition, Acquisition, PartialFourierMode, SimulationInput};
 use trxscan::motion;
 use trxscan::orient::Reorient;
 use trxscan::phase::PhaseModel;
@@ -601,7 +601,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_coils: cli.coils,
         accel: cli.accel,
         seed: cli.seed,
-        ..Acquisition::hbcd(grid.dims[1])
+        ..hbcd_acquisition(grid.dims[1])
     };
 
     // Dual-echo GRE fieldmap from the same object: magnitudes from the tissue mixture with the

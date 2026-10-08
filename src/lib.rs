@@ -41,12 +41,14 @@ pub mod mixture;
 pub mod microstructure;
 
 // --- acquisition stage ---
-/// Object phase model (spec 3.2).
-pub mod phase;
+/// Object phase model (spec 3.2), mrsim-acq's.
+pub use mrsim_acq::phase;
 pub use mrsim_acq::readout;
+/// mrsim-acq's k-space forward model and reconstruction, with TRXScan's diffusion entry points.
 pub mod kspace;
 /// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
-pub mod nufft;
+#[cfg(feature = "kspace")]
+pub use mrsim_acq::nufft;
 /// Scoreable benchmark outputs (spec 3.5).
 pub mod benchmark;
 pub use mrsim_acq::noise;

@@ -3,7 +3,7 @@
 //! Evaluating an unringing method needs an artifact-free target *and* a configuration in which the
 //! score means what it claims. This module provides both.
 
-use crate::kspace::{phase_slice, simulate_slice, Acquisition, SliceInput};
+use crate::kspace::{phase_slice, simulate_slice, Acquisition, SliceInput, T2Slice};
 use crate::phase::{PhaseModel, ShotPhase};
 
 /// Reduce a simulation-grid complex field onto the acquisition grid by the **complex block mean**
@@ -49,7 +49,7 @@ pub fn block_mean_complex(hires: &[(f64, f64)], snx: usize, sny: usize, o: usize
 #[allow(clippy::too_many_arguments)]
 pub fn produce_slice(
     comps: &[&[f32]],
-    t2: &[f32],
+    t2: &[T2Slice],
     fmap: &[f32],
     model: &PhaseModel,
     shot: &ShotPhase,
@@ -58,8 +58,7 @@ pub fn produce_slice(
     z: usize,
     nz: usize,
     acq: &Acquisition,
-    bvec: [f64; 3],
-    bval: f64,
+    eddy_drive: Option<[f64; 3]>,
     seed: u64,
 ) -> BenchmarkSlice {
     let [snx, sny] = sim;
@@ -85,15 +84,18 @@ pub fn produce_slice(
             &SliceInput {
                 compartments: comps,
                 t2,
+                t_inhom: None,
                 fmap,
                 phase0: Some(&phi),
                 sim,
                 acq_matrix,
                 z,
                 nz,
-                bvec,
-                bval,
+                eddy_drive,
+                prep_drive: None,
                 slice_seed: seed,
+                // (mrsim-acq's eddy replay; removed with it in the re-sync's Task 7)
+                eddy_lin: None,
             },
             &Acquisition { noise_variance: noise, ..acq.clone() },
         )
@@ -189,6 +191,8 @@ pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
         PhaseKind::Ramp => PhaseModel {
             background: BackgroundPhase {
                 coeffs: [0.0, 0.08, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                // (mrsim-acq's smooth modes, all zero; removed with them in the re-sync's Task 7)
+                ..Default::default()
             },
             ..PhaseModel::none()
         },
@@ -229,20 +233,20 @@ mod tests {
     #[test]
     fn producer_derives_nominal_from_the_same_realization() {
         use crate::kspace::step_hires;
-        use crate::phase::{DiffusionPhase, PhaseModel};
+        use crate::phase::{PhaseModel, PrepPhase};
         let (nx, ny, o) = (16usize, 16usize, 4usize);
         let (snx, sny) = (nx * o, ny * o);
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
         let model = PhaseModel { global: 0.3, ..PhaseModel::none() };
-        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+        let shot = PrepPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
             .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
         let acq = gibbs_benchmark_acquisition(&Acquisition {
-            signal_scale: 1.0, noise_variance: 1.0, ..Acquisition::default()
+            signal_scale: 1.0, noise_variance: 1.0, ..crate::kspace::default_acquisition()
         });
-        let b = produce_slice(&comps, &[100.0], &fmap, &model, &shot,
-                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 7);
+        let b = produce_slice(&comps, &[T2Slice::Uniform(100.0)], &fmap, &model, &shot,
+                              [snx, sny], [nx, ny], 0, 1, &acq, None, 7);
         assert_eq!(b.object_hires.len(), snx * sny);
         assert_eq!(b.object_nominal.len(), nx * ny);
         assert_eq!(b.acquired_clean.len(), nx * ny);
@@ -260,19 +264,19 @@ mod tests {
     #[test]
     fn clean_and_noisy_share_one_realization() {
         use crate::kspace::step_hires;
-        use crate::phase::{DiffusionPhase, PhaseModel};
+        use crate::phase::{PhaseModel, PrepPhase};
         let (nx, ny, o) = (16usize, 16usize, 4usize);
         let (snx, sny) = (nx * o, ny * o);
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let fmap = vec![0.0f32; snx * sny];
         let comps: [&[f32]; 1] = [&img];
-        let shot = DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
+        let shot = PrepPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }
             .shot(0.0, [0.0, 0.0, 0.0], 0, 0, 1);
         let acq = gibbs_benchmark_acquisition(&Acquisition {
-            signal_scale: 1.0, noise_variance: 4.0, ..Acquisition::default()
+            signal_scale: 1.0, noise_variance: 4.0, ..crate::kspace::default_acquisition()
         });
-        let b = produce_slice(&comps, &[100.0], &fmap, &PhaseModel::none(), &shot,
-                              [snx, sny], [nx, ny], 0, 1, &acq, [0.0; 3], 0.0, 11);
+        let b = produce_slice(&comps, &[T2Slice::Uniform(100.0)], &fmap, &PhaseModel::none(), &shot,
+                              [snx, sny], [nx, ny], 0, 1, &acq, None, 11);
         let d: f64 = (0..nx * ny)
             .map(|i| (b.acquired_noisy[i].0 - b.acquired_clean[i].0) as f64)
             .map(|v| v * v)
@@ -318,7 +322,7 @@ mod tests {
 
     #[test]
     fn canonical_benchmark_mode_disables_confounding_artifacts() {
-        let a = gibbs_benchmark_acquisition(&Acquisition::default());
+        let a = gibbs_benchmark_acquisition(&crate::kspace::default_acquisition());
         assert!(!a.do_distortions, "EPI distortion confounds edge location");
         assert!(!a.do_relaxation, "T2* readout decay is a k-space filter");
         assert_eq!(a.eddy_strength, 0.0);
@@ -333,7 +337,7 @@ mod tests {
     fn canonical_mode_leaves_legitimate_factors_alone() {
         // PF, noise and windows are experimental factors WITHIN the Gibbs benchmark, not
         // confounds, so the fixture must not silently reset them.
-        let base = Acquisition { partial_fourier: 0.75, noise_variance: 2.0, ..Acquisition::default() };
+        let base = Acquisition { partial_fourier: 0.75, noise_variance: 2.0, ..crate::kspace::default_acquisition() };
         let a = gibbs_benchmark_acquisition(&base);
         assert_eq!(a.partial_fourier, 0.75);
         assert_eq!(a.noise_variance, 2.0);
