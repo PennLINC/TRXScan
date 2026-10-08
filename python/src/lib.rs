@@ -33,7 +33,7 @@ use trxscan::mixture::MixtureField;
 use trxscan::motion::{self, MotionEvent, MotionMode, Pose};
 use trxscan::orient::Reorient;
 use trxscan::phase::PhaseModel;
-use trxscan::raster::Grid;
+use trxscan::raster::{Grid, GridRaster};
 use trxscan::scheme::GradientScheme;
 use trxscan::sphere::HemiSphere;
 

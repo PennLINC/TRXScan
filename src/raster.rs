@@ -14,20 +14,41 @@ use crate::mat;
 use crate::Vec3;
 
 /// The acquisition voxel grid: dimensions + voxel→world (RAS mm) affine (may be oblique).
-#[derive(Debug, Clone)]
-pub struct Grid {
-    pub dims: [usize; 3],
-    /// voxel→world 4×4, row-major.
-    pub voxel_to_world: [[f64; 4]; 4],
+/// mrsim-acq's; the rasterisation geometry is [`GridRaster`].
+pub use mrsim_acq::grid::Grid;
+
+/// One intersection of a streamline segment with a voxel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentHit {
+    pub voxel: [usize; 3],
+    /// path length of the segment inside this voxel (world mm)
+    pub length: f64,
 }
 
-impl Grid {
+/// Rasterisation geometry for [`Grid`]. `Grid` lives in mrsim-acq, so these cannot be inherent
+/// methods; the trait keeps call sites in method syntax (`use crate::raster::GridRaster`).
+pub trait GridRaster {
     /// The simulation grid: in-plane refined by `o`, same FOV, slice direction untouched.
     ///
     /// The origin shifts by half the difference between the coarse and fine voxel sizes on each
     /// refined axis, matching the half-cell registration the forward transform uses and the
     /// geometry `scripts/prepare_acquisition_grid.py` writes. Identity at `o = 1`.
-    pub fn hires(&self, o: usize) -> Grid {
+    fn hires(&self, o: usize) -> Grid;
+    /// The linear (3×3) part and origin of the voxel→world affine.
+    fn linear_and_origin(&self) -> (mat::Mat3, Vec3);
+    /// World point → continuous voxel coordinate. Returns `None` if the affine is singular.
+    fn world_to_voxel(&self, p: Vec3) -> Option<Vec3>;
+    /// Walk one segment `a → b` (world mm); return each voxel it passes through with the length of
+    /// the intersection (world mm). Voxels outside the grid are dropped.
+    fn intersect_segment(&self, a: Vec3, b: Vec3) -> Vec<SegmentHit>;
+    /// [`GridRaster::intersect_segment`] writing into caller-owned buffers (`ts` is scratch, `hits`
+    /// is cleared and filled), so a loop over millions of segments allocates nothing per segment.
+    /// Same hits, same order, same lengths.
+    fn intersect_segment_into(&self, a: Vec3, b: Vec3, ts: &mut Vec<f64>, hits: &mut Vec<SegmentHit>);
+}
+
+impl GridRaster for Grid {
+    fn hires(&self, o: usize) -> Grid {
         assert!(o > 0, "oversampling factor must be positive");
         let f = o as f64;
         let mut m = self.voxel_to_world;
@@ -43,18 +64,7 @@ impl Grid {
         }
         Grid { dims: [self.dims[0] * o, self.dims[1] * o, self.dims[2]], voxel_to_world: m }
     }
-}
 
-/// One intersection of a streamline segment with a voxel.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SegmentHit {
-    pub voxel: [usize; 3],
-    /// path length of the segment inside this voxel (world mm)
-    pub length: f64,
-}
-
-impl Grid {
-    /// The linear (3×3) part and origin of the voxel→world affine.
     fn linear_and_origin(&self) -> (mat::Mat3, Vec3) {
         let m = &self.voxel_to_world;
         (
@@ -63,26 +73,20 @@ impl Grid {
         )
     }
 
-    /// World point → continuous voxel coordinate. Returns `None` if the affine is singular.
     fn world_to_voxel(&self, p: Vec3) -> Option<Vec3> {
         let (lin, origin) = self.linear_and_origin();
         let inv = mat::inverse3(&lin)?;
         Some(mat::matvec(&inv, mat::sub(p, origin)))
     }
 
-    /// Walk one segment `a → b` (world mm); return each voxel it passes through with the length of
-    /// the intersection (world mm). Voxels outside the grid are dropped.
-    pub fn intersect_segment(&self, a: Vec3, b: Vec3) -> Vec<SegmentHit> {
+    fn intersect_segment(&self, a: Vec3, b: Vec3) -> Vec<SegmentHit> {
         let mut ts = Vec::new();
         let mut hits = Vec::new();
         self.intersect_segment_into(a, b, &mut ts, &mut hits);
         hits
     }
 
-    /// [`Grid::intersect_segment`] writing into caller-owned buffers (`ts` is scratch, `hits` is
-    /// cleared and filled), so a loop over millions of segments allocates nothing per segment.
-    /// Same hits, same order, same lengths.
-    pub fn intersect_segment_into(&self, a: Vec3, b: Vec3, ts: &mut Vec<f64>, hits: &mut Vec<SegmentHit>) {
+    fn intersect_segment_into(&self, a: Vec3, b: Vec3, ts: &mut Vec<f64>, hits: &mut Vec<SegmentHit>) {
         hits.clear();
         let (av, bv) = match (self.world_to_voxel(a), self.world_to_voxel(b)) {
             (Some(x), Some(y)) => (x, y),

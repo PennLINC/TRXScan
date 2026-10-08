@@ -26,7 +26,7 @@
 //! [`crate::scheme`].
 
 use crate::mat;
-use crate::raster::Grid;
+use crate::raster::{Grid, GridRaster};
 use crate::scheme::GradientScheme;
 use crate::signal::{Ball, FiberSignalModel, IsotropicSignalModel, Stick, Tensor};
 use std::f64::consts::PI;
