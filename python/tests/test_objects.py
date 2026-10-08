@@ -51,7 +51,10 @@ def test_kspace_npz_round_trip(box_sim, tmp_path):
 
 
 def test_oversampling_rings_and_o1_does_not(gtab6):
-    proto = ts.Protocol.DEFAULT.replace(voxel_mm=2.0, te_ms=0.0, signal_scale=1.0)
+    # The default TE: with relaxation and distortion off the timing has no effect, and a readout
+    # that starts before its excitation (TE 0) is refused (mrsim-acq's timing check; the clean b0
+    # runs with relaxation on).
+    proto = ts.Protocol.DEFAULT.replace(voxel_mm=2.0, signal_scale=1.0)
     art = ts.Artifacts(relaxation=False, distortion=False)
     o2 = ts.objects.box(8, matrix=32, oversample=2).simulate(gtab6, proto.replace(oversample=2, phase_model="none"), art, kspace=False)
     o1 = ts.objects.box(8, matrix=32, oversample=1).simulate(gtab6, proto.replace(oversample=1, phase_model="none"), art, kspace=False)
@@ -90,7 +93,8 @@ def test_crossing_truth_and_peaks(gtab6):
 def test_fill_from_voxel_and_series(gtab6):
     v = ts.Voxel(fibers=[((1, 0, 0), 0.5), ((0, 1, 0), 0.5)], wm=0.7, gm=0.2, csf=0.1)
     obj = ts.objects.fill(ts.objects.box(8, matrix=24, oversample=2), v)
-    sim = obj.simulate(gtab6, ts.Protocol.DEFAULT.replace(voxel_mm=2.0, te_ms=0.0, signal_scale=1.0), ts.Artifacts(relaxation=False, distortion=False), kspace=False)
+    # (the default TE: see test_oversampling_rings_and_o1_does_not)
+    sim = obj.simulate(gtab6, ts.Protocol.DEFAULT.replace(voxel_mm=2.0, signal_scale=1.0), ts.Artifacts(relaxation=False, distortion=False), kspace=False)
     centre = sim.series((12, 12, 0))
     ref = v.signal(gtab6).total
     # the box interior is uniform, so the centre voxel reproduces the voxel signal up to the
