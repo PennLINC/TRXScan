@@ -90,6 +90,14 @@ def test_crossing_truth_and_peaks(gtab6):
     assert n_peaks.max() == 2 and (n_peaks == 1).any()
 
 
+def test_a_readout_before_the_excitation_is_refused(gtab6):
+    # TE 0 with relaxation on: the EPI train would start before the excitation and the relaxation
+    # weight would grow, so the acquisition refuses it with a ValueError naming the problem.
+    proto = ts.Protocol.DEFAULT.replace(voxel_mm=2.0, te_ms=0.0)
+    with pytest.raises(ValueError, match="before the excitation"):
+        ts.objects.box(8, matrix=24, oversample=2).simulate(gtab6, proto, ts.Artifacts(), kspace=False)
+
+
 def test_fill_from_voxel_and_series(gtab6):
     v = ts.Voxel(fibers=[((1, 0, 0), 0.5), ((0, 1, 0), 0.5)], wm=0.7, gm=0.2, csf=0.1)
     obj = ts.objects.fill(ts.objects.box(8, matrix=24, oversample=2), v)

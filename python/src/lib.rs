@@ -942,6 +942,17 @@ fn simulate_acquisition<'py>(
     if let Some(t) = &te_per_volume {
         check_len("te_per_volume", t.len(), ngrad)?;
     }
+    // A readout that starts before its excitation is refused by the acquisition (mrsim-acq's timing
+    // check): raise it here as a ValueError, before the GIL is released, instead of a Rust panic.
+    match &te_per_volume {
+        None => kspace::validate_acquisition_timing(&acq, acq_dims[0], acq_dims[1]).map_err(verr)?,
+        Some(t) => {
+            for (g, &te) in t.iter().enumerate() {
+                kspace::validate_acquisition_timing(&Acquisition { t_echo: te, ..acq.clone() }, acq_dims[0], acq_dims[1])
+                    .map_err(|e| verr(format!("volume {g}: {e}")))?;
+            }
+        }
+    }
     if let Some(sz) = &slice_z {
         check_len("slice_z", sz.len(), acq_dims[2])?;
         let nzf = nz_full.ok_or_else(|| verr("slice_z requires nz_full"))?;

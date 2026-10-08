@@ -104,9 +104,8 @@ pub fn simulate_acquisition_complex(
     opts: &AcquisitionOptions,
 ) -> AcquisitionOutput {
     let SimulationInput { sim_dims, acq_dims, ngrad, images, t2, fmap, bvals, bvecs, phase, seed, noise_sigma } = *inp;
-    assert_eq!(bvals.len(), ngrad, "one b-value per volume");
-    assert_eq!(bvecs.len(), ngrad, "one gradient direction per volume");
-    let (eddy_drive, prep_drive) = diffusion_drives(bvals, bvecs);
+    // the first `ngrad` entries, as main read them (`bvals[g]`, `bvecs[g]`)
+    let (eddy_drive, prep_drive) = diffusion_drives(&bvals[..ngrad], &bvecs[..ngrad]);
     let t2: Vec<T2Volume> = t2.iter().map(|&v| T2Volume::Uniform(v)).collect();
     let general = AcquisitionInput {
         sim_dims, acq_dims, n_volumes: ngrad, images, t2: &t2, fmap, t_inhom: None, eddy_drive: &eddy_drive,

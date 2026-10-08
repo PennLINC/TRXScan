@@ -45,21 +45,11 @@ pub fn dropout_events(bvals: &[f64], n_shots: usize, rate: f64, seed: u64) -> Ve
     evs
 }
 
-/// The diffusion dropout law for `ngrad` volumes: a dropped shot is attenuated
-/// `1 − severity·(b/b_max)`; a volume with `b < 50` (a b0, or one missing from `bvals`) is exempt,
-/// and so is everything when `b_max <= 0`. mrsim-acq's [`DropoutLaw::Scaled`] normalises by the
-/// largest drive, so `b_max` is appended after the volumes' drives, which makes it that largest
-/// one; a `b_max` below the largest b-value has no such law and is refused.
-pub fn diffusion_dropout_law(bvals: &[f64], b_max: f64, ngrad: usize) -> DropoutLaw {
-    let mut drive: Vec<f64> = (0..ngrad).map(|g| bvals.get(g).copied().unwrap_or(0.0)).collect();
-    if b_max > 0.0 {
-        let top = drive.iter().cloned().fold(0.0f64, f64::max);
-        assert!(b_max >= top, "b_max {b_max} is below the largest b-value {top}");
-        drive.push(b_max);
-    } else {
-        drive.iter_mut().for_each(|d| *d = 0.0);
-    }
-    DropoutLaw::Scaled { drive, floor: 50.0 }
+/// The diffusion dropout law: a dropped shot is attenuated `1 − severity·(b/b_max)`; a volume with
+/// `b < 50` (a b0, or one missing from `bvals`) is exempt, and so is everything when `b_max <= 0`
+/// (mrsim-acq's [`DropoutLaw::ScaledTo`], `b_max` the caller's).
+pub fn diffusion_dropout_law(bvals: &[f64], b_max: f64) -> DropoutLaw {
+    DropoutLaw::ScaledTo { drive: bvals.to_vec(), max: b_max, floor: 50.0 }
 }
 
 /// Apply multiband within-volume motion + slice dropout to the per-compartment signal in place.
@@ -102,7 +92,7 @@ pub fn apply_multiband_motion_slab(
     slice_z: Option<&[usize]>,
     nz_full: Option<usize>,
 ) -> Vec<DroppedShot> {
-    let law = diffusion_dropout_law(bvals, b_max, ngrad);
+    let law = diffusion_dropout_law(bvals, b_max);
     mrsim_acq::motion::apply_multiband_motion_slab(images, dims, ngrad, v2w, mb, interleaved, &law, events, slice_z, nz_full)
 }
 
@@ -127,26 +117,25 @@ mod tests {
     }
 
     /// The law is main's formula, bit for bit: `1 − severity·(b/b_max)` in `f32`, b < 50 and
-    /// volumes missing from `bvals` exempt, nothing attenuated when `b_max <= 0`, including a
-    /// `b_max` above the largest b-value (the Python bindings' b0-only 1000).
+    /// volumes missing from `bvals` exempt, nothing attenuated when `b_max <= 0`, for any `b_max`
+    /// (above the largest b-value, as the Python bindings' b0-only 1000, or below it, as a nominal
+    /// b_max with jittered b-values).
     #[test]
     fn the_dropout_law_is_mains_formula() {
         let main = |bvals: &[f64], b_max: f64, g: usize, sev: f32| -> f32 {
             let is_b0 = bvals.get(g).copied().unwrap_or(0.0) < 50.0;
             if is_b0 || b_max <= 0.0 { 1.0 } else { 1.0 - sev * (bvals[g] / b_max) as f32 }
         };
-        let cases: [(&[f64], f64); 4] =
-            [(&[0.0, 1000.0, 2000.0, 30.0], 2000.0), (&[0.0, 700.0, 1300.0], 3000.0), (&[0.0, 0.0], 1000.0), (&[0.0, 1000.0], 0.0)];
+        let cases: [(&[f64], f64); 5] = [(&[0.0, 1000.0, 2000.0, 30.0], 2000.0), (&[0.0, 700.0, 1300.0], 3000.0),
+                                          (&[0.0, 0.0], 1000.0), (&[0.0, 1000.0], 0.0), (&[0.0, 1005.0, 995.0], 1000.0)];
         for (bvals, b_max) in cases {
             let ngrad = bvals.len() + 1;
-            let law = diffusion_dropout_law(bvals, b_max, ngrad);
+            let law = diffusion_dropout_law(bvals, b_max);
             for g in 0..ngrad {
                 for sev in [0.6f32, 0.83, 1.0] {
                     assert_eq!(law.attenuation(g, sev).to_bits(), main(bvals, b_max, g, sev).to_bits(), "{bvals:?} {b_max} g={g}");
                 }
             }
         }
-        let r = std::panic::catch_unwind(|| diffusion_dropout_law(&[0.0, 2000.0], 1000.0, 2));
-        assert!(r.is_err(), "b_max below the largest b-value");
     }
 }
