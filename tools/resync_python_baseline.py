@@ -82,6 +82,9 @@ def main(path):
         "te_per_volume": dict(acquisition={}, te_per_volume=[60.0, 70.0, 80.0]),
         "noise_map": dict(acquisition={}, noise_sigma=np.linspace(0.0, 1.0, NX * NY * NZ, dtype=np.float32), seed=3),
         "phase_none": dict(acquisition=dict(pf, pf_mode="contiguous"), phase_model="none"),
+        # several slices in a non-sorted order, several coils (the capture's order and layouts)
+        "capture_multi": dict(acquisition=dict(pf, n_coils=2, accel=2, acs_lines=6), kspace_slices=[3, 0, 2],
+                              capture=(True, True, True), seed=9),
     }
     for name, kw in cases.items():
         r[f"acq_{name}"] = c.simulate_acquisition(compartments(), fieldmap(), acq_dims, BVALS, BVECS, **kw)
@@ -93,6 +96,11 @@ def main(path):
         cm = compartments(nz)
         dropped = cm.apply_multiband_motion(np.eye(4), 2, True, BVALS, 2000.0, events, **kw)
         r[name] = dict(dropped=dropped, images=cm.images())
+    # a nominal b_max below jittered b-values
+    jitter = np.array([0.0, 1005.0, 995.0])
+    ev_j = c.dropout_events(jitter, 4, 1.0, c.dropout_seed(7))
+    cm = compartments()
+    r["mb_jitter"] = dict(dropped=cm.apply_multiband_motion(np.eye(4), 2, True, jitter, 1000.0, ev_j), images=cm.images())
     flat = []
     flatten("", digest(r), flat)
     with open(path, "w") as f:

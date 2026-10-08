@@ -50,6 +50,12 @@ for FEATURES in "cli" "cli,kspace,par"; do
   run_config "$FEATURES" noise    --noise 0.5 --noise-map "$FIX/mask.nii.gz"          >> "$OUTFILE"
   run_config "$FEATURES" gre      --gre-out "@OUT@_gre"                               >> "$OUTFILE"
   run_config "$FEATURES" gnl      --gnl whole-body-80                                 >> "$OUTFILE"
+  # the Gibbs benchmark binary (its own slice producer and phase models)
+  bench="$WORK/bench_$(echo "$FEATURES" | tr ',' '_')"
+  cargo run --quiet --release --features "$FEATURES" --bin trxscan-benchmark -- "$bench" matrix=32 oversample=2 slices=2 >/dev/null
+  for f in $(find "$bench" -type f | sort); do
+    printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "bench_$(echo "$FEATURES" | tr ',' '_')/${f#$bench/}"
+  done >> "$OUTFILE"
 done
 
 sort -k2 -o "$OUTFILE" "$OUTFILE"
