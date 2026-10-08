@@ -110,7 +110,7 @@ pub fn simulate_acquisition_complex(
     let t2: Vec<T2Volume> = t2.iter().map(|&v| T2Volume::Uniform(v)).collect();
     let general = AcquisitionInput {
         sim_dims, acq_dims, n_volumes: ngrad, images, t2: &t2, fmap, t_inhom: None, eddy_drive: &eddy_drive,
-        prep_drive: &prep_drive, phase, seed, noise_sigma, eddy_trace: None,
+        prep_drive: &prep_drive, phase, seed, noise_sigma,
     };
     mrsim_acq::kspace::simulate_acquisition_complex(&general, acq, opts)
 }

@@ -94,8 +94,6 @@ pub fn produce_slice(
                 eddy_drive,
                 prep_drive: None,
                 slice_seed: seed,
-                // (mrsim-acq's eddy replay; removed with it in the re-sync's Task 7)
-                eddy_lin: None,
             },
             &Acquisition { noise_variance: noise, ..acq.clone() },
         )
@@ -191,8 +189,6 @@ pub fn phase_model_for(kind: PhaseKind) -> PhaseModel {
         PhaseKind::Ramp => PhaseModel {
             background: BackgroundPhase {
                 coeffs: [0.0, 0.08, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                // (mrsim-acq's smooth modes, all zero; removed with them in the re-sync's Task 7)
-                ..Default::default()
             },
             ..PhaseModel::none()
         },
