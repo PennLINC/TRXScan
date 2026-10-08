@@ -361,7 +361,7 @@ class Protocol:
             return self.readout_ms / max(ny, 1)
         if self.echo_spacing_ms is not None:
             return self.echo_spacing_ms
-        return 1.0  # kspace::Acquisition::default().t_line
+        return 1.0  # kspace::default_acquisition().t_line
 
     def acquisition(self, ny: int) -> dict[str, Any]:
         """The ``kspace::Acquisition`` fields this protocol fixes (artifact knobs come from
@@ -533,7 +533,7 @@ class Protocol:
 
 
 Protocol.DEFAULT = Protocol(name="default")
-# The CLI's shipping protocol (`Acquisition::hbcd`): TE 88 ms, PE train pinned to HBCD's
+# The CLI's shipping protocol (`kspace::hbcd_acquisition`): TE 88 ms, PE train pinned to HBCD's
 # TotalReadoutTime 91.7 ms, 6/8 scanner-style partial Fourier, 24 ACS lines, 1.7 mm. The CLI also
 # adds a subtle Nyquist ghost (0.015), which is an artifact here: `Artifacts(ghost=0.015)`.
 # `readout_ms` is pinned, so `HBCD.replace(voxel_mm=3.0)` keeps the 91.7 ms train and shortens

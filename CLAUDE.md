@@ -90,8 +90,9 @@ per-segment path and the histogram-first `generate_mixture`/`signal_from_mixture
 `sphere` (icosphere hemisphere), `mixture` (the per-voxel orientation-histogram type),
 `microstructure` (FORCE closed-form ground-truth scalars, dipy-fixture-validated), `truth`
 (ground-truth fibre peaks per acquisition voxel), `readout`, `phase` (object phase model),
-`kspace` (all of the acquisition stage; `Acquisition::hbcd` is the shipping protocol,
-`SimulationInput` + `simulate_acquisition` the entry point), `nufft` (its gridded y-transform,
+`kspace` (all of the acquisition stage; `kspace::hbcd_acquisition` is the shipping protocol,
+`kspace::default_acquisition` the default, `SimulationInput` + `simulate_acquisition` the entry
+point), `nufft` (its gridded y-transform,
 feature `kspace`), `gnl` (gradient nonlinearity: coefficients, field, warp, graddev), `gre`
 (synthetic dual-echo GRE fieldmap), `motion`, `orient` (FSL/LAS reorientation + FSL bvecs), `mat`
 (std-only 3×3 helpers), `analytic` (Fourier test oracles), `benchmark` (Gibbs factor grid),
@@ -239,7 +240,7 @@ dispersion from CONSH.
 ## Not implemented (don't assume from the module list)
 
 `noise.rs` and `config.rs` are `todo!()` stubs — k-space noise lives inline in `kspace.rs`, so
-`noise.rs` is dead code, and there is no TOML config (the protocol is `Acquisition::hbcd` in the
+`noise.rs` is dead code, and there is no TOML config (the protocol is `kspace::hbcd_acquisition` in the
 library, overridden field-by-field from the flags in `src/bin/trxscan.rs`). ODX ground-truth
 export, GNL together with `--motion`, and any numerical comparison against Fiberfox are unwritten. Per-fixel
 κ from CONSH fixels (vs the current global κ) and the disp(κ) LUT are future work

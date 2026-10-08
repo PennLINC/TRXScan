@@ -23,7 +23,7 @@ def test_hbcd_preset_matches_the_cli_acquisition():
         got = _core.acquisition_defaults(ts.Protocol.HBCD.acquisition(ny))
         for k in ("t_line", "t_echo", "t_inhom", "partial_fourier", "pf_mode", "acs_lines", "signal_scale"):
             assert got[k] == pytest.approx(want[k]), k
-    # DEFAULT + Artifacts() is exactly Acquisition::default()
+    # DEFAULT + Artifacts() is exactly kspace::default_acquisition()
     d = _core.acquisition_defaults({**ts.Protocol.DEFAULT.acquisition(64), **ts.Artifacts().acquisition()})
     assert d == _core.acquisition_defaults({})
 

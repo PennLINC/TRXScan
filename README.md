@@ -68,7 +68,7 @@ above. The ported parts keep references into the MITK source so the two can be c
   speed (static factors hoisted, the affine-in-ky phase advanced by memoised rotors), and the
   `kspace` feature runs it through `rustfft` plus a type-1 NUFFT for the fieldmap term, which
   gives the same numbers about five times faster. The literal sum is kept as a test oracle.
-- **The CLI protocol is HBCD-like and set in code.** `Acquisition::hbcd` (TE 88 ms, 6/8 partial
+- **The CLI protocol is HBCD-like and set in code.** `kspace::hbcd_acquisition` (TE 88 ms, 6/8 partial
   Fourier, 24 ACS lines, a small Nyquist ghost) is the library default and the flags override
   its artifact settings. There is no config file (the `config` feature is a stub). The Python
   package exposes the protocol as a `Protocol` object instead.
@@ -232,8 +232,8 @@ omit them for dipy's normalized-units default (voxel-to-voxel contrast only).
 
 The binaries are thin: the simulation is `kspace::simulate_acquisition(&SimulationInput, &Acquisition)`
 on the compartments from `compartments::generate_mixture` → `signal_from_mixture_gnl`, the GRE
-is `gre::synthesize(&GreObject, &GreParams)`, and `Acquisition::hbcd(ny)` is the CLI protocol.
-This is the surface the Python package wraps.
+is `gre::synthesize(&GreObject, &GreParams)`, and `kspace::hbcd_acquisition(ny)` is the CLI protocol
+(`kspace::default_acquisition()` the default). This is the surface the Python package wraps.
 
 ## Conventions
 
