@@ -72,6 +72,10 @@ above. The ported parts keep references into the MITK source so the two can be c
   Fourier, 24 ACS lines, a small Nyquist ghost) is the library default and the flags override
   its artifact settings. There is no config file (the `config` feature is a stub). The Python
   package exposes the protocol as a `Protocol` object instead.
+- **A readout that starts before its excitation is refused.** With relaxation on, the first
+  acquired line must come after the excitation (`t_echo` greater than the time from the first
+  acquired line to the k-space centre); otherwise the relaxation weight would grow instead of
+  decay. Scanner-style partial Fourier shortens that time; the Python API raises `ValueError`.
 - **Motion mode uses the per-segment signal stage.** With a `--motion` trace, SIFT2 weights
   and the Watson kernel are ignored, and `--myelin`, `--truth-peaks` and `--gnl` are refused.
   The no-motion path and `trxscan-microstructure` share the orientation-histogram path.
@@ -132,8 +136,15 @@ cargo build --release --features cli,par,kspace
 stage, volumes in the acquisition stage); `kspace` is the FFT/NUFFT k-space path. The first
 build with `cli`/`io` compiles the I/O stack from source (`trx-rs` → `itk-transforms-rs` →
 `hdf5-metno-src`, which builds HDF5), so it needs network access and `cmake` and takes a while.
-`trx-rs` and `odx-rs` are git-pinned in [`Cargo.toml`](Cargo.toml); no sibling checkout is
-needed. The crate is a cargo workspace whose second member, [`python/`](python/), is the pyo3
+`trx-rs`, `odx-rs` and `mrsim-acq` are git-pinned in [`Cargo.toml`](Cargo.toml); no sibling
+checkout is needed. To work on mrsim-acq alongside TRXScan, point Cargo at a local checkout in
+`.cargo/config.toml`:
+
+```toml
+[patch."https://github.com/PennLINC/mrsim-acq"]
+mrsim-acq = { path = "../mrsim-acq" }
+```
+ The crate is a cargo workspace whose second member, [`python/`](python/), is the pyo3
 extension behind the `trxscan` PyPI package. It depends on the std-only core with `kspace,par`,
 so the wheel has no C dependencies.
 
@@ -254,6 +265,7 @@ is `gre::synthesize(&GreObject, &GreParams)`, and `kspace::hbcd_acquisition(ny)`
 |---|---|
 | [`trx-rs`](https://github.com/tee-ar-ex/trx-rs) (git-pinned) | load TRX/TRK/TCK/VTK streamlines and per-streamline SIFT2 weights from TRX `dps` |
 | [`odx-rs`](https://github.com/PennLINC/odx-rs) (git-pinned) | *planned:* SH/sphere math and ground-truth ODX export (behind the `odx` feature; not wired up yet) |
+| [`mrsim-acq`](https://github.com/PennLINC/mrsim-acq) (git-pinned) | the acquisition stage, shared with [aslscan](https://github.com/PennLINC/aslscan): the k-space forward model and reconstruction, object phase, motion and multiband schedules, EPI readout timing, NIfTI volume I/O |
 | [`nifti`](https://crates.io/crates/nifti) 0.17 | 3D/4D NIfTI read and write, affine |
 
 ## Origins

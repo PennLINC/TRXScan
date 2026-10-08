@@ -84,6 +84,16 @@ Acquire  per-slice k-space: distortion · T2* · eddy · ghost · PF · ringing 
 Motion   cuts across both: poses per volume, or per multiband slice-group
 ```
 
+**The acquisition stage lives in [mrsim-acq](https://github.com/PennLINC/mrsim-acq)**, shared with
+aslscan: `mat`, `orient`, `analytic`, `readout`, `phase`, `nufft`, `noise` and `config` are its
+modules re-exported; `kspace` and `motion` re-export its modules and add TRXScan's diffusion-shaped
+surface (`SimulationInput` by bvals/bvecs, `default_acquisition` and `hbcd_acquisition` — never
+`Acquisition::default()`, which is mrsim-acq's Fiberfox-partial-Fourier default — and the dropout
+by b-value); `raster::Grid` is mrsim-acq's, its geometry the `GridRaster` trait; `io` re-exports
+its NIfTI volume I/O. Changes to the forward model go to mrsim-acq, gated there (its tests, aslscan's
+regress, and this repo's `tools/run_resync_baseline.sh` / `tools/resync_python_baseline.py`
+against `tests/fixtures/resync_baseline`).
+
 Module map (`src/`): `scheme` (bval/bvec, shells), `raster` (segment→voxel path lengths),
 `signal` (compartment responses), `compartments` (signal-stage assembly — both the original
 per-segment path and the histogram-first `generate_mixture`/`signal_from_mixture` path),
@@ -165,8 +175,10 @@ implies `io`; it also puts `clap::ValueEnum` on `gre::GreOutput`). `odx` is decl
 `Cargo.toml` for work that isn't written yet. The **`kspace` module is always compiled and needs
 no feature**; the `kspace` feature only swaps the x-stage and reconstruction to `rustfft` and the
 fieldmap y-sum to the NUFFT (identical numbers, ~5× faster than the default build). `par` (rayon) parallelizes over streamline groups
-in the signal stage and over volumes in the acquisition stage. `trx-rs` and `odx-rs` are git-pinned
-in `Cargo.toml` (no sibling checkout). The crate is a workspace; `python/` is the pyo3 extension
+in the signal stage and over volumes in the acquisition stage. `trx-rs`, `odx-rs` and `mrsim-acq`
+are git-pinned in `Cargo.toml` (no sibling checkout; for local mrsim-acq work, a `[patch]` in
+`.cargo/config.toml`, see the README). TRXScan's `kspace`, `io` and `par` features forward to
+mrsim-acq's. The crate is a workspace; `python/` is the pyo3 extension
 (`trxscan._core`, std-only core + `kspace,par`, built with maturin) behind the `trxscan` PyPI package.
 
 ## Python bindings (`python/`)
