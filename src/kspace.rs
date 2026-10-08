@@ -294,7 +294,7 @@ fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         if kx == xs {
             t[ky] = epi.time_from_max_echo(tick);
             trf[ky] = epi.time_from_rf(tick);
-            tread[ky] = epi.time_from_last_diffusion_gradient(tick);
+            tread[ky] = epi.time_from_prep_gradient(tick);
         }
     }
     (t, trf, tread)
