@@ -26,17 +26,17 @@ publish = false
 [features]
 default = []
 # I/O: TRX streamlines + NIfTI tissue maps + 4D DWI writer
-io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra"]
+io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra", "mrsim-acq/io"]
 # k-space FFT backend (rustfft); the default k-space path is std-only and needs no feature
-kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr"]
+kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr", "mrsim-acq/kspace"]
 # config parsing (replaces the .ffp XML)
-config = ["dep:serde", "dep:toml"]
+config = ["dep:serde", "dep:toml", "mrsim-acq/config"]
 # ground-truth ODF/peak export + optional SH `todf` fast-mode (pulls odx-rs → hdf5)
 odx = ["dep:odx-rs", "io"]
 # command-line front end (clap); implies `io` since the binaries read/write NIfTI + TRX
 cli = ["dep:clap", "io"]
 # parallelism
-par = ["dep:rayon"]
+par = ["dep:rayon", "mrsim-acq/par"]
 
 [[bin]]
 name = "trxscan"
@@ -58,6 +58,11 @@ required-features = ["cli"]
 # trx-rs: the commit the `io` module was written against (8 commits past the v0.1.0 tag).
 trx-rs = { git = "https://github.com/tee-ar-ex/trx-rs", rev = "13cfacd397fa1db2d272fa00dfa11f3e3e5e1b40", optional = true }
 odx-rs = { git = "https://github.com/PennLINC/odx-rs", tag = "v0.1.3", optional = true }
+# mrsim-acq: the acquisition stage (k-space forward model, object phase, motion, readout, NIfTI
+# volume I/O), shared with aslscan. To build against a local checkout, add to .cargo/config.toml:
+#   [patch."https://github.com/PennLINC/mrsim-acq"]
+#   mrsim-acq = { path = "../mrsim-acq" }
+mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "trxscan-resync" }
 # --- I/O + math (versions matched to the sibling crates) ---
 nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
 ndarray = { version = "0.16", optional = true }

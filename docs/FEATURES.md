@@ -15,7 +15,7 @@ places:**
 - *GRAPPA* (§2) is as designed except the coil combination: it is a Roemer combine with the
   known sensitivities, not RSS (`kspace.rs`, `simulate_slice`).
 - The *TOML config surface* was never written: `config.rs` is a `todo!()` stub and the protocol is
-  `Acquisition::hbcd` in the library plus `clap` flags in `src/bin/trxscan.rs`.
+  `kspace::hbcd_acquisition` in the library plus `clap` flags in `src/bin/trxscan.rs`.
 
 ## 1. Within-volume motion under multiband
 

@@ -3,7 +3,8 @@
 //! - **Streamlines**: `trx-rs` `read_tractogram` (TRX/TRK/TCK/VTK) → positions + CSR offsets.
 //! - **Tissue maps**: `nifti` 0.17 → f32 volume + voxel→world affine (sform, else qform quaternion,
 //!   mirroring `TRXViz/trxviz-core/src/data/nifti_data.rs`).
-//! - **4D DWI out**: NIfTI-1 with the acquisition affine + FSL `.bval`/`.bvec`.
+//! - **4D DWI out**: NIfTI-1 with the acquisition affine (`mrsim_acq::io::write_complex_4d`)
+//!   + FSL `.bval`/`.bvec`.
 //!
 //! Streamlines and tissue maps must share the same **world (RAS mm)** frame (they do when the TRK
 //! is world-space and the NIfTI affine is scanner/RAS — the qsiprep-testdata pipeline's convention).
@@ -12,12 +13,12 @@ use crate::compartments::{CleanDwi, TissueFractions};
 use crate::raster::Grid;
 use crate::scheme::GradientScheme;
 
-use nalgebra::Matrix4;
-use ndarray::{Array4, Ix3};
-use nifti::writer::WriterOptions;
-use nifti::{IntoNdArray, NiftiHeader, NiftiObject, ReaderOptions, XForm};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+
+// NIfTI volume read and array write live in mrsim-acq (the acquisition stage shared with aslscan);
+// re-exported so `io::` paths inside and outside this crate keep resolving.
+pub use mrsim_acq::io::{hires_grid, load_volume, write_3d, write_3d_i16, write_4d};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -160,69 +161,6 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// voxel→world affine from a NIfTI header: sform if active, else qform quaternion.
-fn affine_from_header(h: &NiftiHeader) -> [[f64; 4]; 4] {
-    if h.sform_code > 0 {
-        let (sx, sy, sz) = (h.srow_x, h.srow_y, h.srow_z);
-        [
-            [sx[0] as f64, sx[1] as f64, sx[2] as f64, sx[3] as f64],
-            [sy[0] as f64, sy[1] as f64, sy[2] as f64, sy[3] as f64],
-            [sz[0] as f64, sz[1] as f64, sz[2] as f64, sz[3] as f64],
-            [0.0, 0.0, 0.0, 1.0],
-        ]
-    } else {
-        let qfac = if h.pixdim[0] < 0.0 { -1.0 } else { 1.0 };
-        quatern_to_mat44(
-            h.quatern_b as f64, h.quatern_c as f64, h.quatern_d as f64,
-            h.quatern_x as f64, h.quatern_y as f64, h.quatern_z as f64,
-            h.pixdim[1] as f64, h.pixdim[2] as f64, h.pixdim[3] as f64, qfac,
-        )
-    }
-}
-
-/// NIfTI-1 `quatern_to_mat44` (voxel→world from the qform quaternion + pixdims).
-fn quatern_to_mat44(
-    b: f64, c: f64, d: f64, qx: f64, qy: f64, qz: f64, dx: f64, dy: f64, dz: f64, qfac: f64,
-) -> [[f64; 4]; 4] {
-    let mut a = 1.0 - (b * b + c * c + d * d);
-    let (mut b, mut c, mut d) = (b, c, d);
-    if a < 1e-7 {
-        let n = (b * b + c * c + d * d).sqrt();
-        b /= n;
-        c /= n;
-        d /= n;
-        a = 0.0;
-    } else {
-        a = a.sqrt();
-    }
-    let dz = dz * qfac;
-    [
-        [(a * a + b * b - c * c - d * d) * dx, 2.0 * (b * c - a * d) * dy, 2.0 * (b * d + a * c) * dz, qx],
-        [2.0 * (b * c + a * d) * dx, (a * a + c * c - b * b - d * d) * dy, 2.0 * (c * d - a * b) * dz, qy],
-        [2.0 * (b * d - a * c) * dx, 2.0 * (c * d + a * b) * dy, (a * a + d * d - c * c - b * b) * dz, qz],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-/// Read a 3D NIfTI scalar volume as a flat `x + nx*(y + ny*z)` f32 buffer + its grid.
-pub fn load_volume(path: &Path) -> R<(Vec<f32>, Grid)> {
-    let obj = ReaderOptions::new().read_file(path)?;
-    let header = obj.header().clone();
-    let dims = [header.dim[1] as usize, header.dim[2] as usize, header.dim[3] as usize];
-    let aff = affine_from_header(&header);
-    let arr = obj.into_volume().into_ndarray::<f32>()?.into_dimensionality::<Ix3>()?;
-    let [nx, ny, nz] = dims;
-    let mut flat = vec![0.0f32; nx * ny * nz];
-    for z in 0..nz {
-        for y in 0..ny {
-            for x in 0..nx {
-                flat[x + nx * (y + ny * z)] = arr[[x, y, z]];
-            }
-        }
-    }
-    Ok((flat, Grid { dims, voxel_to_world: aff }))
-}
-
 /// Load WM/GM/CSF fraction maps + a brain mask onto a shared grid (dims/affine must match).
 pub fn load_tissue(wm: &Path, gm: &Path, csf: &Path, mask: &Path) -> R<(TissueFractions, Grid)> {
     let (wm, grid) = load_volume(wm)?;
@@ -237,29 +175,6 @@ pub fn load_tissue(wm: &Path, gm: &Path, csf: &Path, mask: &Path) -> R<(TissueFr
     let mask = maskf.iter().map(|&m| (m > 0.5) as u8).collect();
     let dims = grid.dims;
     Ok((TissueFractions { dims, wm, gm, csf, mask }, grid))
-}
-
-fn header_for_grid(v: [[f64; 4]; 4]) -> NiftiHeader {
-    let mut h = NiftiHeader::default();
-    let col_norm = |c: usize| (v[0][c].powi(2) + v[1][c].powi(2) + v[2][c].powi(2)).sqrt() as f32;
-    h.pixdim = [1.0, col_norm(0), col_norm(1), col_norm(2), 0.0, 0.0, 0.0, 0.0];
-    h.xyzt_units = 2; // mm
-    let m = Matrix4::<f64>::new(
-        v[0][0], v[0][1], v[0][2], v[0][3],
-        v[1][0], v[1][1], v[1][2], v[1][3],
-        v[2][0], v[2][1], v[2][2], v[2][3],
-        v[3][0], v[3][1], v[3][2], v[3][3],
-    );
-    h.set_qform(&m, XForm::ScannerAnat);
-    h.set_sform(&m, XForm::ScannerAnat);
-    h
-}
-
-/// Write a 4D `[x,y,z,g]` (layout `(x+nx*(y+ny*z))*ngrad+g`) as NIfTI-1 with the given affine.
-/// The simulation grid's [`Grid`] for oversampling `o`: see [`Grid::hires`] (kept here so the
-/// benchmark writer and the io tests keep their call site).
-pub fn hires_grid(g: &Grid, o: usize) -> Grid {
-    g.hires(o)
 }
 
 /// Write the four benchmark images as BIDS-style magnitude/phase pairs.
@@ -331,36 +246,6 @@ pub fn write_benchmark(
     write_pair("objectnominal", gather_f64(&|s| &s.object_nominal, nx, ny), dims, grid)?;
     write_pair("acquiredclean", gather_f32(&|s| &s.acquired_clean), dims, grid)?;
     write_pair("acquirednoisy", gather_f32(&|s| &s.acquired_noisy), dims, grid)?;
-    Ok(())
-}
-
-pub fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
-    let [nx, ny, nz] = dims;
-    let arr = Array4::from_shape_fn((nx, ny, nz, ngrad), |(x, y, z, g)| {
-        data[(x + nx * (y + ny * z)) * ngrad + g]
-    });
-    let hdr = header_for_grid(grid.voxel_to_world);
-    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
-    Ok(())
-}
-
-/// Write one 3D scalar volume (layout `x + nx*(y + ny*z)`) as NIfTI-1 with the given affine.
-pub fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<()> {
-    let [nx, ny, nz] = dims;
-    let arr =
-        ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
-    let hdr = header_for_grid(grid.voxel_to_world);
-    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
-    Ok(())
-}
-
-/// Write one 3D volume as int16 (Siemens-style phase images are stored as integers 0..4095).
-pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) -> R<()> {
-    let [nx, ny, nz] = dims;
-    let arr =
-        ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
-    let hdr = header_for_grid(grid.voxel_to_world);
-    WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
     Ok(())
 }
 
@@ -476,31 +361,20 @@ pub fn write_complex_dwi(
     scheme: &GradientScheme,
     info: &SidecarInfo,
 ) -> R<()> {
-    let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
-    write_4d(&p("_part-mag_dwi.nii.gz"), dims, ngrad, mag, grid)?;
-    write_4d(&p("_part-phase_dwi.nii.gz"), dims, ngrad, phase, grid)?;
-    write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)?;
-    // PED is resolved by the caller for the written frame (native grid, or reoriented to LAS with
-    // --fsl-orientation). EffectiveEchoSpacing is per the PE axis the code names, not a fixed axis.
-    let ped = info.phase_encoding_direction.as_str();
-    let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
-    let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
-    let b0src = match &info.b0_field_source {
-        Some(id) => format!(",\n  \"B0FieldSource\": \"{id}\""),
-        None => String::new(),
+    let shared = mrsim_acq::io::SidecarInfo {
+        manufacturer: "TRXScan".to_string(),
+        phase_encoding_direction: info.phase_encoding_direction.clone(),
+        total_readout_time: info.total_readout_time,
+        echo_time: info.echo_time,
+        partial_fourier: info.partial_fourier,
+        accel: info.accel,
+        mb: info.mb,
+        repetition_time_s: None,
+        b0_field_source: info.b0_field_source.clone(),
     };
-    let common = format!(
-        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
-         \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
-         \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
-         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
-        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
-    );
-    std::fs::write(p("_part-mag_dwi.json"),
-        format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
-    std::fs::write(p("_part-phase_dwi.json"),
-        format!("{{\n{common},\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}}\n"))?;
-    Ok(())
+    mrsim_acq::io::write_complex_4d(out_prefix, "dwi", dims, ngrad, mag, phase, grid, &shared)?;
+    let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
+    write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)
 }
 
 /// Keep `n` streamlines sampled proportionally to weight; see

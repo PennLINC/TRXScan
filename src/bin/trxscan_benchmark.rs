@@ -10,7 +10,8 @@ use trxscan::benchmark::{
     factor_grid, gibbs_benchmark_acquisition, phase_model_for, produce_slice, PhaseKind,
 };
 use trxscan::io;
-use trxscan::kspace::{box_hires, Acquisition, PartialFourierMode};
+use trxscan::kspace::{box_hires, default_acquisition, Acquisition, PartialFourierMode, T2Slice};
+use trxscan::phase::ShotPhase;
 use trxscan::raster::Grid;
 
 const USAGE: &str = "usage: trxscan-benchmark <out_dir> \
@@ -108,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Per-component image-space variance at full sampling; ~30 dB against a unit step.
             // One nonzero level for every fixture; produce_slice emits the clean/noisy pair.
             noise_variance: 1.0e-3,
-            ..Acquisition::default()
+            ..default_acquisition()
         });
         let model = phase_model_for(p.phase);
         // b and direction only matter for the Diffusion condition; fixed elsewhere for determinism.
@@ -121,10 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let comps: [&[f32]; 1] = [&img];
         let slices: Vec<_> = (0..nz)
             .map(|z| {
-                let shot = model.diffusion.shot(bval, bvec, 0, z, 0xB0A7);
+                let shot = model.prep.map_or(
+                    ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
+                    |p| p.shot(bval, bvec, 0, z, 0xB0A7));
                 produce_slice(
-                    &comps, &[100.0], &fmap, &model, &shot,
-                    [snx, sny], [n, n], z, nz, &acq, bvec, bval,
+                    &comps, &[T2Slice::Uniform(100.0)], &fmap, &model, &shot,
+                    [snx, sny], [n, n], z, nz, &acq,
+                    if bval.abs() > 1e-9 { Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]) } else { None },
                     (z as u64).wrapping_mul(0x9E37) ^ 0x51E,
                 )
             })
