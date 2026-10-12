@@ -241,6 +241,34 @@ def _flat_or_none(img: Any, dims: tuple[int, int, int], what: str) -> np.ndarray
     return v
 
 
+#: The non-brain head's fluid (eyes, extra-axial CSF) and tissue (muscle, skin): ADC (mm²/s), and the
+#: tissue's proton density relative to the brain's tissue S0. The fluid takes the CSF's S0 and T2.
+HEAD_FLUID_ADC_MM2_S = 3.0e-3
+HEAD_TISSUE_ADC_MM2_S = 1.0e-3
+HEAD_TISSUE_PD = 0.7
+
+
+def _head_compartments(sub: "Object", protocol: Protocol, t2_ms: Sequence[float]) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    """The DWI's non-brain head on ``sub``'s simulation grid (``Protocol.head``) as two isotropic
+    compartments, fluid then tissue: ``(amplitude, adc, t2_ms)`` each, amplitudes before T2 decay.
+
+    On a b=0 at a DWI echo time the head's fluid (eyes, extra-axial CSF) is as bright as CSF and
+    its muscle and skin (T2 ``protocol.head_t2_ms``) nearly dark. The fluid fraction is the
+    object's ``sim_fluid`` (bright on the T2w, dark on the T1w; see ``_grid``). Fat is held at
+    ``protocol.head_fat`` of its signal by the fat saturation."""
+    if sub.sim_t2w is None or sub.sim_fluid is None:
+        raise ValueError("Protocol.head needs an object gridded with the head (Phantom.grid with Protocol.head)")
+    fluid = sub.sim_fluid
+    outside = np.where(sub.sim_t2w > 0, 1.0 - np.clip(sub.sim_wm + sub.sim_gm + sub.sim_csf, 0.0, 1.0), 0.0)
+    if sub.sim_fat is not None:
+        outside = outside * (1.0 - sub.sim_fat * (1.0 - float(protocol.head_fat)))
+    f32 = lambda a: np.ascontiguousarray(a, dtype=np.float32)  # noqa: E731
+    return [
+        (f32(outside * fluid * float(protocol.tissue_s0[2])), f32(np.full(fluid.shape, HEAD_FLUID_ADC_MM2_S)), float(t2_ms[2])),
+        (f32(outside * (1.0 - fluid) * HEAD_TISSUE_PD), f32(np.full(fluid.shape, HEAD_TISSUE_ADC_MM2_S)), float(protocol.head_t2_ms)),
+    ]
+
+
 def _voxel_to_world(affine: np.ndarray, ijk: np.ndarray) -> np.ndarray:
     return ijk @ affine[:3, :3].T + affine[:3, 3]
 
@@ -346,6 +374,8 @@ def run(
     mixture = None
     peaks_flat = None
     if artifacts.motion is not None:
+        if protocol.head:
+            raise ValueError("Protocol.head is not available together with motion (the head would not move with the brain)")
         if truth_peaks:
             raise ValueError("truth_peaks is not available together with motion (no orientation mixture)")
         if sub.myelin is not None:
@@ -378,6 +408,11 @@ def run(
             peaks_flat = mixture.truth_peaks(o, 3)
         comp = _core.signal_from_mixture(mixture, bvals, bvecs, gnl_field if artifacts.gnl_encoding else None)
     comp.apply_s0(tuple(float(v) for v in protocol.tissue_s0))
+    head = _head_compartments(sub, protocol, list(comp.t2)) if protocol.head else []
+    for amplitude, adc, t2 in head:
+        comp.add_isotropic(amplitude, adc, np.ascontiguousarray(bvals, dtype=np.float64), t2)
+    if artifacts.receive_bias:
+        comp.apply_receive_bias(float(artifacts.receive_bias), int(sub.z_offset), nz_full)
     timing["signal"] = time.perf_counter() - t
     say("signal", 1, 1)
 
@@ -401,7 +436,7 @@ def run(
     gre_result = None
     if gre is not None:
         t = time.perf_counter()
-        gre_result = _synthesize_gre(sub, local, z0, z1, sim_affine, acq_affine, fmap_sim, list(comp.t2), protocol, artifacts, gre,
+        gre_result = _synthesize_gre(sub, local, z0, z1, sim_affine, acq_affine, fmap_sim, list(comp.t2)[:3], protocol, artifacts, gre,
                                      gnl_field if (gnl_field is not None and artifacts.gnl_warp) else None, seed)
         timing["gre"] = time.perf_counter() - t
 
@@ -454,6 +489,8 @@ def run(
         if mixture is not None:
             comp_c = _core.signal_from_mixture(mixture, b0_bvals, b0_bvecs, None)
             comp_c.apply_s0(tuple(float(v) for v in protocol.tissue_s0))
+            for amplitude, adc, t2 in head:
+                comp_c.add_isotropic(amplitude, adc, b0_bvals, t2)
             comp_c = comp_c if local == all_local else comp_c.select_slices(local)
             acq_c = {**protocol.acquisition(ny), **Artifacts().acquisition(), "reverse_phase": acq["reverse_phase"], "do_distortions": False}
             try:

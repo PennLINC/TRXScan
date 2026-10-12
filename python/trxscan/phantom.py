@@ -139,7 +139,9 @@ class Object:
     """A gridded object: compartment fractions on the acquisition grid and on the ``oversample``
     times finer simulation grid, the fieldmap (Hz), and its fibre content as streamlines or an
     explicit fibre list. Built by :meth:`Phantom.grid` or the synthetic constructors in
-    :mod:`trxscan.objects`. Arrays are flat float32 in TRXScan's F-order (see
+    :mod:`trxscan.objects`. ``sim_head`` is the GRE's non-brain head (T1w); ``sim_t2w``,
+    ``sim_fluid`` and ``sim_fat`` (the T2w over the head, zero in the air; its fluid fraction; the
+    fat outside the brain) are the DWI's, gridded only for ``Protocol.head``. Arrays are flat float32 in TRXScan's F-order (see
     :mod:`trxscan._arrays`); use :meth:`image` for NIfTI views.
     """
 
@@ -162,6 +164,9 @@ class Object:
     fibers: Fibers | None = None
     myelin: np.ndarray | None = None
     sim_head: np.ndarray | None = None
+    sim_t2w: np.ndarray | None = None
+    sim_fat: np.ndarray | None = None
+    sim_fluid: np.ndarray | None = None
     z_offset: int = 0
     nz_full: int | None = None
     voxel_mm: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -190,11 +195,12 @@ class Object:
             if m.size != ns:
                 raise ValueError("myelin must be on the simulation grid")
             object.__setattr__(self, "myelin", m)
-        if self.sim_head is not None:
-            h = np.ascontiguousarray(self.sim_head, dtype=np.float32).reshape(-1)
-            if h.size != ns:
-                raise ValueError("sim_head must be on the simulation grid")
-            object.__setattr__(self, "sim_head", h)
+        for name in ("sim_head", "sim_t2w", "sim_fat", "sim_fluid"):
+            if getattr(self, name) is not None:
+                h = np.ascontiguousarray(getattr(self, name), dtype=np.float32).reshape(-1)
+                if h.size != ns:
+                    raise ValueError(f"{name} must be on the simulation grid")
+                object.__setattr__(self, name, h)
         if self.nz_full is None:
             object.__setattr__(self, "nz_full", self.dims[2])
         o = self.oversample
@@ -246,6 +252,8 @@ class Object:
             sim_wm=scut(self.sim_wm), sim_gm=scut(self.sim_gm), sim_csf=scut(self.sim_csf), sim_mask=scut(self.sim_mask),
             sim_fmap=scut(self.sim_fmap), fmap=None if self.fmap is None else cut(self.fmap),
             myelin=None if self.myelin is None else scut(self.myelin), sim_head=None if self.sim_head is None else scut(self.sim_head),
+            sim_t2w=None if self.sim_t2w is None else scut(self.sim_t2w), sim_fat=None if self.sim_fat is None else scut(self.sim_fat),
+            sim_fluid=None if self.sim_fluid is None else scut(self.sim_fluid),
             fibers=fibers, z_offset=self.z_offset + z0,
         )
 
@@ -317,9 +325,12 @@ class Phantom:
     fieldmap: nib.Nifti1Image | None = None
     motion: dict[str, Motion] = field(default_factory=dict)
     #: The subject's anatomical images in the same world frame (written to BIDS ``anat/`` by
-    #: :class:`~trxscan.bids.Dataset`; nothing in the simulation reads them).
+    #: :class:`~trxscan.bids.Dataset`; the GRE's and the DWI's non-brain heads are made from them).
     t1w: nib.Nifti1Image | None = None
     t2w: nib.Nifti1Image | None = None
+    #: Eyes for the DWI's head (``Protocol.head``) when the anatomy is defaced:
+    #: ``((x, y, z), radius_mm)`` per eye in world RAS mm. See :meth:`with_eyes`.
+    eyes: tuple[tuple[tuple[float, float, float], float], ...] = ()
     name: str = ""
     path: Path | None = None
     _grids: dict[Any, Object] = field(default_factory=dict, repr=False)
@@ -387,8 +398,15 @@ class Phantom:
         mv = lambda img: None if img is None else offset_image(img, T)  # noqa: E731
         return dataclasses.replace(
             self, wm=mv(self.wm), gm=mv(self.gm), csf=mv(self.csf), mask=mv(self.mask), fieldmap=mv(self.fieldmap),
-            t1w=mv(self.t1w), t2w=mv(self.t2w), streamlines=sl, name=name if name is not None else (f"{self.name}+moved" if self.name else ""), _grids={},
+            t1w=mv(self.t1w), t2w=mv(self.t2w), streamlines=sl,
+            eyes=tuple((tuple(float(v) for v in T[:3, :3] @ np.asarray(c) + T[:3, 3]), r) for c, r in self.eyes), name=name if name is not None else (f"{self.name}+moved" if self.name else ""), _grids={},
         )
+
+    def with_eyes(self, centers: Any, radius_mm: float = 12.0) -> "Phantom":
+        """The same subject with eyes (vitreous spheres, world RAS mm centres) for the DWI's head:
+        a defaced T1w/T2w has none, but a DWI is not defaced and its eyes are as bright as CSF."""
+        eyes = tuple((tuple(float(v) for v in c), float(radius_mm)) for c in np.asarray(centers, dtype=float).reshape(-1, 3))
+        return dataclasses.replace(self, eyes=eyes, _grids={})
 
     def subsample(self, n: int, *, seed: int = 0) -> "Phantom":
         """Keep ``n`` streamlines sampled proportionally to weight (deterministic in ``seed``);
@@ -403,8 +421,9 @@ class Phantom:
     ) -> Object:
         """The phantom resampled onto the acquisition grid (and the finer simulation grid) a
         protocol implies: its own bounding box plus ``pad``, centred in a fixed ``matrix``
-        (``Protocol.matrix``), or exactly the grid of another run's object (``like``). Cached
-        per ``(voxel_mm, oversample, pad, matrix, like)``."""
+        (``Protocol.matrix``), or exactly the grid of another run's object (``like``), with the
+        DWI head when ``Protocol.head``. Cached per ``(voxel_mm, oversample, pad, matrix, like,
+        oblique, head)``."""
         from ._grid import grid_phantom
 
         p = protocol or Protocol.DEFAULT
@@ -414,10 +433,10 @@ class Phantom:
         pd = tuple(int(v) for v in (p.pad if pad is None else pad))
         mt = p.matrix if matrix is None else tuple(int(v) for v in matrix)
         target = None if like is None else (tuple(like.dims), np.asarray(like.affine))
-        key = (vox, o, pd, mt, None if like is None else (target[0], tuple(np.round(target[1].ravel(), 9))), p.oblique_deg)
+        key = (vox, o, pd, mt, None if like is None else (target[0], tuple(np.round(target[1].ravel(), 9))), p.oblique_deg, p.head)
         obj = self._grids.get(key)
         if obj is None:
-            obj = grid_phantom(self, vox, o, pd, mt, target, p.oblique_deg)
+            obj = grid_phantom(self, vox, o, pd, mt, target, p.oblique_deg, p.head)
             self._grids[key] = obj
         return obj
 

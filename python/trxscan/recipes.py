@@ -142,7 +142,7 @@ def rpe_series(
     coils: int = 1, accel: int = 1, mb: int = 1, tr_s: float | None = 4.0, gnl: str | None = None, gnl_scale: float = 1.0,
     gnl_tag: str = "ND", pa_offset: Sequence[float] | None = None, parts: Sequence[str] | None = None, anat: bool = True, truth: bool = True, slices: Any = "all",
     pad: Sequence[int] = (4, 14, 2), oversample: int = 2, echo_spacing_ms: float = ECHO_SPACING_MS, chunk: int | None = 8, anat_offset: Sequence[float] | None = None, acq_rotation: Sequence[float] | None = None,
-    isocenter: Sequence[float] | None = None, seed: int = 0,
+    isocenter: Sequence[float] | None = None, seed: int = 0, head: bool = False, receive_bias: float = 0.0,
 ) -> Dataset:
     """A blip-up/blip-down pair: one single-shell DWI series per phase-encode polarity in
     ``pe`` with the phantom's measured fieldmap (``dir-AP``/``dir-PA``), magnitude only by
@@ -163,25 +163,27 @@ def rpe_series(
     non-identity. ``acq_rotation`` ``(rx, ry, rz)`` tilts the DWI acquisition grid about its
     centre (an oblique acquisition: the header carries the rotation, the head does not move).
     ``isocenter`` (world mm) places the scanner isocenter, which matters with ``gnl``. Truth: clean b=0, fieldmap,
-    displacement, fibre peaks, GNL fields."""
+    displacement, fibre peaks, GNL fields. ``head`` (every recipe but ``motion``) gives the DWI the
+    non-brain head from the phantom's T2w (``Protocol.head``); ``receive_bias`` shades every run
+    (``Artifacts.receive_bias``)."""
     params = {k: v for k, v in locals().items() if k != "out"}
     ds, rec = _new(out, "rpe_series", params)
     ph = load_phantom(phantom, subsample, seed)
     bvals, bvecs = scheme(((bval, ndirs),), nb0)
     first_obj = None
     for i, d in enumerate(pe):
-        proto = _protocol(voxel, coils, accel, mb, tr_s, d, pad, oversample, echo_spacing_ms, acq_rotation, gnl_tag=gnl_tag)
+        proto = _protocol(voxel, coils, accel, mb, tr_s, d, pad, oversample, echo_spacing_ms, acq_rotation, gnl_tag=gnl_tag, head=head)
         if i > 0 and pa_offset is not None:
             # the subject moved between the runs: the moved head inside the FIRST run's field of view
             obj = ph.moved(pa_offset).grid(proto, like=first_obj)
-            sim = obj.simulate((bvals, bvecs), proto, _artifacts(noise, seed, gnl, gnl_scale, isocenter), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
+            sim = obj.simulate((bvals, bvecs), proto, _artifacts(noise, seed, gnl, gnl_scale, isocenter, receive_bias=receive_bias), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
             files = ds.add_dwi(sim, subject, parts=parts, truth=truth, dir=d)
             from .bids import _offset_of
             ds.add_offset_truth(subject, None, "dwi", f"dir{d}", _offset_of(pa_offset, ph.wm), dir=d)
         else:
             obj = ph.grid(proto)
             first_obj = first_obj or obj
-            sim = obj.simulate((bvals, bvecs), proto, _artifacts(noise, seed, gnl, gnl_scale, isocenter), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
+            sim = obj.simulate((bvals, bvecs), proto, _artifacts(noise, seed, gnl, gnl_scale, isocenter, receive_bias=receive_bias), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
             ds.add_dwi(sim, subject, parts=parts, truth=truth, dir=d)
     if anat:
         ds.add_phantom_anat(ph, subject, offset=anat_offset)
@@ -195,7 +197,7 @@ def epi_fieldmap(
     nb0: int = 2, bval: float = 1000.0, pe: str = "AP", nb0_epi: int = 2, fmap_offset: Sequence[float] | None = None, subsample: int | None = 400_000, noise: float = 0.0,
     coils: int = 1, accel: int = 1, mb: int = 1, tr_s: float | None = 4.0, gnl: str | None = None, gnl_scale: float = 1.0,
     parts: Sequence[str] | None = None, anat: bool = True, truth: bool = True, slices: Any = "all", pad: Sequence[int] = (4, 14, 2), oversample: int = 2, echo_spacing_ms: float = ECHO_SPACING_MS, chunk: int | None = 8, anat_offset: Sequence[float] | None = None, acq_rotation: Sequence[float] | None = None,
-    isocenter: Sequence[float] | None = None, seed: int = 0,
+    isocenter: Sequence[float] | None = None, seed: int = 0, head: bool = False, receive_bias: float = 0.0,
 ) -> Dataset:
     """One DWI series plus a PEPOLAR ``fmap/_epi`` of ``nb0_epi`` b=0 volumes with the opposite
     polarity, linked by ``IntendedFor`` and ``B0FieldIdentifier``."""
@@ -204,10 +206,10 @@ def epi_fieldmap(
     ph = load_phantom(phantom, subsample, seed)
     bvals, bvecs = scheme(((bval, ndirs),), nb0)
     rev = "PA" if pe == "AP" else "AP"
-    arts = _artifacts(noise, seed, gnl, gnl_scale, isocenter)
-    sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, pe, pad, oversample, echo_spacing_ms, acq_rotation), arts, slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
+    arts = _artifacts(noise, seed, gnl, gnl_scale, isocenter, receive_bias=receive_bias)
+    sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, pe, pad, oversample, echo_spacing_ms, acq_rotation, head=head), arts, slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
     files = ds.add_dwi(sim, subject, parts=parts, truth=truth, dir=pe, b0_field="pepolar", b0_identifier="pepolar")
-    epi = ph.simulate(scheme((), nb0_epi), _protocol(voxel, coils, accel, mb, tr_s, rev, pad, oversample, echo_spacing_ms, acq_rotation), arts, slices=slices, kspace=False, chunk=chunk, truth_peaks=False, clean_b0=False)
+    epi = ph.simulate(scheme((), nb0_epi), _protocol(voxel, coils, accel, mb, tr_s, rev, pad, oversample, echo_spacing_ms, acq_rotation, head=head), arts, slices=slices, kspace=False, chunk=chunk, truth_peaks=False, clean_b0=False)
     ds.add_dwi(epi, subject, suffix="epi", parts=("mag",), truth=False, intended_for=[files[0]], b0_field="pepolar", dir=rev, fmap_offset=fmap_offset)
     if anat:
         ds.add_phantom_anat(ph, subject, offset=anat_offset)
@@ -222,7 +224,7 @@ def phasediff_fieldmap(
     gre_snr: float = 50.0, output: str = "phasediff", fmap_offset: Sequence[float] | None = None, subsample: int | None = 400_000, noise: float = 0.0, coils: int = 1,
     accel: int = 1, mb: int = 1, tr_s: float | None = 4.0, parts: Sequence[str] | None = None, anat: bool = True,
     truth: bool = True, slices: Any = "all", pad: Sequence[int] = (4, 14, 2), oversample: int = 2, echo_spacing_ms: float = ECHO_SPACING_MS, chunk: int | None = 8, anat_offset: Sequence[float] | None = None, acq_rotation: Sequence[float] | None = None,
-    isocenter: Sequence[float] | None = None, seed: int = 0,
+    isocenter: Sequence[float] | None = None, seed: int = 0, head: bool = False, receive_bias: float = 0.0,
 ) -> Dataset:
     """One DWI series plus a synthetic dual-echo GRE fieldmap (``phasediff`` or
     ``phase1``/``phase2`` with ``output="phase"``) of the same object in ``fmap/``."""
@@ -231,7 +233,7 @@ def phasediff_fieldmap(
     ph = load_phantom(phantom, subsample, seed)
     bvals, bvecs = scheme(((bval, ndirs),), nb0)
     gre = Gre(te_s=tuple(float(t) for t in te_s), snr=gre_snr, res_mm=gre_res_mm, output=output)
-    sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, pe, pad, oversample, echo_spacing_ms, acq_rotation), _artifacts(noise, seed, None, 1.0, isocenter), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth, gre=gre)
+    sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, pe, pad, oversample, echo_spacing_ms, acq_rotation, head=head), _artifacts(noise, seed, None, 1.0, isocenter, receive_bias=receive_bias), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth, gre=gre)
     ds.add_dwi(sim, subject, parts=parts, truth=truth, dir=pe, fmap_entities={"acq": "gre"}, fmap_offset=fmap_offset)
     if anat:
         ds.add_phantom_anat(ph, subject, offset=anat_offset)
@@ -245,7 +247,7 @@ def multishell(
     shells: Sequence[Sequence[float]] = ((1000.0, 16), (2000.0, 32)), nb0: int = 4, pe: Sequence[str] = ("AP",),
     subsample: int | None = 400_000, noise: float = 0.0, coils: int = 1, accel: int = 1, mb: int = 1, tr_s: float | None = 4.0,
     parts: Sequence[str] | None = None, anat: bool = True, truth: bool = True, slices: Any = "all", pad: Sequence[int] = (4, 14, 2), oversample: int = 2, echo_spacing_ms: float = ECHO_SPACING_MS, chunk: int | None = 8, anat_offset: Sequence[float] | None = None, acq_rotation: Sequence[float] | None = None,
-    isocenter: Sequence[float] | None = None, seed: int = 0,
+    isocenter: Sequence[float] | None = None, seed: int = 0, head: bool = False, receive_bias: float = 0.0,
 ) -> Dataset:
     """A multi-shell series (``shells`` = ``[(bval, ndirs), ...]``) per polarity in ``pe``,
     for reconstruction tests scored against the fibre peaks and clean b=0."""
@@ -254,7 +256,7 @@ def multishell(
     ph = load_phantom(phantom, subsample, seed)
     bvals, bvecs = scheme([(float(b), int(n)) for b, n in shells], nb0)
     for d in pe:
-        sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, d, pad, oversample, echo_spacing_ms, acq_rotation), _artifacts(noise, seed, None, 1.0, isocenter), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
+        sim = ph.simulate((bvals, bvecs), _protocol(voxel, coils, accel, mb, tr_s, d, pad, oversample, echo_spacing_ms, acq_rotation, head=head), _artifacts(noise, seed, None, 1.0, isocenter, receive_bias=receive_bias), slices=slices, kspace=False, chunk=chunk, truth_peaks=truth, clean_b0=truth)
         ds.add_dwi(sim, subject, parts=parts, truth=truth, dir=d)
     if anat:
         ds.add_phantom_anat(ph, subject, offset=anat_offset)

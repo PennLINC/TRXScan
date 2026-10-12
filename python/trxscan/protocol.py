@@ -256,6 +256,14 @@ class Protocol:
     with ``Artifacts(gnl=...)`` deliberately mislabels a warped image for tests of a
     pipeline's tag handling.
 
+    ``head`` adds the non-brain head (scalp, skull, eyes, extra-axial fluid, neck) to the DWI
+    from the phantom's T2w outside the brain, distorted by the same field: fluid (bright on the
+    T2w and dark on the T1w: the CSF's S0 and T2, ADC 3.0e-3 mm²/s) and tissue (muscle and skin:
+    T2 ``head_t2_ms``, ADC 1.0e-3), so on the b=0 the eyes are as bright as CSF and the scalp is
+    nearly dark, as on a real HBCD b=0. The voxels that are bright on the T1w are fat, which the fat
+    saturation of a DWI acquisition leaves at ``head_fat`` of its signal. The grid's bounding
+    box then covers the head in-plane. Needs a phantom with a T2w; not available with motion.
+
     :meth:`replace` keeps the field of view: changing ``voxel_mm`` on a protocol that has a
     ``matrix`` rescales the matrix (``Protocol.from_bids(...).replace(voxel_mm=3.0)`` is the
     same scan at 3 mm, not a 3 mm scan with the 1.7 mm matrix). Pass ``matrix`` too to
@@ -293,6 +301,9 @@ class Protocol:
     slice_timing: tuple[float, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     gnl_tag: Literal["ND", "DIS2D", "DIS3D"] = "ND"
+    head: bool = False
+    head_fat: float = 0.05
+    head_t2_ms: float = 25.0
     name: str = ""
 
     HBCD: ClassVar["Protocol"]
@@ -325,6 +336,10 @@ class Protocol:
             object.__setattr__(self, "oblique_deg", o)
         if self.slice_timing is not None:
             object.__setattr__(self, "slice_timing", tuple(float(v) for v in self.slice_timing))
+        if not 0.0 <= self.head_fat <= 1.0:
+            raise ValueError("head_fat must be in [0, 1]")
+        if self.head_t2_ms <= 0:
+            raise ValueError("head_t2_ms must be positive")
         if self.gnl_tag not in _GNL_TAGS:
             raise ValueError(f"gnl_tag must be one of {_GNL_TAGS}, got {self.gnl_tag!r}")
         object.__setattr__(self, "metadata", dict(self.metadata))

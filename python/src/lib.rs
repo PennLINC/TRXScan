@@ -534,6 +534,29 @@ impl Compartments {
         self.lock()?.apply_s0([s0.0, s0.1, s0.2]);
         Ok(())
     }
+    /// Multiply every compartment by the receive-coil profile `gre::bias_gain` (centre `1 - bias`,
+    /// corners `1 + bias`), on this grid as slices `z_offset..` of an `nz_full`-slice volume.
+    #[pyo3(signature = (bias, z_offset=0, nz_full=None))]
+    fn apply_receive_bias(&self, bias: f64, z_offset: usize, nz_full: Option<usize>) -> PyResult<()> {
+        let mut g = self.lock()?;
+        let gain = gre::bias_gain(g.dims, bias, z_offset, nz_full.unwrap_or(g.dims[2]).max(g.dims[2] + z_offset));
+        g.apply_gain(&gain);
+        Ok(())
+    }
+    /// Append an isotropically diffusing compartment (`comp::Compartments::push_isotropic`):
+    /// `amplitude` and `adc` (mm²/s) flat per voxel, `bvals` (s/mm²) one per volume, `t2` in ms.
+    fn add_isotropic(
+        &self, amplitude: PyReadonlyArray1<'_, f32>, adc: PyReadonlyArray1<'_, f32>, bvals: PyReadonlyArray1<'_, f64>, t2: f32,
+    ) -> PyResult<()> {
+        let (amplitude, adc, bvals) = (f32s(&amplitude)?, f32s(&adc)?, f64s(&bvals)?);
+        let mut g = self.lock()?;
+        let n = nvox(g.dims);
+        check_len("amplitude", amplitude.len(), n)?;
+        check_len("adc", adc.len(), n)?;
+        check_len("bvals", bvals.len(), g.ngrad)?;
+        g.push_isotropic(&amplitude, &adc, &bvals, t2);
+        Ok(())
+    }
     /// Within-volume multiband motion + slice dropout (`motion::apply_multiband_motion`), in
     /// place; returns the dropped-shot ground truth as dicts.
     #[pyo3(signature = (affine, mb, interleaved, bvals, b_max, events, slice_z=None, nz_full=None))]

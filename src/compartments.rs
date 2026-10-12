@@ -169,9 +169,6 @@ impl Compartments {
         CleanDwi { dims: self.dims, ngrad: self.ngrad, data }
     }
 
-    /// Scale each compartment image by a per-compartment amplitude `[fiber, gm, csf]`
-    /// (proton density x T1 saturation). Lets a caller match a real acquisition's tissue b0
-    /// levels without touching the physics. No-op for an all-ones factor.
     /// The compartment images restricted to the given local slices (in that order), as a new
     /// `Compartments` on an `[nx, ny, slices.len()]` grid.
     pub fn select_slices(&self, slices: &[usize]) -> Compartments {
@@ -192,6 +189,10 @@ impl Compartments {
         Compartments { dims: [nx, ny, slices.len()], ngrad: self.ngrad, images, t2: self.t2.clone() }
     }
 
+    /// Scale each compartment image by a per-compartment amplitude `[fiber, gm, csf]`
+    /// (proton density x T1 saturation). Lets a caller match a real acquisition's tissue b0
+    /// levels without touching the physics. No-op for an all-ones factor. Compartments past
+    /// the third (see [`Compartments::push_isotropic`]) carry their own amplitude and are left alone.
     pub fn apply_s0(&mut self, s0: [f32; 3]) {
         for (img, &a) in self.images.iter_mut().zip(s0.iter()) {
             if (a - 1.0).abs() > f32::EPSILON {
@@ -200,6 +201,43 @@ impl Compartments {
                 }
             }
         }
+    }
+
+    /// Multiply every volume of every compartment by a per-voxel gain on this grid (a receive-coil
+    /// profile, e.g. [`crate::gre::bias_gain`]).
+    pub fn apply_gain(&mut self, gain: &[f64]) {
+        let nvox: usize = self.dims.iter().product();
+        assert_eq!(gain.len(), nvox, "gain is not on the compartment grid");
+        let ng = self.ngrad;
+        for img in self.images.iter_mut() {
+            for (v, &a) in gain.iter().enumerate() {
+                for x in &mut img[v * ng..(v + 1) * ng] {
+                    *x = (*x as f64 * a) as f32;
+                }
+            }
+        }
+    }
+
+    /// Append an isotropically diffusing compartment with T2 `t2` (ms): voxel `v` of volume `g`
+    /// is `amplitude[v]·exp(−bvals[g]·adc[v])` (`bvals` in s/mm², `adc` in mm²/s). For tissue with
+    /// no fibres and no place in the orientation mixture, such as the non-brain head.
+    pub fn push_isotropic(&mut self, amplitude: &[f32], adc: &[f32], bvals: &[f64], t2: f32) {
+        let nvox: usize = self.dims.iter().product();
+        let ng = self.ngrad;
+        assert_eq!(amplitude.len(), nvox, "amplitude is not on the compartment grid");
+        assert_eq!(adc.len(), nvox, "adc is not on the compartment grid");
+        assert_eq!(bvals.len(), ng, "one b-value per volume");
+        let mut img = vec![0.0f32; nvox * ng];
+        for (v, (&a, &d)) in amplitude.iter().zip(adc).enumerate() {
+            if a == 0.0 {
+                continue;
+            }
+            for (g, &b) in bvals.iter().enumerate() {
+                img[v * ng + g] = (a as f64 * (-b * d as f64).exp()) as f32;
+            }
+        }
+        self.images.push(img);
+        self.t2.push(t2);
     }
 }
 
@@ -949,6 +987,28 @@ mod tests {
                 [0.0, 0.0, 0.0, 1.0],
             ],
         }
+    }
+
+    #[test]
+    fn apply_gain_scales_every_volume_of_every_compartment_per_voxel() {
+        let mut c = Compartments { dims: [2, 1, 1], ngrad: 2, images: vec![vec![1.0; 4], vec![2.0; 4]], t2: vec![80.0, 70.0] };
+        c.apply_gain(&[0.5, 2.0]);
+        assert_eq!(c.images[0], vec![0.5, 0.5, 2.0, 2.0]);
+        assert_eq!(c.images[1], vec![1.0, 1.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn push_isotropic_appends_an_attenuated_compartment_with_its_own_t2() {
+        let mut c = Compartments { dims: [2, 1, 1], ngrad: 2, images: vec![vec![1.0; 4]], t2: vec![80.0] };
+        c.push_isotropic(&[2.0, 0.0], &[1e-3, 3e-3], &[0.0, 1000.0], 70.0);
+        assert_eq!(c.t2, vec![80.0, 70.0]);
+        let h = &c.images[1];
+        assert!((h[0] - 2.0).abs() < 1e-6, "b=0 keeps the amplitude");
+        assert!((h[1] - 2.0 * (-1.0f32).exp()).abs() < 1e-6, "b=1000 at 1e-3 mm²/s attenuates by e");
+        assert_eq!(&h[2..], &[0.0, 0.0]);
+        c.apply_s0([0.5, 1.0, 1.0]);
+        assert_eq!(c.images[1][0], 2.0, "apply_s0 leaves the added compartment alone");
+        assert_eq!(c.images[0][0], 0.5);
     }
 
     #[test]
