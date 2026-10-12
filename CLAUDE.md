@@ -134,7 +134,8 @@ needs `--gre-out`, `--gnl-*` needs `--gnl`) via clap `requires`; keep new knobs 
   Always feed models `GradientScheme::fiberfox_gradients()`, never raw bvecs.
 - **4D layout is voxel-major interleaved**: `(x + nx*(y + ny*z)) * ngrad + g`. Single slices inside
   `kspace` are `x + nx*y`. `io::write_4d` is the only place this is transposed to `[x,y,z,g]`.
-- **Compartments stay separate** through the signal stage (`Compartments { images, t2 }` — fiber/GM/CSF) so
+- **Compartments stay separate** through the signal stage (`Compartments { images, t2 }` — fiber/GM/CSF, plus the
+  optional non-brain head appended by `push_isotropic` for the Python `Protocol.head`) so
   `kspace` can apply per-compartment T2 relaxation. `Compartments::mixed()` collapses them.
 - **Streamlines and tissue maps must share a world (RAS mm) frame.** The rasterizer maps world → the
   DWI grid's own (possibly oblique) affine; nothing re-registers for you.

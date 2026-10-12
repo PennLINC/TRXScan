@@ -28,17 +28,60 @@ def _resample(img: nib.Nifti1Image, target: tuple[tuple[int, int, int], np.ndarr
     return np.clip(a, 0, None) if clip else a
 
 
+#: A head voxel is fluid (the eyes) as its T2w rises from the first to the second fraction of the
+#: CSF's T2w, and as its T1w falls from the second to the first fraction of the WM's T1w: fluid is
+#: bright on the T2w and dark on the T1w, fat bright on both. Only clear fluid counts: on a real
+#: HBCD b=0 the partial-volume rim at the skull, bright-ish on the T2w, stays dark.
+HEAD_FLUID_T2W = (1.0, 1.4)
+HEAD_FLUID_T1W = (0.15, 0.3)
+
+
+def _ramp(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _eye_fraction(eyes, shape: tuple[int, int, int], affine: np.ndarray) -> np.ndarray | None:
+    """The fraction of each voxel inside the eyes: spheres ``((x, y, z), radius_mm)`` in world mm,
+    with a one-voxel soft edge."""
+    if not eyes:
+        return None
+    vox = float(np.mean(np.linalg.norm(affine[:3, :3], axis=0)))
+    ijk = np.indices(shape, dtype=np.float32).reshape(3, -1)
+    xyz = affine[:3, :3].astype(np.float32) @ ijk + affine[:3, 3:4].astype(np.float32)
+    frac = np.zeros(ijk.shape[1], np.float32)
+    for centre, radius in eyes:
+        dist = np.linalg.norm(xyz - np.asarray(centre, np.float32)[:, None], axis=0)
+        frac = np.maximum(frac, np.clip((radius - dist) / vox + 0.5, 0.0, 1.0))
+    return frac.reshape(shape)
+
+
+def _head_mask(t2w: np.ndarray, tissue: np.ndarray) -> np.ndarray:
+    """The head on a T2w: above 5% of the brain's 99th percentile once lightly smoothed, the
+    largest connected piece (noise in the air dropped), holes filled."""
+    from scipy import ndimage as ndi
+
+    ref = float(np.percentile(t2w[tissue > 0.3], 99))
+    m = ndi.gaussian_filter(t2w, 1.0) > 0.05 * ref
+    lab, n = ndi.label(m)
+    if n > 1:
+        sizes = ndi.sum(m, lab, range(1, n + 1))
+        m = lab == 1 + int(np.argmax(sizes))
+    return ndi.binary_fill_holes(m)
+
+
 def grid_phantom(
     phantom: "Phantom", voxel_mm: tuple[float, float, float], oversample: int, pad: tuple[int, int, int],
     matrix: tuple[int, int, int] | None = None, target: tuple[tuple[int, int, int], np.ndarray] | None = None,
-    oblique_deg: tuple[float, float, float] | None = None,
+    oblique_deg: tuple[float, float, float] | None = None, head: bool = False,
 ) -> "Object":
     """``matrix`` fixes the acquired matrix instead of bounding box + ``pad``: the tissue
     bounding box is centred in it (the FOV of a real scan). An axis the object overruns is
     cropped, centred, with a warning (a scanner would wrap it). ``target`` ``(shape, affine)``
     uses that exact acquisition grid instead (the grid of another run, so a moved subject is
     sampled inside the same field of view). ``oblique_deg`` rotates the grid about its own
-    centre (an oblique acquisition; the object does not move)."""
+    centre (an oblique acquisition; the object does not move). ``head`` (``Protocol.head``)
+    widens the in-plane bounding box to the head on the T2w (the slices stay the brain's, as a
+    DWI slab does) and grids the T2w and a fat map for the DWI's non-brain head."""
     from .phantom import Object
 
     if oversample < 1:
@@ -53,6 +96,14 @@ def grid_phantom(
         raise ValueError("tissue fractions are empty (nothing above 0.3)")
     lo, hi = nz_.min(0), nz_.max(0) + 1
     A = np.asarray(src.affine, dtype=np.float64)
+    if head:
+        if phantom.t2w is None:
+            raise ValueError("a DWI head (Protocol.head) needs a phantom with a T2w")
+        hm = _head_mask(_resample(phantom.t2w, (tuple(src.shape[:3]), A), True), tissue)
+        eye_src = _eye_fraction(phantom.eyes, tuple(src.shape[:3]), A)
+        hd = np.argwhere(hm if eye_src is None else hm | (eye_src > 0))
+        lo[:2] = np.minimum(lo[:2], hd.min(0)[:2])
+        hi[:2] = np.maximum(hi[:2], hd.max(0)[:2] + 1)
     zooms = np.asarray(src.header.get_zooms()[:3], dtype=np.float64)
     if not np.all(zooms > 0):
         raise ValueError(f"source has a non-positive voxel size {tuple(zooms)}")
@@ -117,10 +168,35 @@ def grid_phantom(
         if level > 0:
             sim_head = np.clip(t1 / level, 0.0, None) * (1.0 - brain)
 
+    # Non-brain head for the DWI (Protocol.head): the T2w over the whole head (zero in the air), its
+    # fluid fraction, and the T1w-bright voxels outside the brain as fat. Without a T1w, T2w
+    # brightness alone marks the fluid.
+    sim_t2w = sim_fat = sim_fluid = None
+    if head:
+        brain = np.clip(sim["wm"] + sim["gm"] + sim["csf"], 0.0, 1.0)
+        t2 = _resample(phantom.t2w, (tuple(sim_shape), sim_affine), True)
+        sim_t2w = np.where(_head_mask(t2, brain), t2, 0.0)
+        csf_t2w = float(np.median(t2[sim["csf"] > 0.9]))
+        sim_fluid = _ramp(sim_t2w / csf_t2w, *HEAD_FLUID_T2W)
+        if phantom.t1w is not None:
+            t1 = _resample(phantom.t1w, (tuple(sim_shape), sim_affine), True)
+            t1 = t1 / float(np.median(t1[sim["wm"] > 0.9]))
+            sim_fluid = sim_fluid * (1.0 - _ramp(t1, *HEAD_FLUID_T1W))
+            sim_fat = _ramp(t1, 1.0, 1.3) * (1.0 - brain)
+        eye = _eye_fraction(phantom.eyes, tuple(sim_shape), sim_affine)
+        if eye is not None:
+            # A defaced T2w has nothing there, so the eyes join the head mask themselves.
+            sim_t2w = np.maximum(sim_t2w, eye * csf_t2w)
+            sim_fluid = np.maximum(sim_fluid, eye)
+            if sim_fat is not None:
+                sim_fat = sim_fat * (1.0 - eye)
+
     return Object(
         dims=shape, affine=affine, oversample=oversample, sim_dims=tuple(sim_shape), sim_affine=sim_affine,
         wm=flat_f32(acq["wm"]), gm=flat_f32(acq["gm"]), csf=flat_f32(acq["csf"]), mask=flat_f32(mask),
         sim_wm=flat_f32(sim["wm"]), sim_gm=flat_f32(sim["gm"]), sim_csf=flat_f32(sim["csf"]), sim_mask=flat_f32(sim_mask),
         sim_fmap=flat_f32(sim_fmap), fmap=flat_f32(fmap), streamlines=phantom.streamlines, fibers=None,
-        sim_head=None if sim_head is None else flat_f32(sim_head), voxel_mm=tuple(float(v) for v in VOX), name=phantom.name,
+        sim_head=None if sim_head is None else flat_f32(sim_head),
+        sim_t2w=None if sim_t2w is None else flat_f32(sim_t2w), sim_fat=None if sim_fat is None else flat_f32(sim_fat),
+        sim_fluid=None if sim_fluid is None else flat_f32(sim_fluid), voxel_mm=tuple(float(v) for v in VOX), name=phantom.name,
     )

@@ -26,6 +26,9 @@ BUNDLES: dict[str, dict[str, Any]] = {
     "sub-60501": {
         "tag": "sub-60501-v1",
         "registry": "registry_sub-60501.txt",
+        # Its T1w/T2w are defaced. The eye centres (world RAS mm) are the MNI152NLin2009cAsym
+        # template's vitreous centroids carried through the subject's ACPC->MNI transform.
+        "eyes": ((31.6, 50.8, -35.1), (-30.1, 51.1, -34.1)),
         "prefix": "sub-60501_ses-01_space-ACPC",
         "files": {
             "wm": "{p}_label-WM_probseg.nii.gz",
@@ -142,7 +145,8 @@ def load_phantom(name: str = "sub-60501", *, weights: str | None = "sift2_weight
         wm=paths["wm"], gm=paths["gm"], csf=paths["csf"], mask=paths.get("mask"), fieldmap=paths.get("fieldmap"),
         streamlines=paths["streamlines"], weights=weights, motion=motion, name=name, **anat,
     )
-    return Phantom(**{**{f.name: getattr(ph, f.name) for f in ph.__dataclass_fields__.values() if f.name != "_grids"}, "path": root})
+    ph = Phantom(**{**{f.name: getattr(ph, f.name) for f in ph.__dataclass_fields__.values() if f.name != "_grids"}, "path": root})
+    return ph.with_eyes(BUNDLES[name]["eyes"]) if BUNDLES[name].get("eyes") else ph
 
 
 def fetch(name: str = "sub-60501") -> Path:

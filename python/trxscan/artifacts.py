@@ -74,8 +74,11 @@ class Artifacts:
     ``"connectom-300"``, the path of a Siemens ``.grad`` file, or its text) with
     ``gnl_scale``/``gnl_warp``/``gnl_encoding``/``gnl_jacobian`` and ``isocenter`` (world mm).
 
-    ``te_per_volume`` overrides the protocol's TE per volume; ``seed`` fixes the noise, spike,
-    dropout and shot-phase realisation.
+    ``receive_bias`` shades the image with a head array's periphery-bright receive profile (centre
+    ``1 - receive_bias``, corners ``1 + receive_bias``, the GRE magnitude's ``Gre.bias``); the
+    clean b=0 is left unshaded. A negative value gives the centre-bright shading that a
+    prescan-normalized 3 T image keeps from its transmit field. ``te_per_volume`` overrides the
+    protocol's TE per volume; ``seed`` fixes the noise, spike, dropout and shot-phase realisation.
     """
 
     noise: float = 0.0
@@ -99,6 +102,7 @@ class Artifacts:
     gnl_jacobian: bool = True
     isocenter: tuple[float, float, float] | None = None
     te_per_volume: Any = None
+    receive_bias: float = 0.0
     seed: int = 0
 
     def __post_init__(self) -> None:
@@ -106,6 +110,8 @@ class Artifacts:
             raise TypeError("motion must be a trxscan.Motion (see Motion.from_confounds, Motion.random, ...)")
         if not 0.0 <= self.dropout <= 1.0:
             raise ValueError("dropout is a probability in [0, 1]")
+        if not -1.0 < self.receive_bias < 1.0:
+            raise ValueError("receive_bias must be in (-1, 1)")
         if self.window is not None and not isinstance(self.window, (str, tuple)):
             raise TypeError("window must be None, 'hann', ('tukey', a) or ('fermi', r, w)")
 
