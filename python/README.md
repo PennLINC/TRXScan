@@ -58,9 +58,15 @@ sim = phantom.simulate(real.gtab, real.protocol, ts.Artifacts(noise=1e-4), slice
 matrix, TE, readout, phase-encode polarity, partial Fourier, GRAPPA, multiband) and records the
 rest (`RepetitionTime`, `FlipAngle`, `SliceTiming`, `MagneticFieldStrength`, the scanner and
 sequence descriptors) so the simulated run's sidecar documents the scan it stands in for. The
-signal model has no TR, T1 or flip-angle term; `Protocol(tr_s=4.8, flip_angle_deg=78, mb=3)`
+signal model has no TR, T1 or flip-angle term by default; `Protocol(tr_s=4.8, flip_angle_deg=78, mb=3)`
 sets the recorded values by hand, and `SliceTiming` is derived from TR and the multiband
-factor in the Siemens interleaved order (or given explicitly).
+factor in the Siemens interleaved order (or given explicitly). `applied_flip_deg=(excitation,
+refocusing)` turns an RF term on: every compartment is scaled by the spin-echo weight
+`sin α sin²(β/2)` times the TR-loop T1 steady state at `tr_s` (`t1_ms`, default adult 3 T), the
+model of a transmitter that applies less voltage than the pulse asked for (Siemens VE11:
+`flAmplitude / flAmplitudeNL` in the CSA header, flip angle linear in that ratio, pulse by pulse);
+`Protocol.rf_relative_weights` is the fraction of the correctly adjusted scan's signal each
+compartment keeps, and the sidecar records `AppliedFlipAngle` / `AppliedRefocusingFlipAngle`.
 
 ### A BIDS dataset
 

@@ -104,7 +104,11 @@ per-segment path and the histogram-first `generate_mixture`/`signal_from_mixture
 `kspace::default_acquisition` the default, `SimulationInput` + `simulate_acquisition` the entry
 point), `nufft` (its gridded y-transform,
 feature `kspace`), `gnl` (gradient nonlinearity: coefficients, field, warp, graddev), `gre`
-(synthetic dual-echo GRE fieldmap), `motion`, `orient` (FSL/LAS reorientation + FSL bvecs), `mat`
+(synthetic dual-echo GRE fieldmap), `rf` (applied excitation/refocusing flip angles →
+per-compartment spin-echo amplitude: `sin α sin²(β/2)` × the TR-loop T1 steady state, the model
+of a transmitter that applies less voltage than a pulse asked for; Python
+`Protocol.applied_flip_deg`; the ABCD study of it lives in `~/projects/abcc_bmi_check/trxscan_sim`),
+`motion`, `orient` (FSL/LAS reorientation + FSL bvecs), `mat`
 (std-only 3×3 helpers), `analytic` (Fourier test oracles), `benchmark` (Gibbs factor grid),
 `io` (feature-gated), plus `noise`/`config` which are still `todo!()` stubs.
 

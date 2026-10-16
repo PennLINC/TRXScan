@@ -60,8 +60,8 @@ pub struct GreParams {
     pub tr_s: f64,
     /// Flip angle (degrees).
     pub flip_deg: f64,
-    /// Per-compartment T1 (ms) `[fiber, gm, csf]`; default adult 3 T (Wansapura 1999: WM 830,
-    /// GM 1330; CSF ~4000).
+    /// Per-compartment T1 (ms) `[fiber, gm, csf]`; default [`crate::rf::ADULT_T1_MS`] (adult 3 T:
+    /// Wansapura 1999: WM 830, GM 1330; CSF ~4000).
     pub t1_ms: [f32; 3],
     /// Per-compartment proton density `[fiber, gm, csf]` multiplying the steady state (the DWI's
     /// `s0` is applied on top). The default 0.7/0.85/1.0 with TR 0.5 s / FA 60° gives the nearly
@@ -92,7 +92,7 @@ impl Default for GreParams {
             b0_field: "b0gre".to_string(),
             tr_s: 0.5,
             flip_deg: 60.0,
-            t1_ms: [830.0, 1330.0, 4000.0],
+            t1_ms: crate::rf::ADULT_T1_MS,
             pd: [0.7, 0.85, 1.0],
             bias: 0.3,
             ringing: true,

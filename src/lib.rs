@@ -59,6 +59,8 @@ pub mod motion;
 pub mod gnl;
 /// Dual-echo GRE fieldmap synthesis from the same object (Siemens integer-phase conventions).
 pub mod gre;
+/// Applied excitation/refocusing flip angles of the spin-echo EPI → per-compartment amplitude.
+pub mod rf;
 /// Ground-truth fibre orientations (peaks of the orientation mixture) per acquisition voxel.
 pub mod truth;
 

@@ -245,8 +245,20 @@ class Protocol:
 
     **Recorded, not modeled.** ``tr_s``, ``flip_angle_deg``, ``field_strength_t``,
     ``slice_timing`` and ``metadata`` go into the BIDS sidecar so a simulated run documents
-    the scan it stands in for, but the signal model has no TR, T1 or flip-angle term and the
-    acquisition has no slice clock. ``slice_timing`` (seconds per slice, one entry per slice
+    the scan it stands in for; by default the signal model has no TR, T1 or flip-angle term and
+    the acquisition has no slice clock.
+
+    **Applied RF pulses.** ``applied_flip_deg`` = ``(excitation, refocusing)`` in degrees turns
+    the RF term on: the clean signal of every compartment is multiplied by the spin-echo weight
+    ``sin(a) sin^2(b/2)`` times the T1 steady state of the TR loop at ``tr_s`` (``t1_ms`` per
+    compartment, default adult 3 T; ``tr_s=None`` = fully relaxed), see :attr:`rf_weights` and
+    :attr:`s0`. The nominal ``(90, 180)`` at ``tr_s=None`` changes nothing. This is the Siemens
+    VE11 behaviour in which the transmitter applies less voltage than a pulse asks for
+    (``flAmplitude / flAmplitudeNL`` in the CSA header) and the flip angle scales with that ratio
+    pulse by pulse: ``applied_flip_deg=(90 * r_exc, 180 * r_ref)``. Noise does not move with it,
+    so the SNR falls while the clean ``S(b)/S(0)`` is untouched. ``flip_angle_deg`` stays the
+    recorded (requested) angle; the sidecar gets ``AppliedFlipAngle`` and
+    ``AppliedRefocusingFlipAngle`` as ground truth. ``slice_timing`` (seconds per slice, one entry per slice
     of the full volume) defaults to a Siemens-style interleaved multiband order derived from
     ``tr_s``, the slice count and ``mb``. ``metadata`` is extra sidecar keys written verbatim
     (``Manufacturer``, ``PulseSequenceDetails``, ...); :meth:`from_bids` fills it from a real
@@ -297,6 +309,8 @@ class Protocol:
     oblique_deg: tuple[float, float, float] | None = None
     tr_s: float | None = None
     flip_angle_deg: float | None = None
+    applied_flip_deg: tuple[float, float] | None = None
+    t1_ms: tuple[float, float, float] | None = None
     field_strength_t: float | None = 3.0
     slice_timing: tuple[float, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -336,6 +350,18 @@ class Protocol:
             object.__setattr__(self, "oblique_deg", o)
         if self.slice_timing is not None:
             object.__setattr__(self, "slice_timing", tuple(float(v) for v in self.slice_timing))
+        if self.applied_flip_deg is not None:
+            a = tuple(float(v) for v in self.applied_flip_deg)
+            if len(a) != 2 or not all(0.0 <= v <= 180.0 for v in a):
+                raise ValueError("applied_flip_deg must be (excitation, refocusing) degrees in [0, 180]")
+            object.__setattr__(self, "applied_flip_deg", a)
+        if self.t1_ms is not None:
+            t = tuple(float(v) for v in self.t1_ms)
+            if len(t) != 3 or min(t) <= 0:
+                raise ValueError("t1_ms must be three positive values (fiber, gm, csf)")
+            object.__setattr__(self, "t1_ms", t)
+        if self.applied_flip_deg is not None and self.tr_s is not None and self.tr_s * 1000.0 < self.te_ms:
+            raise ValueError("tr_s must be at least te_ms when applied_flip_deg is set")
         if not 0.0 <= self.head_fat <= 1.0:
             raise ValueError("head_fat must be in [0, 1]")
         if self.head_t2_ms <= 0:
@@ -369,6 +395,31 @@ class Protocol:
     @property
     def reverse_phase(self) -> bool:
         return _PE[self.pe]
+
+    @property
+    def rf_weights(self) -> tuple[float, float, float]:
+        """Per-compartment ``(fiber, gm, csf)`` amplitude left by the applied RF pulses: the
+        spin-echo pathway ``sin(a) sin^2(b/2)`` times the T1 steady state at ``tr_s``
+        (``rf::SpinEchoRf::weights``). ``(1, 1, 1)`` without ``applied_flip_deg``."""
+        if self.applied_flip_deg is None:
+            return (1.0, 1.0, 1.0)
+        a, b = self.applied_flip_deg
+        return tuple(float(v) for v in _core.spin_echo_weights(a, b, self.tr_s, self.te_ms / 1000.0, self.t1_ms))
+
+    @property
+    def rf_relative_weights(self) -> tuple[float, float, float]:
+        """:attr:`rf_weights` relative to nominal 90/180 pulses at the same TR: the fraction of
+        the correctly-adjusted scan's signal each compartment keeps."""
+        if self.applied_flip_deg is None:
+            return (1.0, 1.0, 1.0)
+        a, b = self.applied_flip_deg
+        return tuple(float(v) for v in _core.spin_echo_weights(a, b, self.tr_s, self.te_ms / 1000.0, self.t1_ms, relative=True))
+
+    @property
+    def s0(self) -> tuple[float, float, float]:
+        """The amplitude applied to each compartment's clean signal: ``tissue_s0`` times
+        :attr:`rf_weights`."""
+        return tuple(float(a * w) for a, w in zip(self.tissue_s0, self.rf_weights))
 
     def t_line_ms(self, ny: int) -> float:
         """ms per phase-encode line on an ``ny``-line matrix."""
@@ -447,6 +498,8 @@ class Protocol:
             side["RepetitionTime"] = float(self.tr_s)
         if self.flip_angle_deg is not None:
             side["FlipAngle"] = float(self.flip_angle_deg)
+        if self.applied_flip_deg is not None:
+            side["AppliedFlipAngle"], side["AppliedRefocusingFlipAngle"] = self.applied_flip_deg
         if self.field_strength_t is not None:
             side["MagneticFieldStrength"] = float(self.field_strength_t)
         if nz is not None:

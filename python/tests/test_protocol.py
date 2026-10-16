@@ -74,3 +74,31 @@ def test_sidecar_and_from_bids_round_trip(tmp_path):
     with pytest.warns(UserWarning):
         (tmp_path / "bare.json").write_text("{}")
         ts.Protocol.from_bids(tmp_path / "bare.json")
+
+
+def test_applied_flip_angles_weight_the_signal():
+    import math
+
+    nominal = ts.Protocol.HBCD.replace(applied_flip_deg=(90.0, 180.0))
+    assert nominal.rf_weights == (1.0, 1.0, 1.0) and nominal.s0 == (1.0, 1.0, 1.0)
+    assert ts.Protocol.HBCD.rf_weights == (1.0, 1.0, 1.0)
+    # fully relaxed: the pathway share sin(a) sin^2(b/2), the same for every compartment
+    p = ts.Protocol.HBCD.replace(applied_flip_deg=(63.0, 126.0), tissue_s0=(1.0, 0.8, 0.5))
+    want = math.sin(math.radians(63.0)) * math.sin(math.radians(63.0)) ** 2
+    assert p.rf_weights == pytest.approx((want,) * 3)
+    assert p.s0 == pytest.approx((want, 0.8 * want, 0.5 * want))
+    # at TR 4.2 s the T1 loop saturates CSF (T1 4 s) and the clipped pair saturates it a little more
+    q = p.replace(tr_s=4.2)
+    w, rel = q.rf_weights, q.rf_relative_weights
+    assert w[2] < w[0] < want and rel[2] < rel[0] < 1.0
+    assert q.replace(applied_flip_deg=(90.0, 180.0)).rf_relative_weights == pytest.approx((1.0, 1.0, 1.0))
+    assert _core.spin_echo_weights(63.0, 126.0, 4.2, 0.088, (830.0, 1330.0, 4000.0)) == pytest.approx(w)
+    side = q.sidecar(96, nz=6)
+    assert side["AppliedFlipAngle"] == 63.0 and side["AppliedRefocusingFlipAngle"] == 126.0 and side["RepetitionTime"] == 4.2
+    assert "AppliedFlipAngle" not in ts.Protocol.HBCD.sidecar(96)
+    with pytest.raises(ValueError):
+        ts.Protocol(applied_flip_deg=(200.0, 180.0))
+    with pytest.raises(ValueError):
+        ts.Protocol(applied_flip_deg=(90.0, 180.0), tr_s=0.05, te_ms=88.0)
+    with pytest.raises(ValueError):
+        ts.Protocol(t1_ms=(1.0, 2.0))

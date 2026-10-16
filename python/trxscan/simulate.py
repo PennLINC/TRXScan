@@ -264,7 +264,7 @@ def _head_compartments(sub: "Object", protocol: Protocol, t2_ms: Sequence[float]
         outside = outside * (1.0 - sub.sim_fat * (1.0 - float(protocol.head_fat)))
     f32 = lambda a: np.ascontiguousarray(a, dtype=np.float32)  # noqa: E731
     return [
-        (f32(outside * fluid * float(protocol.tissue_s0[2])), f32(np.full(fluid.shape, HEAD_FLUID_ADC_MM2_S)), float(t2_ms[2])),
+        (f32(outside * fluid * float(protocol.s0[2])), f32(np.full(fluid.shape, HEAD_FLUID_ADC_MM2_S)), float(t2_ms[2])),
         (f32(outside * (1.0 - fluid) * HEAD_TISSUE_PD), f32(np.full(fluid.shape, HEAD_TISSUE_ADC_MM2_S)), float(protocol.head_t2_ms)),
     ]
 
@@ -407,7 +407,7 @@ def run(
         if truth_peaks:
             peaks_flat = mixture.truth_peaks(o, 3)
         comp = _core.signal_from_mixture(mixture, bvals, bvecs, gnl_field if artifacts.gnl_encoding else None)
-    comp.apply_s0(tuple(float(v) for v in protocol.tissue_s0))
+    comp.apply_s0(protocol.s0)
     head = _head_compartments(sub, protocol, list(comp.t2)) if protocol.head else []
     for amplitude, adc, t2 in head:
         comp.add_isotropic(amplitude, adc, np.ascontiguousarray(bvals, dtype=np.float64), t2)
@@ -488,7 +488,7 @@ def run(
         b0_bvals, b0_bvecs = np.zeros(1), np.zeros((1, 3))
         if mixture is not None:
             comp_c = _core.signal_from_mixture(mixture, b0_bvals, b0_bvecs, None)
-            comp_c.apply_s0(tuple(float(v) for v in protocol.tissue_s0))
+            comp_c.apply_s0(protocol.s0)
             for amplitude, adc, t2 in head:
                 comp_c.add_isotropic(amplitude, adc, b0_bvals, t2)
             comp_c = comp_c if local == all_local else comp_c.select_slices(local)

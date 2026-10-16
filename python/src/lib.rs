@@ -1474,6 +1474,27 @@ fn tissue_preset<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict
     params_to_dict(py, &p)
 }
 
+/// Per-compartment `[fiber, gm, csf]` amplitude of a spin-echo EPI with the applied excitation /
+/// refocusing flip angles (degrees) at `tr_s` (None = fully relaxed) and `te_s`, with `t1_ms`
+/// (default adult 3 T): `rf::SpinEchoRf::weights`. `relative=True` divides by the nominal
+/// 90°/180° pulses at the same TR, giving the fraction of the correctly-adjusted scan's signal.
+#[pyfunction]
+#[pyo3(signature = (excite_deg, refocus_deg, tr_s=None, te_s=0.088, t1_ms=None, relative=false))]
+fn spin_echo_weights(excite_deg: f64, refocus_deg: f64, tr_s: Option<f64>, te_s: f64, t1_ms: Option<(f32, f32, f32)>, relative: bool) -> PyResult<(f64, f64, f64)> {
+    if !(0.0..=180.0).contains(&excite_deg) || !(0.0..=180.0).contains(&refocus_deg) {
+        return Err(verr("flip angles must be in [0, 180] degrees"));
+    }
+    if te_s <= 0.0 || tr_s.is_some_and(|tr| tr < te_s) {
+        return Err(verr("te_s must be positive and tr_s at least te_s"));
+    }
+    let rf = trxscan::rf::SpinEchoRf {
+        excite_deg, refocus_deg, tr_s, te_s,
+        t1_ms: t1_ms.map_or(trxscan::rf::ADULT_T1_MS, |t| [t.0, t.1, t.2]),
+    };
+    let w = if relative { rf.relative_weights() } else { rf.weights() };
+    Ok((w[0], w[1], w[2]))
+}
+
 /// The names of the 27 closed-form microstructure maps, in `Mixture.scalars()` order.
 #[pyfunction]
 fn scalar_names() -> Vec<&'static str> {
@@ -1529,6 +1550,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(core_version, m)?)?;
     m.add_function(wrap_pyfunction!(scalar_names, m)?)?;
     m.add_function(wrap_pyfunction!(tissue_preset, m)?)?;
+    m.add_function(wrap_pyfunction!(spin_echo_weights, m)?)?;
     m.add_function(wrap_pyfunction!(set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(current_threads, m)?)?;
     Ok(())
