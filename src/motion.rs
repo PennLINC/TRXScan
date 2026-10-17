@@ -244,6 +244,25 @@ pub fn shot_offsets(nz: usize, mb: usize, order: SliceOrder, tr_s: f64) -> Resul
     Ok(offsets)
 }
 
+/// Check per-slice offsets before a plan is built from them: a finite positive repetition, every
+/// offset finite and inside `[0, tr_s)`, and each distinct offset shared by exactly `mb` slices
+/// (one at single band), so a shot is the slices the protocol excites together.
+pub fn check_shot_timing(offsets: &[f64], mb: usize, tr_s: f64) -> Result<(), String> {
+    if !(tr_s.is_finite() && tr_s > 0.0) {
+        return Err(format!("the repetition time {tr_s} s is not positive"));
+    }
+    if let Some(bad) = offsets.iter().find(|t| !(t.is_finite() && **t >= 0.0 && **t < tr_s)) {
+        return Err(format!("slice offset {bad} s is not inside the repetition [0, {tr_s}) s"));
+    }
+    let mb = mb.max(1);
+    for shot in slice_schedule_from_times(offsets) {
+        if shot.len() != mb {
+            return Err(format!("slices {shot:?} share an excitation time, but the multiband factor is {mb}"));
+        }
+    }
+    Ok(())
+}
+
 /// The shots of a run (full slice stack): the schedule, each shot's time, and per shot two
 /// world-space transforms about the full stack's field-of-view centre: `geometry` (what the
 /// images are resampled by) and `history` (the head's actual pose, for spin history). Without
@@ -333,6 +352,10 @@ pub fn load_motion_events(path: &std::path::Path, n_volumes: usize, n_shots: usi
     let idx = COLS.iter()
         .map(|c| header.iter().position(|h| h.trim() == *c).ok_or_else(|| format!("{what}: column {c:?} missing")))
         .collect::<Result<Vec<usize>, String>>()?;
+    // `slices` must be there (the format's columns), though the schedule decides the slices
+    if !header.iter().any(|h| h.trim() == "slices") {
+        return Err(format!("{what}: column \"slices\" missing"));
+    }
     let mut events: Vec<MotionEvent> = Vec::new();
     for (i, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
@@ -469,6 +492,14 @@ mod tests {
             }
         }
         assert!(load_motion_events(&path, 3, 4).unwrap_err().contains("volume 3"));
+        let no_slices = write_motion_events(&ev, &sched).replacen("\tslices", "", 1)
+            .lines().enumerate().map(|(i, l)| if i == 0 { l.to_string() } else {
+                let mut c: Vec<&str> = l.split('\t').collect();
+                c.remove(2);
+                c.join("\t")
+            }).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, no_slices).unwrap();
+        assert!(load_motion_events(&path, 4, 4).unwrap_err().contains("\"slices\""));
         let mut dup = write_motion_events(&ev, &sched);
         dup.push_str("1\t2\t2\t1\t0\t0\t0\t0\t0\t0\n");
         std::fs::write(&path, dup).unwrap();
@@ -612,6 +643,17 @@ mod tests {
         assert!(at(4, 3) < -1e-3, "the tissue at x = 4 is corrected: {}", at(4, 3));
         assert!(at(6, 3).abs() < 1e-7 && at(2, 3).abs() < 1e-7, "nothing where there is no tissue: {} {}", at(6, 3), at(2, 3));
         assert!(shot_offsets(5, 2, SliceOrder::Sequential, 3.0).is_err(), "5 slices at multiband 2");
+    }
+
+    /// Final-review fix: shot timing is checked before a plan is built.
+    #[test]
+    fn shot_timing_is_checked() {
+        let ok = shot_offsets(6, 2, SliceOrder::Interleaved, 3.0).unwrap();
+        assert!(check_shot_timing(&ok, 2, 3.0).is_ok());
+        assert!(check_shot_timing(&ok, 2, 0.0).unwrap_err().contains("not positive"));
+        assert!(check_shot_timing(&ok, 1, 3.0).unwrap_err().contains("multiband factor is 1"));
+        assert!(check_shot_timing(&[0.0, 0.5, 3.5], 1, 3.0).unwrap_err().contains("inside the repetition"));
+        assert!(check_shot_timing(&[0.0, f64::NAN], 1, 3.0).is_err());
     }
 
     /// The law is main's formula, bit for bit: `1 − severity·(b/b_max)` in `f32`, b < 50 and

@@ -456,9 +456,9 @@ def run(
             jumps = any(any(v != 0.0 for v in (*e["jump_mm"], *e["jump_deg"])) for e in events)
             if not jumps and poses is None:
                 raise ValueError("spin history needs motion to have a history of: events that jump, or Artifacts.motion")
-            gt, spin_corr = comp.apply_shot_motion_spin_history(sim_affine, offsets, tr, list(protocol.t1_s), bvals, b_max, events, poses)
+            gt, spin_corr = comp.apply_shot_motion_spin_history(sim_affine, offsets, tr, list(protocol.t1_s), bvals, b_max, events, poses, int(protocol.mb))
         else:
-            gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses)
+            gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses, int(protocol.mb))
         dropped = [DroppedShot(int(d["volume"]), int(d["shot"]), tuple(int(s) for s in d["slices"]), float(d["attenuation"])) for d in gt]
         motion_events = _core.write_motion_events(events, schedule)
     elif protocol.mb > 1 and artifacts.dropout > 0.0:

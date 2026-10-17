@@ -60,7 +60,9 @@ class ShotEvents:
     def offsets(self, nz: int, mb: int, tr_s: float, protocol: Any = None) -> list[float]:
         """Each of the ``nz`` slices' excitation offset (s) in a repetition of ``tr_s``."""
         if self.slice_order == "protocol":
-            st = protocol.slice_timing_for(nz) if protocol is not None else None
+            if protocol is None or protocol.tr_s is None:
+                raise ValueError("slice_order='protocol' needs Protocol.tr_s (the slice times are checked against it)")
+            st = protocol.slice_timing_for(nz)
             if st is None:
                 raise ValueError("slice_order='protocol' needs a protocol with SliceTiming for every slice (or tr_s and mb)")
             return [float(t) for t in st]

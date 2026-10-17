@@ -598,12 +598,12 @@ impl Compartments {
     /// is the full stack's, its rotations about the full stack's centre. `volume_poses` (`(n, 6)`,
     /// `[tx, ty, tz mm, rx, ry, rz deg]`) are the re-simulation path's poses, which the images
     /// already carry: the geometry applies only the jumps.
-    #[pyo3(signature = (affine, offsets, tr, bvals, b_max, events, slice_z=None, nz_full=None, volume_poses=None))]
+    #[pyo3(signature = (affine, offsets, tr, bvals, b_max, events, slice_z=None, nz_full=None, volume_poses=None, mb=1))]
     #[allow(clippy::too_many_arguments)]
     fn apply_shot_motion<'py>(
         &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64,
         bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>,
-        slice_z: Option<Vec<usize>>, nz_full: Option<usize>, volume_poses: Option<PyReadonlyArray2<'_, f64>>,
+        slice_z: Option<Vec<usize>>, nz_full: Option<usize>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
     ) -> PyResult<Bound<'py, PyList>> {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
@@ -616,6 +616,7 @@ impl Compartments {
         let (dims, ngrad) = (g.dims, g.ngrad);
         let nz_full = nz_full.unwrap_or(dims[2]);
         check_len("offsets", offsets.len(), nz_full)?;
+        motion::check_shot_timing(&offsets, mb, tr).map_err(verr)?;
         let z0 = match &slice_z {
             Some(sz) => {
                 check_len("slice_z", sz.len(), dims[2])?;
@@ -650,11 +651,11 @@ impl Compartments {
     /// [`apply_shot_motion`] with spin history (P9 part C3), on the whole slice stack: returns the
     /// dropped-shot dicts and the correction summed over compartments (flat, voxel-major
     /// interleaved, this grid). `t1_s` one per compartment (seconds); `tr` the repetition.
-    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None))]
+    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None, mb=1))]
     #[allow(clippy::too_many_arguments)]
     fn apply_shot_motion_spin_history<'py>(
         &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64, t1_s: Vec<f64>,
-        bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>, volume_poses: Option<PyReadonlyArray2<'_, f64>>,
+        bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<f32>>)> {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
@@ -666,6 +667,7 @@ impl Compartments {
         check_len("bvals", bvals.len(), g.ngrad)?;
         let (dims, ngrad) = (g.dims, g.ngrad);
         check_len("offsets", offsets.len(), dims[2])?;
+        motion::check_shot_timing(&offsets, mb, tr).map_err(verr)?;
         let grid = Grid { dims, voxel_to_world: v2w };
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
         check_events(&events, ngrad, n_shots)?;
