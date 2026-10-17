@@ -17,6 +17,46 @@ import numpy as np
 from . import _core
 
 Kind = Literal["trajectory", "random", "linear"]
+SliceOrder = Literal["interleaved", "sequential", "descending", "odd-first", "protocol"]
+
+
+@dataclass(frozen=True, eq=False)
+class ShotEvents:
+    """Within-volume (per-shot) motion and dropout (P9). A shot is the slices excited together:
+    one slice single-band, ``Protocol.mb`` slices multiband. Independent of :class:`Motion`
+    (``Artifacts.motion``): asking for shot events never switches the signal stage to the
+    per-volume re-simulation.
+
+    ``slice_order`` is ``"interleaved"`` (even groups then odd, what multiband dropout has always
+    used), ``"sequential"``, ``"descending"``, ``"odd-first"``, or ``"protocol"`` (the protocol's
+    ``SliceTiming``, :meth:`Protocol.slice_timing_for`). Events are drawn at ``rate`` per
+    diffusion-weighted volume (the CLI's ``--dropout-rate`` rule: a 1-3 mm jump, b=0 volumes
+    exempt), or given as ``events``: a list of dicts (``volume``, ``shot``, ``severity``,
+    ``jump_mm``, ``jump_deg``) or the path of an events TSV (``Simulation.motion_events``, or
+    aslscan's ``desc-motionEvents_gt.tsv``). A dropped shot is attenuated
+    ``1 - severity * b / b_max``; the jump persists to the end of its volume.
+    """
+
+    slice_order: SliceOrder = "interleaved"
+    rate: float = 0.0
+    events: Any = None
+
+    def __post_init__(self) -> None:
+        if self.slice_order not in ("interleaved", "sequential", "descending", "odd-first", "protocol"):
+            raise ValueError(f"slice_order {self.slice_order!r}: expected interleaved, sequential, descending, odd-first or protocol")
+        if not 0.0 <= self.rate <= 1.0:
+            raise ValueError("rate is a probability in [0, 1]")
+        if self.events is not None and self.rate > 0.0:
+            raise ValueError("give events or a rate, not both")
+
+    def offsets(self, nz: int, mb: int, tr_s: float, protocol: Any = None) -> list[float]:
+        """Each of the ``nz`` slices' excitation offset (s) in a repetition of ``tr_s``."""
+        if self.slice_order == "protocol":
+            st = protocol.slice_timing_for(nz) if protocol is not None else None
+            if st is None:
+                raise ValueError("slice_order='protocol' needs a protocol with SliceTiming for every slice (or tr_s and mb)")
+            return [float(t) for t in st]
+        return list(_core.shot_offsets(int(nz), int(mb), self.slice_order, float(tr_s)))
 
 
 @dataclass(frozen=True, eq=False)

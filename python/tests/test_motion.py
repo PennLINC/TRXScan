@@ -39,3 +39,64 @@ def test_motion_path_on_a_synthetic_object_requires_streamlines(gtab6):
     box = ts.objects.box(8, matrix=16)
     with pytest.raises(ValueError):
         box.simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(motion=ts.Motion.random((1, 1, 1), (1, 1, 1))), kspace=False)
+
+
+# ---- P9: per-shot events ----
+
+
+def test_shot_events_validation():
+    with pytest.raises(ValueError):
+        ts.ShotEvents(slice_order="random")
+    with pytest.raises(ValueError):
+        ts.ShotEvents(rate=0.2, events=[])
+    with pytest.raises(ValueError):
+        ts.Artifacts(dropout=0.2, shot_events=ts.ShotEvents(rate=0.1))
+    assert ts.Artifacts(shot_events=ts.ShotEvents(rate=0.1)).needs_context
+
+
+def test_slice_orders():
+    from trxscan import _core
+
+    sched = lambda order, mb=1: _core.slice_schedule_from_times(_core.shot_offsets(6, mb, order, 3.0))
+    assert sched("sequential") == [[0], [1], [2], [3], [4], [5]]
+    assert sched("descending") == [[5], [4], [3], [2], [1], [0]]
+    assert sched("interleaved") == [[0], [2], [4], [1], [3], [5]]
+    assert sched("odd-first") == [[1], [3], [5], [0], [2], [4]]
+    assert sched("interleaved", 2) == [[0, 3], [2, 5], [1, 4]]
+
+
+def _shot_run(gtab6, events, *, nz=6, order="sequential", **kw):
+    box = ts.objects.box(8, matrix=16, nz=nz)
+    art = ts.Artifacts(shot_events=ts.ShotEvents(slice_order=order, events=events))
+    return box.simulate(gtab6, ts.Protocol.DEFAULT, art, kspace=False, clean_b0=False, **kw)
+
+
+def test_shot_events_drop_one_single_band_slice_on_a_synthetic_object(gtab6, tmp_path):
+    # a synthetic fibre object: the re-simulation path would refuse it, ShotEvents does not select it
+    ev = [{"volume": 1, "shot": 2, "severity": 0.5, "jump_mm": (0.0, 0.0, 0.0), "jump_deg": (0.0, 0.0, 0.0)}]
+    sim = _shot_run(gtab6, ev)
+    clean = ts.objects.box(8, matrix=16, nz=6).simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(), kspace=False, clean_b0=False)
+    assert [(d.volume, d.shot, d.slices) for d in sim.dropout] == [(1, 2, (2,))]
+    # volume 1 (b = 1000 of b_max 2000), slice 2: 1 - 0.5 * 1000 / 2000; elsewhere unchanged
+    img_a = np.asarray(clean.magnitude.dataobj, dtype=float)
+    img_b = np.asarray(sim.magnitude.dataobj, dtype=float)
+    m = img_a[..., 2, 1] > 0.1 * img_a.max()
+    assert np.allclose(img_b[..., 2, 1][m] / img_a[..., 2, 1][m], 0.75, rtol=1e-4)
+    keep = np.ones(img_a.shape, bool)
+    keep[..., 2, 1] = False
+    assert np.allclose(img_b[keep], img_a[keep], rtol=1e-5, atol=1e-6 * img_a.max())
+    # the events table replays the run
+    path = tmp_path / "ev.tsv"
+    path.write_text(sim.motion_events)
+    again = _shot_run(gtab6, str(path))
+    assert np.array_equal(np.asarray(again.magnitude.dataobj), img_b)
+
+
+def test_shot_events_on_slabs_use_the_full_stack(gtab6):
+    ev = [{"volume": 2, "shot": 5, "severity": 0.0, "jump_mm": (0.6, 0.0, 0.0), "jump_deg": (0.0, 0.0, 3.0)}]
+    full = _shot_run(gtab6, ev, nz=12)
+    chunked = _shot_run(gtab6, ev, nz=12, chunk=4)
+    a = np.asarray(full.magnitude.dataobj, dtype=float)
+    b = np.asarray(chunked.magnitude.dataobj, dtype=float)
+    assert np.allclose(a, b, rtol=1e-5, atol=1e-6 * a.max())
+    assert not np.allclose(a[..., 5, 2], _shot_run(gtab6, None, nz=12).magnitude.dataobj[..., 5, 2]), "the jump moves slice 5"

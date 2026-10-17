@@ -95,6 +95,9 @@ class Simulation:
     gre: GreResult | None = None
     gnl: GnlResult | None = None
     dropout: list[DroppedShot] = field(default_factory=list)
+    #: The within-volume events of an `Artifacts.shot_events` run, as the events TSV text
+    #: (`_desc-motionEvents.tsv`, raw severities; `load_motion_events` reads it back).
+    motion_events: str | None = None
     noise_sigma: nib.Nifti1Image | None = None
     #: The off-resonance field the acquisition applied (Hz, acquisition grid, written slices).
     fieldmap: nib.Nifti1Image | None = None
@@ -416,9 +419,27 @@ def run(
     timing["signal"] = time.perf_counter() - t
     say("signal", 1, 1)
 
-    # ---- multiband dropout ----
+    # ---- within-volume motion and dropout ----
     dropped: list[DroppedShot] = []
-    if protocol.mb > 1 and artifacts.dropout > 0.0:
+    motion_events: str | None = None
+    if artifacts.shot_events is not None:
+        # P9: per-shot motion on the full stack's shots, any slice order, single band too
+        se = artifacts.shot_events
+        tr = float(protocol.tr_s) if protocol.tr_s is not None else 1.0
+        offsets = se.offsets(nz_full, int(protocol.mb), tr, protocol)
+        schedule = _core.slice_schedule_from_times(offsets)
+        n_shots = len(schedule)
+        if se.events is None:
+            events = _core.dropout_events(bvals, n_shots, float(se.rate), _core.dropout_seed(seed))
+        elif isinstance(se.events, (str, Path)):
+            events = _core.load_motion_events(str(se.events), int(ngrad), n_shots)
+        else:
+            events = list(se.events)
+        poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed)) if artifacts.motion is not None else None
+        gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses)
+        dropped = [DroppedShot(int(d["volume"]), int(d["shot"]), tuple(int(s) for s in d["slices"]), float(d["attenuation"])) for d in gt]
+        motion_events = _core.write_motion_events(events, schedule)
+    elif protocol.mb > 1 and artifacts.dropout > 0.0:
         n_shots = max(nz_full // protocol.mb, 1)
         events = _core.dropout_events(bvals, n_shots, float(artifacts.dropout), _core.dropout_seed(seed))
         gt = comp.apply_multiband_motion(sim_affine, int(protocol.mb), True, bvals, b_max, events, sub_global_z, nz_full)
@@ -590,7 +611,7 @@ def run(
     return Simulation(
         re=re_, im=im_, mag=mag_, ph=ph_, dims=out_dims, affine=out_affine, slices=np.asarray(global_z),
         bvals=bvals, bvecs=bvecs, bvecs_fsl=bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
-        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped,
+        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped, motion_events=motion_events,
         noise_sigma=ns_img, fieldmap=fmap_img, clean_b0=clean_img, mixture=mixture, compartments=comp, object=sub, timing=timing,
     )
 
@@ -694,7 +715,7 @@ def _run_chunked(obj, gtab, protocol, artifacts, sel, chunk, context, gre, truth
         dims=dims, affine=first.affine, slices=np.concatenate([p.slices for p in parts]),
         bvals=first.bvals, bvecs=first.bvecs, bvecs_fsl=first.bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
         readout=first.readout, kspace=None, truth_peaks=_cat_images([p.truth_peaks for p in parts]), gre=gre_result, gnl=gnl,
-        dropout=dropped, noise_sigma=_cat_images([p.noise_sigma for p in parts]), fieldmap=_cat_images([p.fieldmap for p in parts]),
+        dropout=dropped, motion_events=first.motion_events, noise_sigma=_cat_images([p.noise_sigma for p in parts]), fieldmap=_cat_images([p.fieldmap for p in parts]),
         clean_b0=_cat_images([p.clean_b0 for p in parts]), mixture=None, compartments=None, object=obj, timing=timing,
     )
 

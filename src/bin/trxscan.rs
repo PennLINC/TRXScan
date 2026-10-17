@@ -171,9 +171,21 @@ struct Cli {
     /// kappa, myelin, GNL or truth peaks there).
     #[arg(long, value_name = "TSV")]
     motion: Option<PathBuf>,
-    /// Per-DWI-volume probability of a within-volume dropout event (needs --mb > 1)
+    /// Per-DWI-volume probability of a within-volume dropout event (a shot is one slice single-band,
+    /// `--mb` slices multiband)
     #[arg(long, default_value_t = 0.0, value_name = "P")]
     dropout_rate: f64,
+    /// The order the shots of a volume are excited in, for within-volume events (`interleaved`, the
+    /// default, is the order multiband dropout has always used)
+    #[arg(long, value_enum, default_value_t = motion::SliceOrder::Interleaved)]
+    slice_order: motion::SliceOrder,
+    /// Explicit within-volume events instead of the drawn ones: a TSV in aslscan's
+    /// desc-motionEvents_gt.tsv format (attenuation = 1 - severity, before the b-value scaling)
+    #[arg(long, value_name = "TSV", conflicts_with = "dropout_rate")]
+    motion_events: Option<PathBuf>,
+    /// Repetition time (s): spaces the shots over the repetition (timing for spin history)
+    #[arg(long, value_name = "S")]
+    tr: Option<f64>,
 
     /// SIFT2 weights: a TRX data-per-streamline array name, or an MRtrix tcksift2 text file
     #[arg(long, value_name = "SPEC")]
@@ -503,6 +515,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // mixture path — SIFT2 weights + Watson κ dispersion, and the same
     // mixture `trxscan-microstructure` computes ground truth from.
     let mut truth_peaks: Option<Vec<f32>> = None;
+    // the motion trace's poses, kept for the per-shot plan (the re-simulation applies them itself)
+    let mut volume_poses: Option<Vec<motion::Pose>> = None;
     let mut comp = if let Some(tsv) = &cli.motion {
         // The per-segment path has no orientation mixture, so everything that lives on the
         // mixture is unavailable. Refuse rather than silently ignore.
@@ -522,8 +536,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let moved = poses.iter().filter(|p| **p != motion::Pose::IDENTITY).count();
         println!("Motion (faithful re-simulation): {} poses, {} moved, from {}",
             poses.len(), moved, tsv.display());
-        generate_compartments_moving(
-            &sig_grid, &positions, &offsets, &sig_tissue, &scheme, &params, &poses)
+        let c = generate_compartments_moving(
+            &sig_grid, &positions, &offsets, &sig_tissue, &scheme, &params, &poses);
+        volume_poses = Some(poses);
+        c
     } else {
         let mut mix = generate_mixture(
             &sig_grid, &positions, &offsets, weights.as_deref(), &sig_tissue, &params, kappa,
@@ -554,9 +570,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Signal stage (per-compartment signal): {:?}  T2 {:?}", t.elapsed(), comp.t2);
     comp.apply_s0(tissue_s0);
 
-    // Multiband within-volume motion + slice dropout: inject synthetic bulk-motion events on random
-    // DWI shots and write the dropped-slice ground truth (for scoring eddy --repol / SHORELine).
-    if cli.mb > 1 && cli.dropout_rate > 0.0 {
+    // Within-volume motion + slice dropout. The per-shot path (P9) runs for a single-band request,
+    // a slice order other than interleaved, or an events file; otherwise the multiband path runs
+    // exactly as before.
+    let shot_path = cli.motion_events.is_some()
+        || (cli.dropout_rate > 0.0 && (cli.mb <= 1 || cli.slice_order != motion::SliceOrder::Interleaved));
+    if shot_path {
+        let nz = sig_grid.dims[2];
+        let tr = cli.tr.unwrap_or(1.0);
+        let offsets = motion::shot_offsets(nz, cli.mb, cli.slice_order, tr);
+        let n_shots = motion::slice_schedule_from_times(&offsets).len();
+        let events = match &cli.motion_events {
+            Some(path) => motion::load_motion_events(path, comp.ngrad, n_shots)?,
+            None => motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed)),
+        };
+        let plan = motion::ShotPlan::new(&offsets, comp.ngrad, tr, volume_poses.as_deref(), events, &sig_grid);
+        let gt = motion::apply_shot_motion(
+            &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world, &plan, None, &scheme.bvals, scheme.b_max);
+        let mut tsv = String::from("volume\tshot\tslices\tattenuation\n");
+        for d in &gt {
+            let sl = d.slices.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
+            tsv.push_str(&format!("{}\t{}\t{}\t{:.3}\n", d.volume, d.shot, sl, d.attenuation));
+        }
+        std::fs::write(format!("{}_desc-dropout_slices.tsv", cli.out), tsv)?;
+        std::fs::write(format!("{}_desc-motionEvents.tsv", cli.out), motion::write_motion_events(&plan.events, &plan.schedule))?;
+        println!("Per-shot motion: mb={}, {:?} order, {} shots per volume, {} events -> {}_desc-dropout_slices.tsv, \
+                  {}_desc-motionEvents.tsv", cli.mb, cli.slice_order, n_shots, gt.len(), cli.out, cli.out);
+    } else if cli.mb > 1 && cli.dropout_rate > 0.0 {
         let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
         let events = motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed));
         let gt = motion::apply_multiband_motion(
