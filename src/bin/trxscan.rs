@@ -186,6 +186,14 @@ struct Cli {
     /// Repetition time (s): spaces the shots over the repetition (timing for spin history)
     #[arg(long, value_name = "S")]
     tr: Option<f64>,
+    /// Spin history of the tissue under through-plane motion (P9): needs --t1 and --tr, and events
+    /// that jump (--dropout-rate or --motion-events) or a --motion trace. Writes
+    /// <out>_desc-spinHistory.nii.gz
+    #[arg(long, requires_all = ["t1", "tr"])]
+    spin_history: bool,
+    /// Longitudinal relaxation time (s) of each compartment, "WM,GM,CSF", for --spin-history
+    #[arg(long, value_delimiter = ',', num_args = 3, value_name = "WM,GM,CSF")]
+    t1: Option<Vec<f64>>,
 
     /// SIFT2 weights: a TRX data-per-streamline array name, or an MRtrix tcksift2 text file
     #[arg(long, value_name = "SPEC")]
@@ -573,8 +581,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Within-volume motion + slice dropout. The per-shot path (P9) runs for a single-band request,
     // a slice order other than interleaved, or an events file; otherwise the multiband path runs
     // exactly as before.
-    let shot_path = cli.motion_events.is_some()
+    let shot_path = cli.motion_events.is_some() || cli.spin_history
         || (cli.dropout_rate > 0.0 && (cli.mb <= 1 || cli.slice_order != motion::SliceOrder::Interleaved));
+    let mut spin_truth: Option<Vec<f32>> = None;
     if shot_path {
         let nz = sig_grid.dims[2];
         let tr = cli.tr.unwrap_or(1.0);
@@ -585,8 +594,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed)),
         };
         let plan = motion::ShotPlan::new(&offsets, comp.ngrad, tr, volume_poses.as_deref(), events, &sig_grid);
-        let gt = motion::apply_shot_motion(
-            &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world, &plan, None, &scheme.bvals, scheme.b_max);
+        let gt = if cli.spin_history {
+            let jumps = plan.events.iter().any(|e| e.jump_mm.iter().chain(&e.jump_deg).any(|x| *x != 0.0));
+            if !jumps && volume_poses.is_none() {
+                return Err("--spin-history needs motion to have a history of: events that jump (--dropout-rate, \
+                            --motion-events) or a --motion trace".into());
+            }
+            let t1 = cli.t1.clone().expect("clap requires --t1");
+            let (gt, sum) = motion::apply_shot_motion_with_spin_history(
+                &mut comp.images, &sig_grid, comp.ngrad, &plan, &scheme.bvals, scheme.b_max, &t1, tr)?;
+            spin_truth = Some(sum);
+            gt
+        } else {
+            motion::apply_shot_motion(
+                &mut comp.images, sig_grid.dims, comp.ngrad, sig_grid.voxel_to_world, &plan, None, &scheme.bvals, scheme.b_max)
+        };
         let mut tsv = String::from("volume\tshot\tslices\tattenuation\n");
         for d in &gt {
             let sl = d.slices.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(",");
@@ -780,6 +802,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::write_4d(&PathBuf::from(format!("{}_desc-noise_sigma.nii.gz", cli.out)),
             grid.dims, 1, &ns_out, &grid)?;
         println!("wrote noise-level ground truth {}_desc-noise_sigma.nii.gz", cli.out);
+    }
+    if let Some(sh) = &spin_truth {
+        // the summed correction, block-averaged in-plane from the signal grid to the acquired one
+        let [sx, sy, nz] = sig_grid.dims;
+        let [ax, ay, _] = grid.dims;
+        let (ox, oy, ng) = (sx / ax, sy / ay, comp.ngrad);
+        let mut acq = vec![0.0f32; ax * ay * nz * ng];
+        for z in 0..nz {
+            for y in 0..ay {
+                for x in 0..ax {
+                    for g in 0..ng {
+                        let mut s = 0.0f64;
+                        for j in 0..oy {
+                            for i in 0..ox {
+                                s += sh[((x * ox + i) + sx * ((y * oy + j) + sy * z)) * ng + g] as f64;
+                            }
+                        }
+                        acq[(x + ax * (y + ay * z)) * ng + g] = (s / (ox * oy) as f64) as f32;
+                    }
+                }
+            }
+        }
+        let out = if cli.fsl_orientation { reo.apply_volume(&acq, ng) } else { acq };
+        io::write_4d(&PathBuf::from(format!("{}_desc-spinHistory.nii.gz", cli.out)), grid.dims, ng, &out, &grid)?;
+        println!("wrote spin-history ground truth {}_desc-spinHistory.nii.gz (the tissue's correction, signal units)", cli.out);
     }
 
     if let Some((prefix, g)) = &gre_fieldmap {

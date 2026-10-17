@@ -98,6 +98,9 @@ class Simulation:
     #: The within-volume events of an `Artifacts.shot_events` run, as the events TSV text
     #: (`_desc-motionEvents.tsv`, raw severities; `load_motion_events` reads it back).
     motion_events: str | None = None
+    #: The spin-history correction of the tissue (`ShotEvents(spin_history=True)`), summed over the
+    #: compartments, per volume on the acquisition grid, in signal units; zero means no effect.
+    spin_history: nib.Nifti1Image | None = None
     noise_sigma: nib.Nifti1Image | None = None
     #: The off-resonance field the acquisition applied (Hz, acquisition grid, written slices).
     fieldmap: nib.Nifti1Image | None = None
@@ -324,6 +327,16 @@ def run(
     say = progress or (lambda *_: None)
 
     sel = _resolve_slices(slices, z_mm, obj)
+    se = artifacts.shot_events
+    if se is not None and se.spin_history:
+        # P9 part C3: the spin-history state spans the whole slice stack
+        whole = len(sel) == nz and int(obj.z_offset or 0) == 0 and int(obj.nz_full or nz) == nz
+        if chunk is not None or not whole:
+            raise ValueError("spin history needs the whole slice stack: no chunk=, slices=, z_mm= or slab object")
+        if protocol.t1_s is None or protocol.tr_s is None:
+            raise ValueError("spin history needs Protocol.t1_s (WM, GM, CSF) and Protocol.tr_s")
+        if protocol.head:
+            raise ValueError("spin history is not available with Protocol.head (five compartments, three T1s)")
     if chunk is not None and len(sel) > int(chunk):
         if kspace:
             raise ValueError("k-space capture is not available with chunk=; run the slices of interest unchunked")
@@ -422,6 +435,7 @@ def run(
     # ---- within-volume motion and dropout ----
     dropped: list[DroppedShot] = []
     motion_events: str | None = None
+    spin_corr = None
     if artifacts.shot_events is not None:
         # P9: per-shot motion on the full stack's shots, any slice order, single band too
         se = artifacts.shot_events
@@ -436,7 +450,13 @@ def run(
         else:
             events = list(se.events)
         poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed)) if artifacts.motion is not None else None
-        gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses)
+        if se.spin_history:
+            jumps = any(any(v != 0.0 for v in (*e["jump_mm"], *e["jump_deg"])) for e in events)
+            if not jumps and poses is None:
+                raise ValueError("spin history needs motion to have a history of: events that jump, or Artifacts.motion")
+            gt, spin_corr = comp.apply_shot_motion_spin_history(sim_affine, offsets, tr, list(protocol.t1_s), bvals, b_max, events, poses)
+        else:
+            gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses)
         dropped = [DroppedShot(int(d["volume"]), int(d["shot"]), tuple(int(s) for s in d["slices"]), float(d["attenuation"])) for d in gt]
         motion_events = _core.write_motion_events(events, schedule)
     elif protocol.mb > 1 and artifacts.dropout > 0.0:
@@ -605,13 +625,21 @@ def run(
         ns = _core.apply_reorient(noise_sigma, 1, reo) if protocol.fsl_orientation else noise_sigma
         ns_img = nifti(volume(ns, out_dims), out_affine)
     fmap_img = nifti(volume(fmap_flat, out_dims), out_affine)
+    spin_img = None
+    if spin_corr is not None:
+        # the summed correction, block-averaged in-plane to the acquisition grid (whole stack)
+        sc = series(np.asarray(spin_corr, dtype=np.float32), (snx, sny, nsl), ngrad).reshape(nx, o, ny, o, nsl, ngrad).mean(axis=(1, 3))
+        sc_flat = np.ascontiguousarray(sc.transpose(2, 1, 0, 3), dtype=np.float32).reshape(-1)
+        if protocol.fsl_orientation:
+            sc_flat = _core.apply_reorient(sc_flat, ngrad, reo)
+        spin_img = nifti(series(sc_flat, out_dims, ngrad), out_affine)
     clean_img = None if clean_mag is None else nifti(volume(np.asarray(clean_mag, dtype=np.float32), out_dims), out_affine)
 
     timing["total"] = time.perf_counter() - t_start
     return Simulation(
         re=re_, im=im_, mag=mag_, ph=ph_, dims=out_dims, affine=out_affine, slices=np.asarray(global_z),
         bvals=bvals, bvecs=bvecs, bvecs_fsl=bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
-        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped, motion_events=motion_events,
+        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped, motion_events=motion_events, spin_history=spin_img,
         noise_sigma=ns_img, fieldmap=fmap_img, clean_b0=clean_img, mixture=mixture, compartments=comp, object=sub, timing=timing,
     )
 

@@ -96,6 +96,100 @@ pub fn apply_multiband_motion_slab(
     mrsim_acq::motion::apply_multiband_motion_slab(images, dims, ngrad, v2w, mb, interleaved, &law, events, slice_z, nz_full)
 }
 
+// ---- spin history (P9, part C3) ----
+
+/// The spin-history correction of each compartment (`[compartment][vox * ngrad + v]` on `grid`),
+/// from the compartments' signal before any per-shot motion. A diffusion series is spin echo at
+/// 90 degrees with every volume prepared alike, so the reference is `1 - exp(-TR/T1)`: each
+/// compartment's `T1` is uniform (`t1_s`, seconds, one per compartment). The engine
+/// (`mrsim_acq::spin_history`) tracks every voxel the compartment has signal in, as exact pieces
+/// along z, and is stepped through every shot of `plan` with its `history` transform; per volume its
+/// weight is the compartment's signal over the reference magnetization, so the correction is in
+/// signal units, weighted by the signal actually there.
+///
+/// Under the re-simulation path (`plan` built with volume poses) the weights are read from the
+/// re-simulated images without undoing the volume pose, an approximation at tissue edges.
+pub fn spin_history_corrections(images: &[Vec<f32>], grid: &mrsim_acq::grid::Grid, ngrad: usize, t1_s: &[f64], tr_s: f64,
+                                plan: &ShotPlan) -> Result<Vec<Vec<f32>>, String> {
+    use mrsim_acq::spin_history::{Slabs, Source, SpinHistory, NO_CLASS};
+    if t1_s.len() != images.len() {
+        return Err(format!("spin history needs one T1 per compartment: {} T1s for {} compartments", t1_s.len(), images.len()));
+    }
+    if let Some(bad) = t1_s.iter().find(|t| !(t.is_finite() && **t > 0.0)) {
+        return Err(format!("spin history: T1 {bad} s is not positive"));
+    }
+    if !(tr_s.is_finite() && tr_s > 0.0) {
+        return Err(format!("spin history: TR {tr_s} s is not positive"));
+    }
+    let [nx, ny, nz] = grid.dims;
+    let (nvox, slab) = (nx * ny * nz, nx * ny);
+    let mut out = Vec::with_capacity(images.len());
+    for (img, &t1) in images.iter().zip(t1_s) {
+        let r = 1.0 - (-tr_s / t1).exp();
+        let class: Vec<u8> = (0..nvox).map(|i| if (0..ngrad).any(|g| img[i * ngrad + g] != 0.0) { 0 } else { NO_CLASS }).collect();
+        let t1v = vec![t1 as f32; nvox];
+        let zeros = vec![0.0f32; nvox];
+        let mut h = SpinHistory::new(
+            Source { dims: grid.dims, v2w: grid.voxel_to_world, t1: &t1v, weight: &zeros, class: &class, n_classes: 1 },
+            Slabs { dims: grid.dims, v2w: grid.voxel_to_world },
+            Vec::new(),
+        );
+        let prime: Vec<(f64, &[usize])> = plan.schedule.iter().enumerate().map(|(s, sl)| (plan.times[0][s] - tr_s, sl.as_slice())).collect();
+        h.prime(&prime, plan.history[0][0]);
+        let mut corr = vec![0.0f32; nvox * ngrad];
+        let reference = move |t1: f64| 1.0 - (-tr_s / t1).exp();
+        for v in 0..ngrad.min(plan.times.len()) {
+            let weight: Vec<f32> = (0..nvox).map(|i| (img[i * ngrad + v] as f64 / r) as f32).collect();
+            for (s, slices) in plan.schedule.iter().enumerate() {
+                for term in h.excite(plan.times[v][s], plan.history[v][s], slices, &reference, Some(&weight)) {
+                    for (cell, x) in term.num[0].iter().enumerate() {
+                        corr[(term.slice * slab + cell) * ngrad + v] += *x;
+                    }
+                }
+            }
+        }
+        out.push(corr);
+    }
+    Ok(out)
+}
+
+/// [`apply_shot_motion`] with spin history: the corrections from the signal before the motion,
+/// the per-shot motion and dropout, then each compartment's correction added at its shot's slices
+/// times that shot's dropout attenuation. Returns the dropped-shot truth and the correction summed
+/// over compartments (`vox * ngrad + v` on this grid). The whole slice stack only.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_shot_motion_with_spin_history(
+    images: &mut [Vec<f32>],
+    grid: &mrsim_acq::grid::Grid,
+    ngrad: usize,
+    plan: &ShotPlan,
+    bvals: &[f64],
+    b_max: f64,
+    t1_s: &[f64],
+    tr_s: f64,
+) -> Result<(Vec<DroppedShot>, Vec<f32>), String> {
+    let corr = spin_history_corrections(images, grid, ngrad, t1_s, tr_s, plan)?;
+    let dropped = apply_shot_motion(images, grid.dims, ngrad, grid.voxel_to_world, plan, None, bvals, b_max);
+    let law = diffusion_dropout_law(bvals, b_max);
+    let slab = grid.dims[0] * grid.dims[1];
+    let mut sum = vec![0.0f32; corr.first().map_or(0, |c| c.len())];
+    for v in 0..ngrad {
+        for (s, slices) in plan.schedule.iter().enumerate() {
+            let att: f32 = plan.events.iter().filter(|e| e.volume == v && e.shot == s).map(|e| law.attenuation(v, e.severity)).product();
+            for &z in slices {
+                for xy in 0..slab {
+                    let i = (z * slab + xy) * ngrad + v;
+                    for (img, c) in images.iter_mut().zip(&corr) {
+                        img[i] += c[i] * att;
+                        sum[i] += c[i];
+                    }
+                }
+            }
+        }
+    }
+    Ok((dropped, sum))
+}
+
 // ---- per-shot motion (P9, part C): any slice order, single band, events from a file ----
 
 /// The order in which a volume's shots (groups of `mb` slices `{g, g + nz/mb, ...}`) are excited.
@@ -400,6 +494,70 @@ mod tests {
         assert_eq!(plan.geometry[0][1], j.to_matrix(c));
         assert_eq!(plan.history[0][1], matmul4(&j.to_matrix(c), &p.to_matrix(c)));
         assert!((plan.times[0][3] - 1.5).abs() < 1e-12);
+    }
+
+    /// A uniform two-compartment object on 2 mm slices, sequential single band, TR 4 s: a jump of a
+    /// quarter slice toward the next slab at shot 3 of volume 1 corrects slice 3 of volume 1 by
+    /// `-0.25 S (1 - e_dt / e_TR)` per compartment, `S` its signal and `T1` its own; nothing in the
+    /// slices before; a still head gets nothing. The relative correction does not depend on the
+    /// diffusion signal, and the dropped shot's attenuation scales its correction.
+    #[test]
+    fn spin_history_meets_the_closed_form_per_compartment() {
+        let (nx, ny, nz, ngrad) = (4usize, 4usize, 8usize, 3usize);
+        let mut v2w = IDENTITY_MATRIX;
+        v2w[2][2] = 2.0;
+        let grid = mrsim_acq::grid::Grid { dims: [nx, ny, nz], voxel_to_world: v2w };
+        let nvox = nx * ny * nz;
+        let tr = 4.0;
+        let t1 = [0.9, 1.6];
+        // compartment signals per volume (a b=0 and two diffusion-weighted volumes)
+        let sig = [[1.0f32, 0.6, 0.3], [0.5, 0.45, 0.4]];
+        let mk = || -> Vec<Vec<f32>> { (0..2).map(|c| (0..nvox * ngrad).map(|i| sig[c][i % ngrad]).collect()).collect() };
+        let offsets = shot_offsets(nz, 1, SliceOrder::Sequential, tr);
+        let jump = MotionEvent { volume: 1, shot: 3, severity: 0.0, jump_mm: [0.0, 0.0, 0.5], jump_deg: [0.0; 3] };
+        let still = ShotPlan::new(&offsets, ngrad, tr, None, Vec::new(), &grid);
+        let corr = spin_history_corrections(&mk(), &grid, ngrad, &t1, tr, &still).unwrap();
+        assert!(corr.iter().flatten().all(|x| x.abs() < 1e-6), "a still head");
+        let plan = ShotPlan::new(&offsets, ngrad, tr, None, vec![jump], &grid);
+        let corr = spin_history_corrections(&mk(), &grid, ngrad, &t1, tr, &plan).unwrap();
+        let dt = tr / nz as f64;
+        let at = |c: usize, x: usize, y: usize, z: usize, v: usize| corr[c][(x + nx * (y + ny * z)) * ngrad + v] as f64;
+        for c in 0..2 {
+            let (e_tr, e_dt) = (1.0 - (-tr / t1[c]).exp(), 1.0 - (-dt / t1[c]).exp());
+            let want = -0.25 * (1.0 - e_dt / e_tr);
+            for (x, y) in [(0, 0), (2, 1), (3, 3)] {
+                assert!((at(c, x, y, 3, 1) / sig[c][1] as f64 - want).abs() < 1e-5, "compartment {c}: {} vs {want}", at(c, x, y, 3, 1) / sig[c][1] as f64);
+                for z in 0..3 {
+                    assert!(at(c, x, y, z, 1).abs() < 1e-7, "slice {z} before the jump");
+                }
+            }
+        }
+        // b-value independence: the same events with every volume's signal scaled gives the same
+        // relative correction
+        let scaled: Vec<Vec<f32>> = mk().into_iter().map(|c| c.into_iter().map(|x| x * 0.37).collect()).collect();
+        let corr2 = spin_history_corrections(&scaled, &grid, ngrad, &t1, tr, &plan).unwrap();
+        for c in 0..2 {
+            for i in 0..nvox * ngrad {
+                assert!((corr2[c][i] - 0.37 * corr[c][i]).abs() <= 1e-6, "{c} {i}");
+            }
+        }
+        // applied: the correction is added at the shot's slices, times its attenuation
+        let ev = MotionEvent { severity: 0.5, ..jump };
+        let plan = ShotPlan::new(&offsets, ngrad, tr, None, vec![ev], &grid);
+        let bvals = [0.0, 1000.0, 2000.0];
+        let mut img = mk();
+        let (dropped, sum) = apply_shot_motion_with_spin_history(&mut img, &grid, ngrad, &plan, &bvals, 2000.0, &t1, tr).unwrap();
+        assert_eq!(dropped.len(), 1);
+        let i = (1 + nx * (1 + ny * 3)) * ngrad + 1;
+        let att = 1.0 - 0.5 * (1000.0 / 2000.0);
+        assert!((sum[i] as f64 - (corr[0][i] + corr[1][i]) as f64).abs() < 1e-6);
+        let base = mk();
+        let mut moved = base.clone();
+        apply_shot_motion(&mut moved, grid.dims, ngrad, v2w, &plan, None, &bvals, 2000.0);
+        for c in 0..2 {
+            assert!((img[c][i] - (moved[c][i] + corr[c][i] * att as f32)).abs() < 1e-6);
+        }
+        assert!(spin_history_corrections(&mk(), &grid, ngrad, &[1.0], tr, &plan).unwrap_err().contains("one T1 per compartment"));
     }
 
     /// The law is main's formula, bit for bit: `1 − severity·(b/b_max)` in `f32`, b < 50 and

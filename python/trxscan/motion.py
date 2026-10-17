@@ -35,11 +35,19 @@ class ShotEvents:
     ``jump_mm``, ``jump_deg``) or the path of an events TSV (``Simulation.motion_events``, or
     aslscan's ``desc-motionEvents_gt.tsv``). A dropped shot is attenuated
     ``1 - severity * b / b_max``; the jump persists to the end of its volume.
+
+    ``spin_history`` adds the tissue's spin history (P9): tissue carried through the slice
+    direction into a slice not yet excited is excited twice and is dark the second time; carried
+    out of one it is skipped and is bright in the next volume. It needs ``Protocol.t1_s`` and
+    ``Protocol.tr_s``, the whole slice stack (no ``chunk``, ``slices`` or ``z_mm``), no
+    ``Protocol.head``, and events that jump or an ``Artifacts.motion``. The correction is
+    :attr:`Simulation.spin_history`.
     """
 
     slice_order: SliceOrder = "interleaved"
     rate: float = 0.0
     events: Any = None
+    spin_history: bool = False
 
     def __post_init__(self) -> None:
         if self.slice_order not in ("interleaved", "sequential", "descending", "odd-first", "protocol"):

@@ -95,6 +95,8 @@ def write_bids(sim: "Simulation", prefix: str | Path) -> list[Path]:
         p("_desc-gnl_invdisp.json").write_text(_json({"Description": "Inverse gradient-nonlinearity displacement phi^-1(x) - x at each voxel centre x, three volumes = RAS x,y,z in mm (true minus apparent position). Resample images through it to pull apparent <- true."}))
     if sim.dropout:
         p("_desc-dropout_slices.tsv").write_text(sim.dropout_table())
+    if sim.spin_history is not None:
+        nib.save(sim.spin_history, p("_desc-spinHistory.nii.gz"))
     if sim.motion_events is not None:
         p("_desc-motionEvents.tsv").write_text(sim.motion_events)
     if sim.gre is not None:
@@ -619,7 +621,7 @@ class Dataset:
 
     def _add_truth(self, sim: "Simulation", sub: str, ses: str | None, ent: dict[str, Any], suffix: str) -> list[Path]:
         has_field = sim.fieldmap is not None and bool(np.any(np.asanyarray(sim.fieldmap.dataobj)))
-        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout and sim.motion_events is None and sim.clean_b0 is None and not has_field:
+        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout and sim.motion_events is None and sim.spin_history is None and sim.clean_b0 is None and not has_field:
             return []
         out_dir = self.folder(sub, ses, "dwi", derivative=True)
         written: list[Path] = []
@@ -660,6 +662,8 @@ class Dataset:
             })
         if sim.dropout:
             put("dropout", text=sim.dropout_table(), ext=".tsv", meta={"Description": "Multiband shots dropped by within-volume motion: volume, shot, slices, attenuation."})
+        if sim.spin_history is not None:
+            put("spinHistory", sim.spin_history, {"Description": "The spin-history correction added to the tissue (ShotEvents(spin_history=True)): the compartments' longitudinal magnetization at each excitation minus the closed form 1 - exp(-TR/T1), weighted by their signal, summed over compartments; per volume, in signal units; zero means no effect. Box slice profile, voxel tilt ignored."})
         if sim.motion_events is not None:
             put("motionEvents", text=sim.motion_events, ext=".tsv", meta={"Description": "Within-volume events (ShotEvents): volume, shot, slices, attenuation = 1 - severity before the b-value scaling, jumps in mm and radians; read back with trxscan._core.load_motion_events or ShotEvents(events=path)."})
         return written

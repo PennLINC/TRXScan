@@ -100,3 +100,40 @@ def test_shot_events_on_slabs_use_the_full_stack(gtab6):
     b = np.asarray(chunked.magnitude.dataobj, dtype=float)
     assert np.allclose(a, b, rtol=1e-5, atol=1e-6 * a.max())
     assert not np.allclose(a[..., 5, 2], _shot_run(gtab6, None, nz=12).magnitude.dataobj[..., 5, 2]), "the jump moves slice 5"
+
+
+def test_spin_history_refusals(gtab6):
+    box = ts.objects.box(8, matrix=16, nz=6)
+    ev = [{"volume": 1, "shot": 2, "severity": 0.0, "jump_mm": (0.0, 0.0, 0.5), "jump_deg": (0.0, 0.0, 0.0)}]
+    art = ts.Artifacts(shot_events=ts.ShotEvents(slice_order="sequential", events=ev, spin_history=True))
+    with pytest.raises(ValueError, match="t1_s"):
+        box.simulate(gtab6, ts.Protocol.DEFAULT, art, kspace=False, clean_b0=False)
+    proto = ts.Protocol.DEFAULT.replace(t1_s=(0.8, 1.3, 4.0), tr_s=4.0)
+    with pytest.raises(ValueError, match="whole slice stack"):
+        box.simulate(gtab6, proto, art, kspace=False, clean_b0=False, chunk=2)
+    still = ts.Artifacts(shot_events=ts.ShotEvents(slice_order="sequential", events=[{**ev[0], "jump_mm": (0.0, 0.0, 0.0)}], spin_history=True))
+    with pytest.raises(ValueError, match="history of"):
+        box.simulate(gtab6, proto, still, kspace=False, clean_b0=False)
+
+
+def test_spin_history_is_signal_weighted_and_independent_of_b(gtab6):
+    from dipy.core.gradients import gradient_table
+
+    box = ts.objects.box(8, matrix=16, nz=8)
+    proto = ts.Protocol.DEFAULT.replace(t1_s=(0.8, 1.3, 4.0), tr_s=4.0)
+    ev = [{"volume": 1, "shot": 3, "severity": 0.0, "jump_mm": (0.0, 0.0, 0.5), "jump_deg": (0.0, 0.0, 0.0)}]
+    art = ts.Artifacts(shot_events=ts.ShotEvents(slice_order="sequential", events=ev, spin_history=True))
+    half = gradient_table(gtab6.bvals * 0.5, bvecs=gtab6.bvecs)
+
+    def rel(gtab):
+        sim = box.simulate(gtab, proto, art, kspace=False, clean_b0=False)
+        clean = box.simulate(gtab, proto, ts.Artifacts(), kspace=False, clean_b0=False)
+        sh = np.asarray(sim.spin_history.dataobj, dtype=float)
+        mag = np.asarray(clean.magnitude.dataobj, dtype=float)
+        m = mag[..., 3, 1] > 0.2 * mag[..., 3, 1].max()
+        assert np.abs(sh[..., :3, 1]).max() < 1e-6 * np.abs(sh).max(), "nothing before the event shot"
+        return np.median(sh[..., 3, 1][m] / mag[..., 3, 1][m])
+
+    a, b = rel(gtab6), rel(half)
+    assert a < 0, "the event slice is darker"
+    assert abs(a - b) <= 1e-4 * abs(a), f"{a} vs {b}"

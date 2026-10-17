@@ -649,6 +649,46 @@ impl Compartments {
         }
         Ok(out)
     }
+    /// [`apply_shot_motion`] with spin history (P9 part C3), on the whole slice stack: returns the
+    /// dropped-shot dicts and the correction summed over compartments (flat, voxel-major
+    /// interleaved, this grid). `t1_s` one per compartment (seconds); `tr` the repetition.
+    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn apply_shot_motion_spin_history<'py>(
+        &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64, t1_s: Vec<f64>,
+        bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>, volume_poses: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<f32>>)> {
+        let v2w = affine4(&affine)?;
+        let bvals = f64s(&bvals)?;
+        let events = events_from(events)?;
+        let poses: Option<Vec<Pose>> = volume_poses.map(|a| {
+            a.as_array().rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect()
+        });
+        let mut g = self.lock()?;
+        check_len("bvals", bvals.len(), g.ngrad)?;
+        let (dims, ngrad) = (g.dims, g.ngrad);
+        check_len("offsets", offsets.len(), dims[2])?;
+        let grid = Grid { dims, voxel_to_world: v2w };
+        let n_shots = motion::slice_schedule_from_times(&offsets).len();
+        if let Some(bad) = events.iter().find(|e| e.volume >= ngrad || e.shot >= n_shots) {
+            return Err(verr(format!("event at volume {}, shot {} is outside {ngrad} volumes of {n_shots} shots", bad.volume, bad.shot)));
+        }
+        let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &grid);
+        let c: &mut comp::Compartments = &mut g;
+        let (dropped, sum) = py.detach(|| motion::apply_shot_motion_with_spin_history(
+            &mut c.images, &grid, ngrad, &plan, &bvals, b_max, &t1_s, tr,
+        )).map_err(verr)?;
+        let out = PyList::empty(py);
+        for d in dropped {
+            let e = PyDict::new(py);
+            e.set_item("volume", d.volume)?;
+            e.set_item("shot", d.shot)?;
+            e.set_item("slices", d.slices)?;
+            e.set_item("attenuation", d.attenuation as f64)?;
+            out.append(e)?;
+        }
+        Ok((out, PyArray1::from_vec(py, sum)))
+    }
     /// A new `Compartments` holding only the given local slices, in that order.
     fn select_slices(&self, slices: Vec<usize>) -> PyResult<Compartments> {
         let g = self.lock()?;
