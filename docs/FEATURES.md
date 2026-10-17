@@ -59,9 +59,9 @@ future work.
   weighted by the compartment's signal, after the geometry; a still head is unchanged. It needs a
   `T1` per compartment and the repetition time, and the whole slice stack.
 - *Still not modeled:* real slice profiles and slice gaps (cross-talk without motion), the voxel's
-  tilt under rotation inside the box overlap, spin history of the head compartments
-  (`Protocol.head` is refused), and, under the re-simulation path, undoing the volume pose when the
-  spin-history weights are read from the re-simulated images.
+  tilt under rotation inside the box overlap, and spin history of the head compartments
+  (`Protocol.head` is refused). Under the re-simulation path the spin-history weights are read
+  from the re-simulated images moved back by each volume's pose (trilinear), into the head frame.
 
 ## 2. GRAPPA (parallel imaging)
 

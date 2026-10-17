@@ -107,8 +107,9 @@ pub fn apply_multiband_motion_slab(
 /// weight is the compartment's signal over the reference magnetization, so the correction is in
 /// signal units, weighted by the signal actually there.
 ///
-/// Under the re-simulation path (`plan` built with volume poses) the weights are read from the
-/// re-simulated images without undoing the volume pose, an approximation at tissue edges.
+/// Under the re-simulation path (`plan` built with volume poses) the images already sit at each
+/// volume's pose, so the weights are read from them moved back by its inverse (trilinear), into
+/// the head frame the engine's history is kept in.
 pub fn spin_history_corrections(images: &[Vec<f32>], grid: &mrsim_acq::grid::Grid, ngrad: usize, t1_s: &[f64], tr_s: f64,
                                 plan: &ShotPlan) -> Result<Vec<Vec<f32>>, String> {
     use mrsim_acq::spin_history::{Slabs, Source, SpinHistory, NO_CLASS};
@@ -124,9 +125,19 @@ pub fn spin_history_corrections(images: &[Vec<f32>], grid: &mrsim_acq::grid::Gri
     let [nx, ny, nz] = grid.dims;
     let (nvox, slab) = (nx * ny * nz, nx * ny);
     let mut out = Vec::with_capacity(images.len());
+    let all: Vec<usize> = (0..nz).collect();
+    let nv = ngrad.min(plan.times.len());
     for (img, &t1) in images.iter().zip(t1_s) {
         let r = 1.0 - (-tr_s / t1).exp();
-        let class: Vec<u8> = (0..nvox).map(|i| if (0..ngrad).any(|g| img[i * ngrad + g] != 0.0) { 0 } else { NO_CLASS }).collect();
+        // each volume's signal in the head frame (re-simulated images carry their volume pose)
+        let head: Vec<Vec<f32>> = (0..nv).map(|v| {
+            let vol: Vec<f32> = (0..nvox).map(|i| img[i * ngrad + v]).collect();
+            match plan.volume.get(v) {
+                Some(p) if *p != IDENTITY_MATRIX => resample_slices_by_matrix(&vol, grid.dims, grid.voxel_to_world, rigid_inverse(p), &all),
+                _ => vol,
+            }
+        }).collect();
+        let class: Vec<u8> = (0..nvox).map(|i| if head.iter().any(|h| h[i] != 0.0) { 0 } else { NO_CLASS }).collect();
         let t1v = vec![t1 as f32; nvox];
         let zeros = vec![0.0f32; nvox];
         let mut h = SpinHistory::new(
@@ -138,8 +149,8 @@ pub fn spin_history_corrections(images: &[Vec<f32>], grid: &mrsim_acq::grid::Gri
         h.prime(&prime, plan.history[0][0]);
         let mut corr = vec![0.0f32; nvox * ngrad];
         let reference = move |t1: f64| 1.0 - (-tr_s / t1).exp();
-        for v in 0..ngrad.min(plan.times.len()) {
-            let weight: Vec<f32> = (0..nvox).map(|i| (img[i * ngrad + v] as f64 / r) as f32).collect();
+        for (v, hv) in head.iter().enumerate() {
+            let weight: Vec<f32> = hv.iter().map(|x| (*x as f64 / r) as f32).collect();
             for (s, slices) in plan.schedule.iter().enumerate() {
                 for term in h.excite(plan.times[v][s], plan.history[v][s], slices, &reference, Some(&weight)) {
                     for (cell, x) in term.num[0].iter().enumerate() {
@@ -208,9 +219,13 @@ pub enum SliceOrder {
 /// `mb` in `order`: the shots are spread evenly, shot `s` at `s * tr_s / n_shots`, every slice of a
 /// shot sharing its time. `Interleaved` and `Sequential` give the shots of
 /// [`slice_schedule`]`(nz, mb, ..)` in the same order (through [`slice_schedule_from_times`]).
-pub fn shot_offsets(nz: usize, mb: usize, order: SliceOrder, tr_s: f64) -> Vec<f64> {
+/// `nz` must be a multiple of `mb`: every shot excites exactly `mb` slices.
+pub fn shot_offsets(nz: usize, mb: usize, order: SliceOrder, tr_s: f64) -> Result<Vec<f64>, String> {
     let mb = mb.max(1);
-    let n_groups = (nz / mb).max(1);
+    if nz == 0 || nz % mb != 0 {
+        return Err(format!("{nz} slices are not a multiple of the multiband factor {mb}: a shot would excite a different number of slices"));
+    }
+    let n_groups = nz / mb;
     let groups: Vec<usize> = match order {
         SliceOrder::Sequential => (0..n_groups).collect(),
         SliceOrder::Descending => (0..n_groups).rev().collect(),
@@ -226,7 +241,7 @@ pub fn shot_offsets(nz: usize, mb: usize, order: SliceOrder, tr_s: f64) -> Vec<f
             }
         }
     }
-    offsets
+    Ok(offsets)
 }
 
 /// The shots of a run (full slice stack): the schedule, each shot's time, and per shot two
@@ -242,7 +257,22 @@ pub struct ShotPlan {
     pub times: Vec<Vec<f64>>,
     pub geometry: Vec<Vec<[[f64; 4]; 4]>>,
     pub history: Vec<Vec<[[f64; 4]; 4]>>,
+    /// `[volume]`: the volume pose `P` (the identity without volume poses), which re-simulated
+    /// images already carry.
+    pub volume: Vec<[[f64; 4]; 4]>,
     pub events: Vec<MotionEvent>,
+}
+
+/// The inverse of a rigid world-space transform: `[R^T | -R^T t]`.
+fn rigid_inverse(m: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+    let mut out = IDENTITY_MATRIX;
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[j][i];
+        }
+        out[i][3] = -(0..3).map(|k| m[k][i] * m[k][3]).sum::<f64>();
+    }
+    out
 }
 
 fn matmul4(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
@@ -267,9 +297,11 @@ impl ShotPlan {
         let mut times = vec![vec![0.0; n_shots]; n_volumes];
         let mut geometry = vec![vec![IDENTITY_MATRIX; n_shots]; n_volumes];
         let mut history = vec![vec![IDENTITY_MATRIX; n_shots]; n_volumes];
+        let mut volume = vec![IDENTITY_MATRIX; n_volumes];
         for v in 0..n_volumes {
             let mut cum = Pose::IDENTITY;
             let pm = mat(volume_poses.and_then(|p| p.get(v).copied()).unwrap_or(Pose::IDENTITY));
+            volume[v] = pm;
             for (s, slices) in schedule.iter().enumerate() {
                 for e in events.iter().filter(|e| e.volume == v && e.shot == s) {
                     for i in 0..3 {
@@ -283,7 +315,7 @@ impl ShotPlan {
                 history[v][s] = if pm == IDENTITY_MATRIX { jm } else if jm == IDENTITY_MATRIX { pm } else { matmul4(&jm, &pm) };
             }
         }
-        ShotPlan { schedule, times, geometry, history, events }
+        ShotPlan { schedule, times, geometry, history, volume, events }
     }
 }
 
@@ -403,7 +435,7 @@ mod tests {
     #[test]
     fn slice_orders_give_their_schedules() {
         for (nz, mb) in [(12usize, 1usize), (12, 2), (12, 3), (9, 3)] {
-            let sched = |o: SliceOrder| slice_schedule_from_times(&shot_offsets(nz, mb, o, 2.0));
+            let sched = |o: SliceOrder| slice_schedule_from_times(&shot_offsets(nz, mb, o, 2.0).unwrap());
             assert_eq!(sched(SliceOrder::Interleaved), slice_schedule(nz, mb, true), "nz {nz} mb {mb}");
             assert_eq!(sched(SliceOrder::Sequential), slice_schedule(nz, mb, false));
             let mut rev = slice_schedule(nz, mb, false);
@@ -412,7 +444,7 @@ mod tests {
             let odd: Vec<Vec<usize>> = sched(SliceOrder::OddFirst);
             assert_eq!(odd[0][0], 1, "odd-first starts with group 1");
         }
-        let o = shot_offsets(6, 1, SliceOrder::Sequential, 3.0);
+        let o = shot_offsets(6, 1, SliceOrder::Sequential, 3.0).unwrap();
         assert!((o[5] - 2.5).abs() < 1e-12, "shots spread evenly over the repetition");
     }
 
@@ -462,7 +494,7 @@ mod tests {
         ];
         let mut old = mk();
         let gt_old = apply_multiband_motion(&mut old, [nx, ny, nz], ngrad, v2w, 2, true, &bvals, 2000.0, &events);
-        let plan = ShotPlan::new(&shot_offsets(nz, 2, SliceOrder::Interleaved, 3.0), ngrad, 3.0, None, events.clone(), &grid);
+        let plan = ShotPlan::new(&shot_offsets(nz, 2, SliceOrder::Interleaved, 3.0).unwrap(), ngrad, 3.0, None, events.clone(), &grid);
         let mut new = mk();
         let gt_new = apply_shot_motion(&mut new, [nx, ny, nz], ngrad, v2w, &plan, None, &bvals, 2000.0);
         let peak = mk()[0].iter().fold(0.0f32, |m, x| m.max(*x));
@@ -474,7 +506,7 @@ mod tests {
             assert_eq!((a.volume, a.shot, &a.slices, a.attenuation.to_bits()), (b.volume, b.shot, &b.slices, b.attenuation.to_bits()));
         }
         // single band: one slice per event
-        let plan1 = ShotPlan::new(&shot_offsets(nz, 1, SliceOrder::Sequential, 3.0), ngrad, 3.0, None, events, &grid);
+        let plan1 = ShotPlan::new(&shot_offsets(nz, 1, SliceOrder::Sequential, 3.0).unwrap(), ngrad, 3.0, None, events, &grid);
         let mut img = mk();
         let gt1 = apply_shot_motion(&mut img, [nx, ny, nz], ngrad, v2w, &plan1, None, &bvals, 2000.0);
         assert!(gt1.iter().all(|d| d.slices.len() == 1));
@@ -486,7 +518,7 @@ mod tests {
         let grid = mrsim_acq::grid::Grid { dims: [4, 4, 4], voxel_to_world: IDENTITY_MATRIX };
         let p = Pose { rot_deg: [0.0, 2.0, 0.0], trans_mm: [0.0, 0.0, 1.0] };
         let e = MotionEvent { volume: 0, shot: 1, severity: 0.0, jump_mm: [0.0, 0.0, 0.5], jump_deg: [0.0; 3] };
-        let plan = ShotPlan::new(&shot_offsets(4, 1, SliceOrder::Sequential, 2.0), 1, 2.0, Some(&[p]), vec![e], &grid);
+        let plan = ShotPlan::new(&shot_offsets(4, 1, SliceOrder::Sequential, 2.0).unwrap(), 1, 2.0, Some(&[p]), vec![e], &grid);
         let c = fov_center(grid.dims, grid.voxel_to_world);
         let j = Pose { rot_deg: [0.0; 3], trans_mm: [0.0, 0.0, 0.5] };
         assert_eq!(plan.geometry[0][0], IDENTITY_MATRIX);
@@ -513,7 +545,7 @@ mod tests {
         // compartment signals per volume (a b=0 and two diffusion-weighted volumes)
         let sig = [[1.0f32, 0.6, 0.3], [0.5, 0.45, 0.4]];
         let mk = || -> Vec<Vec<f32>> { (0..2).map(|c| (0..nvox * ngrad).map(|i| sig[c][i % ngrad]).collect()).collect() };
-        let offsets = shot_offsets(nz, 1, SliceOrder::Sequential, tr);
+        let offsets = shot_offsets(nz, 1, SliceOrder::Sequential, tr).unwrap();
         let jump = MotionEvent { volume: 1, shot: 3, severity: 0.0, jump_mm: [0.0, 0.0, 0.5], jump_deg: [0.0; 3] };
         let still = ShotPlan::new(&offsets, ngrad, tr, None, Vec::new(), &grid);
         let corr = spin_history_corrections(&mk(), &grid, ngrad, &t1, tr, &still).unwrap();
@@ -558,6 +590,28 @@ mod tests {
             assert!((img[c][i] - (moved[c][i] + corr[c][i] * att as f32)).abs() < 1e-6);
         }
         assert!(spin_history_corrections(&mk(), &grid, ngrad, &[1.0], tr, &plan).unwrap_err().contains("one T1 per compartment"));
+    }
+
+    /// Review fix: on the re-simulation path the images already carry the volume pose, so the
+    /// weights are read back in the head frame and the correction lands on the tissue: signal at
+    /// scanner x = 4 under a +2 mm x volume pose is corrected at x = 4, nothing at x = 6.
+    #[test]
+    fn spin_history_weights_undo_the_volume_pose() {
+        let (nx, ny, nz, ngrad) = (10usize, 2usize, 8usize, 2usize);
+        let mut v2w = IDENTITY_MATRIX;
+        v2w[2][2] = 2.0;
+        let grid = mrsim_acq::grid::Grid { dims: [nx, ny, nz], voxel_to_world: v2w };
+        let nvox = nx * ny * nz;
+        let img: Vec<f32> = (0..nvox * ngrad).map(|i| if (i / ngrad) % nx == 4 { 1.0 } else { 0.0 }).collect();
+        let poses = [Pose { trans_mm: [2.0, 0.0, 0.0], ..Pose::IDENTITY }; 2];
+        let jump = MotionEvent { volume: 1, shot: 3, severity: 0.0, jump_mm: [0.0, 0.0, 0.5], jump_deg: [0.0; 3] };
+        let offsets = shot_offsets(nz, 1, SliceOrder::Sequential, 4.0).unwrap();
+        let plan = ShotPlan::new(&offsets, ngrad, 4.0, Some(&poses), vec![jump], &grid);
+        let corr = spin_history_corrections(&[img], &grid, ngrad, &[1.33], 4.0, &plan).unwrap();
+        let at = |x: usize, z: usize| corr[0][(x + nx * ny * z) * ngrad + 1];
+        assert!(at(4, 3) < -1e-3, "the tissue at x = 4 is corrected: {}", at(4, 3));
+        assert!(at(6, 3).abs() < 1e-7 && at(2, 3).abs() < 1e-7, "nothing where there is no tissue: {} {}", at(6, 3), at(2, 3));
+        assert!(shot_offsets(5, 2, SliceOrder::Sequential, 3.0).is_err(), "5 slices at multiband 2");
     }
 
     /// The law is main's formula, bit for bit: `1 − severity·(b/b_max)` in `f32`, b < 50 and

@@ -630,9 +630,7 @@ impl Compartments {
         }
         let full = Grid { dims: [dims[0], dims[1], nz_full], voxel_to_world: full_v2w };
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
-        if let Some(bad) = events.iter().find(|e| e.volume >= ngrad || e.shot >= n_shots) {
-            return Err(verr(format!("event at volume {}, shot {} is outside {ngrad} volumes of {n_shots} shots", bad.volume, bad.shot)));
-        }
+        check_events(&events, ngrad, n_shots)?;
         let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &full);
         let c: &mut comp::Compartments = &mut g;
         let dropped = py.detach(|| motion::apply_shot_motion(
@@ -670,9 +668,7 @@ impl Compartments {
         check_len("offsets", offsets.len(), dims[2])?;
         let grid = Grid { dims, voxel_to_world: v2w };
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
-        if let Some(bad) = events.iter().find(|e| e.volume >= ngrad || e.shot >= n_shots) {
-            return Err(verr(format!("event at volume {}, shot {} is outside {ngrad} volumes of {n_shots} shots", bad.volume, bad.shot)));
-        }
+        check_events(&events, ngrad, n_shots)?;
         let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &grid);
         let c: &mut comp::Compartments = &mut g;
         let (dropped, sum) = py.detach(|| motion::apply_shot_motion_with_spin_history(
@@ -959,6 +955,27 @@ fn dropout_events<'py>(py: Python<'py>, bvals: PyReadonlyArray1<'_, f64>, n_shot
     events_to_py(py, &motion::dropout_events(&bvals, n_shots, rate, seed))
 }
 
+/// Explicit events, checked as `load_motion_events` checks a file (P9): volume and shot in range,
+/// severity in `[0, 1]`, finite jumps, one event per volume and shot, so a run's events table
+/// always replays it.
+fn check_events(events: &[MotionEvent], ngrad: usize, n_shots: usize) -> PyResult<()> {
+    for (i, e) in events.iter().enumerate() {
+        if e.volume >= ngrad || e.shot >= n_shots {
+            return Err(verr(format!("event {i} at volume {}, shot {} is outside {ngrad} volumes of {n_shots} shots", e.volume, e.shot)));
+        }
+        if !(0.0..=1.0).contains(&e.severity) {
+            return Err(verr(format!("event {i}: severity {} is not in [0, 1]", e.severity)));
+        }
+        if !e.jump_mm.iter().chain(&e.jump_deg).all(|x| x.is_finite()) {
+            return Err(verr(format!("event {i}: a jump is not finite")));
+        }
+        if events[..i].iter().any(|f| f.volume == e.volume && f.shot == e.shot) {
+            return Err(verr(format!("event {i}: a second event for volume {}, shot {}", e.volume, e.shot)));
+        }
+    }
+    Ok(())
+}
+
 fn slice_order_from(name: &str) -> PyResult<motion::SliceOrder> {
     Ok(match name {
         "interleaved" => motion::SliceOrder::Interleaved,
@@ -973,7 +990,7 @@ fn slice_order_from(name: &str) -> PyResult<motion::SliceOrder> {
 /// `order` one of `"interleaved"`, `"sequential"`, `"descending"`, `"odd-first"`).
 #[pyfunction]
 fn shot_offsets(nz: usize, mb: usize, order: &str, tr: f64) -> PyResult<Vec<f64>> {
-    Ok(motion::shot_offsets(nz, mb, slice_order_from(order)?, tr))
+    motion::shot_offsets(nz, mb, slice_order_from(order)?, tr).map_err(verr)
 }
 
 /// The shots a set of per-slice offsets describes (slices with equal offsets together, in

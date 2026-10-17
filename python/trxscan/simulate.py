@@ -436,11 +436,13 @@ def run(
     dropped: list[DroppedShot] = []
     motion_events: str | None = None
     spin_corr = None
+    shot_offsets_used = None
     if artifacts.shot_events is not None:
         # P9: per-shot motion on the full stack's shots, any slice order, single band too
         se = artifacts.shot_events
         tr = float(protocol.tr_s) if protocol.tr_s is not None else 1.0
         offsets = se.offsets(nz_full, int(protocol.mb), tr, protocol)
+        shot_offsets_used = offsets
         schedule = _core.slice_schedule_from_times(offsets)
         n_shots = len(schedule)
         if se.events is None:
@@ -576,6 +578,9 @@ def run(
     # EffectiveEchoSpacing follows the CLI: TotalReadoutTime / (n_PE - 1) along the WRITTEN PE axis.
     pe_axis = {"i": 0, "j": 1, "k": 2}[ped[0]]
     sidecar["EffectiveEchoSpacing"] = round(sidecar["TotalReadoutTime"] / max(out_dims[pe_axis] - 1, 1), 8)
+    if shot_offsets_used is not None and protocol.tr_s is not None:
+        # ShotEvents set the excitation order: the sidecar states the clock the shots used
+        sidecar["SliceTiming"] = [float(t) for t in shot_offsets_used]
     if "SliceTiming" in sidecar:
         # the written image holds `global_z` of the full volume's slices
         sidecar["SliceTiming"] = [sidecar["SliceTiming"][z] for z in global_z]

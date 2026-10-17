@@ -137,3 +137,14 @@ def test_spin_history_is_signal_weighted_and_independent_of_b(gtab6):
     a, b = rel(gtab6), rel(half)
     assert a < 0, "the event slice is darker"
     assert abs(a - b) <= 1e-4 * abs(a), f"{a} vs {b}"
+
+
+def test_shot_events_refuse_duplicates_and_state_their_timing(gtab6):
+    e = {"volume": 1, "shot": 2, "severity": 0.5, "jump_mm": (0.0, 0.0, 0.0), "jump_deg": (0.0, 0.0, 0.0)}
+    with pytest.raises(ValueError, match="second event"):
+        _shot_run(gtab6, [e, e])
+    box = ts.objects.box(8, matrix=16, nz=6)
+    proto = ts.Protocol.DEFAULT.replace(tr_s=3.0)
+    sim = box.simulate(gtab6, proto, ts.Artifacts(shot_events=ts.ShotEvents(slice_order="sequential", events=[e])),
+                       kspace=False, clean_b0=False)
+    assert sim.sidecar["SliceTiming"] == pytest.approx([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
