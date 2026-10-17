@@ -192,7 +192,7 @@ struct Cli {
     #[arg(long, requires_all = ["t1", "tr"])]
     spin_history: bool,
     /// Longitudinal relaxation time (s) of each compartment, "WM,GM,CSF", for --spin-history
-    #[arg(long, value_delimiter = ',', num_args = 3, value_name = "WM,GM,CSF")]
+    #[arg(long, value_delimiter = ',', value_name = "WM,GM,CSF")]
     t1: Option<Vec<f64>>,
 
     /// SIFT2 weights: a TRX data-per-streamline array name, or an MRtrix tcksift2 text file
