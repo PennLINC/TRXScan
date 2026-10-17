@@ -44,6 +44,25 @@ looped. So motion can only change between volumes.
 excitations (slice cross-talk) is a Bloch-level problem, not geometric, and much harder. Flag it as
 future work.
 
+**Since then (P9, shared with aslscan through mrsim-acq).**
+
+- *Per-shot motion* (`motion::ShotPlan`, `motion::apply_shot_motion`): a shot is the slices excited
+  together, from per-slice offsets (any order: `--slice-order`, or a protocol's `SliceTiming`), so
+  single-band runs have within-volume events too. Each shot is resampled once by its transform,
+  about the whole stack's centre (slabs match the full run). Events can come from a file
+  (`--motion-events`, `ShotEvents(events=...)`) in aslscan's `desc-motionEvents_gt.tsv` format, and a
+  run writes its own as `<out>_desc-motionEvents.tsv` to replay it.
+- *Spin history* (`--spin-history`, `ShotEvents(spin_history=True)`): the longitudinal
+  magnetization of each compartment is stepped through every slice excitation at the shot's pose
+  (`mrsim_acq::spin_history`: a box slice profile as thick as the slice spacing, each voxel's z
+  extent kept as exact pieces), and the difference from the closed form `1 - exp(-TR/T1)` is added,
+  weighted by the compartment's signal, after the geometry; a still head is unchanged. It needs a
+  `T1` per compartment and the repetition time, and the whole slice stack.
+- *Still not modeled:* real slice profiles and slice gaps (cross-talk without motion), the voxel's
+  tilt under rotation inside the box overlap, and spin history of the head compartments
+  (`Protocol.head` is refused). Under the re-simulation path the spin-history weights are read
+  from the re-simulated images moved back by each volume's pose (trilinear), into the head frame.
+
 ## 2. GRAPPA (parallel imaging)
 
 **What the ported model already provides.** Fiberfox synthesizes a **per-coil complex forward model** — the coil loop

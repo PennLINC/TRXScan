@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .motion import Motion
+from .motion import Motion, ShotEvents
 
 Window = str | tuple[str, float] | tuple[str, float, float] | None
 
@@ -70,7 +70,9 @@ class Artifacts:
 
     Signal stage: ``motion`` (a :class:`~trxscan.motion.Motion`; the faithful per-volume
     re-simulation), ``dropout`` (within-volume multiband dropout probability per DWI volume;
-    needs ``Protocol.mb > 1``), ``gnl`` (gradient nonlinearity: ``"whole-body-80"``,
+    needs ``Protocol.mb > 1``), ``shot_events`` (a :class:`~trxscan.motion.ShotEvents`:
+    per-shot motion and dropout in any slice order, single band too, from a rate or an events
+    file; exclusive with ``dropout``), ``gnl`` (gradient nonlinearity: ``"whole-body-80"``,
     ``"connectom-300"``, the path of a Siemens ``.grad`` file, or its text) with
     ``gnl_scale``/``gnl_warp``/``gnl_encoding``/``gnl_jacobian`` and ``isocenter`` (world mm).
 
@@ -95,6 +97,7 @@ class Artifacts:
     relaxation: bool = True
     motion: Motion | None = None
     dropout: float = 0.0
+    shot_events: ShotEvents | None = None
     gnl: str | None = None
     gnl_scale: float = 1.0
     gnl_warp: bool = True
@@ -110,6 +113,11 @@ class Artifacts:
             raise TypeError("motion must be a trxscan.Motion (see Motion.from_confounds, Motion.random, ...)")
         if not 0.0 <= self.dropout <= 1.0:
             raise ValueError("dropout is a probability in [0, 1]")
+        if self.shot_events is not None:
+            if not isinstance(self.shot_events, ShotEvents):
+                raise TypeError("shot_events must be a trxscan.ShotEvents")
+            if self.dropout > 0.0:
+                raise ValueError("give dropout or shot_events, not both (ShotEvents(rate=...) is the per-shot dropout)")
         if not -1.0 < self.receive_bias < 1.0:
             raise ValueError("receive_bias must be in (-1, 1)")
         if self.window is not None and not isinstance(self.window, (str, tuple)):
@@ -158,4 +166,5 @@ class Artifacts:
     def needs_context(self) -> bool:
         """Whether this spec pulls signal from neighbouring slices (motion, dropout jumps, GNL
         warp), so a slice simulation needs a slab of context around it."""
-        return self.motion is not None or self.dropout > 0.0 or (self.gnl is not None and self.gnl_warp)
+        return (self.motion is not None or self.dropout > 0.0 or self.shot_events is not None
+                or (self.gnl is not None and self.gnl_warp))

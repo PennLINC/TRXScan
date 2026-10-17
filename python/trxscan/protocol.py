@@ -296,6 +296,9 @@ class Protocol:
     matrix: tuple[int, int, int] | None = None
     oblique_deg: tuple[float, float, float] | None = None
     tr_s: float | None = None
+    #: Longitudinal relaxation (s) of the (WM, GM, CSF) compartments; used only by spin history
+    #: (``ShotEvents(spin_history=True)``).
+    t1_s: tuple[float, float, float] | None = None
     flip_angle_deg: float | None = None
     field_strength_t: float | None = 3.0
     slice_timing: tuple[float, ...] | None = None
@@ -329,6 +332,11 @@ class Protocol:
             object.__setattr__(self, "matrix", m)
         if self.tr_s is not None and self.tr_s <= 0:
             raise ValueError("tr_s must be positive")
+        if self.t1_s is not None:
+            t = tuple(float(v) for v in self.t1_s)
+            if len(t) != 3 or min(t) <= 0:
+                raise ValueError(f"t1_s must be three positive T1s (WM, GM, CSF) in seconds, got {self.t1_s!r}")
+            object.__setattr__(self, "t1_s", t)
         if self.oblique_deg is not None:
             o = tuple(float(v) for v in self.oblique_deg)
             if len(o) != 3:

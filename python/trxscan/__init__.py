@@ -19,7 +19,7 @@ from . import _core, objects
 from .artifacts import Artifacts, Gre
 from .bids import BidsDwi, Dataset
 from .kspace import KSpace
-from .motion import Motion
+from .motion import Motion, ShotEvents
 from .phantom import Fibers, Object, Phantom, Streamlines
 from .protocol import EpiReadout, Protocol, Tissue
 from .simulate import DroppedShot, GnlResult, GreResult, Simulation, TrxscanError
@@ -45,7 +45,7 @@ def scalar_names() -> list[str]:
 
 
 __all__ = [
-    "Artifacts", "BidsDwi", "Dataset", "DroppedShot", "EpiReadout", "Fibers", "GnlResult", "Gre", "GreResult", "KSpace", "Motion", "Object",
+    "Artifacts", "BidsDwi", "Dataset", "DroppedShot", "EpiReadout", "Fibers", "GnlResult", "Gre", "GreResult", "KSpace", "Motion", "Object", "ShotEvents",
     "Phantom", "Protocol", "Simulation", "Streamlines", "Tissue", "TrxscanError", "Voxel", "VoxelSignal", "VoxelTruth",
     "data", "objects", "recipes", "scalar_names", "score", "set_threads", "__version__",
 ]
