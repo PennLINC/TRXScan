@@ -587,7 +587,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if shot_path {
         let nz = sig_grid.dims[2];
         let tr = cli.tr.unwrap_or(1.0);
-        let offsets = motion::shot_offsets(nz, cli.mb, cli.slice_order, tr);
+        let offsets = motion::shot_offsets(nz, cli.mb, cli.slice_order, tr)?;
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
         let events = match &cli.motion_events {
             Some(path) => motion::load_motion_events(path, comp.ngrad, n_shots)?,
