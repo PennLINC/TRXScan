@@ -48,6 +48,87 @@ impl std::fmt::Display for Preset {
     }
 }
 
+/// How a --motion trace is sampled (P10).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum MotionSampling {
+    /// One pose per volume, at its first shot
+    Volume,
+    /// Each shot at its own time
+    Shot,
+}
+
+/// A --motion trace, resolved (P10): each volume's pose (the trace's at the volume's first shot,
+/// `v x --tr`, when timed) and, when timed, the trace and where its clock came from.
+#[derive(Debug)]
+struct MotionInput {
+    poses: Vec<motion::Pose>,
+    trace: Option<(motion::Trace, &'static str)>,
+}
+
+impl MotionInput {
+    /// The trajectory's pose at `t`: a timed trace's, or the volumes' poses placed at `v x tr`.
+    fn pose_at(&self, t: f64, tr: f64) -> motion::Pose {
+        match &self.trace {
+            Some((trace, _)) => trace.pose_at(t),
+            None => {
+                let nodes: Vec<f64> = (0..self.poses.len()).map(|v| v as f64 * tr).collect();
+                motion::sample_trajectory(&nodes, &self.poses, t)
+            }
+        }
+    }
+}
+
+/// The sampling clock in a --motion trace's sidecar (the same path with `.json`): SamplingFrequency
+/// (Hz) and StartTime (s, default 0), the BIDS physio convention. `None` without a sidecar or
+/// without SamplingFrequency (a confounds JSON describes columns, not a clock).
+fn trace_sampling(path: &std::path::Path) -> Result<Option<motion::Sampling>, String> {
+    let side = path.with_extension("json");
+    if !side.is_file() {
+        return Ok(None);
+    }
+    let what = format!("--motion sidecar {}", side.display());
+    let text = std::fs::read_to_string(&side).map_err(|e| format!("{what}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("{what}: {e} (it decides whether the trace is timed, so it must be valid JSON)"))?;
+    let Some(f) = v.get("SamplingFrequency") else { return Ok(None) };
+    let num = |key: &str, x: &serde_json::Value| x.as_f64().ok_or_else(|| format!("{what}: {key} {x} is not a number"));
+    let frequency_hz = num("SamplingFrequency", f)?;
+    let start_s = match v.get("StartTime") {
+        Some(s) => num("StartTime", s)?,
+        None => 0.0,
+    };
+    Ok(Some(motion::Sampling { frequency_hz, start_s }))
+}
+
+/// Resolve --motion (P10): timed or not, decided before reading. An untimed trace is read as it
+/// always has been (`load_motion_tsv`, one row per volume, volumes beyond it at the identity); a
+/// timed one strictly, its volume poses sampled at `v x --tr`, and refused unless it covers every
+/// time the run samples it at (before anything is simulated).
+fn read_motion(path: &std::path::Path, cli: &Cli, nz: usize, n_volumes: usize) -> Result<MotionInput, String> {
+    let sampling = trace_sampling(path)?;
+    let column = motion::has_time_column(path)?;
+    let timed = sampling.is_some() || column;
+    let shot = cli.motion_sampling == MotionSampling::Shot;
+    if (timed || shot) && cli.tr.is_none() {
+        return Err(format!("--motion {}: a timed trace, or --motion-sampling shot, needs --tr (the volumes' times)",
+                           path.display()));
+    }
+    if !timed {
+        return Ok(MotionInput { poses: motion::load_motion_tsv(path)?, trace: None });
+    }
+    let tr = cli.tr.expect("checked above");
+    let trace = motion::load_motion_trace(path, sampling)?;
+    let refs: Vec<f64> = (0..n_volumes).map(|v| v as f64 * tr).collect();
+    let queried = if shot {
+        motion::ShotPlan::shot_times(&motion::shot_offsets(nz, cli.mb, cli.slice_order, tr)?, n_volumes, tr).concat()
+    } else {
+        refs.clone()
+    };
+    trace.check_covers(&queried, &format!("--motion {}", path.display()))?;
+    let poses = refs.iter().map(|&t| trace.pose_at(t)).collect();
+    Ok(MotionInput { poses, trace: Some((trace, if column { "time column" } else { "sidecar SamplingFrequency" })) })
+}
+
 /// Simulate a realistic complex 4D diffusion-MRI acquisition from a tractogram and tissue maps.
 #[derive(Parser)]
 #[command(name = "trxscan", version)]
@@ -169,8 +250,16 @@ struct Cli {
     /// Head-motion trace: a qsiprep/eddy confounds TSV (trans_x/y/z mm, rot_x/y/z rad). Switches
     /// the signal stage to the faithful per-volume re-simulation path (no SIFT2 weights, Watson
     /// kappa, myelin, GNL or truth peaks there).
+    /// A timed trace (P10: a `time` column in seconds, or a sidecar at the same path with `.json`
+    /// holding SamplingFrequency and optionally StartTime) holds samples on the run's clock (volume
+    /// `v` starts at `v x --tr`) instead of one row per volume, and needs --tr.
     #[arg(long, value_name = "TSV")]
     motion: Option<PathBuf>,
+    /// How --motion is sampled (P10): `volume`, one pose per volume, at its first shot (the default,
+    /// the per-volume re-simulation alone); or `shot`, each shot at its own time, the re-simulation at
+    /// each volume's pose plus the rest of each shot's motion resampled per shot. Needs --tr
+    #[arg(long, value_enum, default_value_t = MotionSampling::Volume, requires = "motion")]
+    motion_sampling: MotionSampling,
     /// Per-DWI-volume probability of a within-volume dropout event (a shot is one slice single-band,
     /// `--mb` slices multiband)
     #[arg(long, default_value_t = 0.0, value_name = "P")]
@@ -431,6 +520,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let gnl_encoding = gnl.as_ref().filter(|_| !cli.gnl_no_encoding).map(|(_, f)| f);
     let gnl_warp = gnl.as_ref().filter(|_| !cli.gnl_no_warp).map(|(_, f)| (f, !cli.gnl_no_jacobian_modulation));
+    // P10: the --motion trace resolved, timed or not, its coverage checked before anything is simulated
+    let motion_in: Option<MotionInput> = match &cli.motion {
+        Some(path) => Some(read_motion(path, &cli, sig_grid.dims[2], scheme.len())?),
+        None => None,
+    };
     println!("acquisition grid {:?}  signal grid {:?}  {} streamlines  {} volumes  shells {:?}",
         grid.dims, sig_grid.dims, offsets.len().saturating_sub(1), scheme.len(),
         scheme.shells(50.0));
@@ -540,10 +634,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gnl.is_some() {
             return Err("--gnl is not supported together with --motion yet".into());
         }
-        let poses = motion::load_motion_tsv(tsv)?;
+        let mi = motion_in.as_ref().expect("resolved with --motion");
+        let poses = mi.poses.clone();
         let moved = poses.iter().filter(|p| **p != motion::Pose::IDENTITY).count();
-        println!("Motion (faithful re-simulation): {} poses, {} moved, from {}",
-            poses.len(), moved, tsv.display());
+        println!("Motion (faithful re-simulation): {} poses, {} moved, from {}{}",
+            poses.len(), moved, tsv.display(), mi.trace.as_ref().map_or(String::new(), |(t, clock)| format!(
+                " (timed, {clock}: {} samples, {} to {} s, each volume at its first shot)", t.times.len(), t.times[0],
+                t.times[t.times.len() - 1])));
         let c = generate_compartments_moving(
             &sig_grid, &positions, &offsets, &sig_tissue, &scheme, &params, &poses);
         volume_poses = Some(poses);
@@ -581,7 +678,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Within-volume motion + slice dropout. The per-shot path (P9) runs for a single-band request,
     // a slice order other than interleaved, or an events file; otherwise the multiband path runs
     // exactly as before.
-    let shot_path = cli.motion_events.is_some() || cli.spin_history
+    let shot_path = cli.motion_events.is_some() || cli.spin_history || cli.motion_sampling == MotionSampling::Shot
         || (cli.dropout_rate > 0.0 && (cli.mb <= 1 || cli.slice_order != motion::SliceOrder::Interleaved));
     let mut spin_truth: Option<Vec<f32>> = None;
     if shot_path {
@@ -594,7 +691,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(path) => motion::load_motion_events(path, comp.ngrad, n_shots)?,
             None => motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed)),
         };
-        let plan = motion::ShotPlan::new(&offsets, comp.ngrad, tr, volume_poses.as_deref(), events, &sig_grid);
+        // P10: under --motion-sampling shot, each shot at the trajectory's pose at its own time
+        let shot_poses: Option<Vec<Vec<motion::Pose>>> = (cli.motion_sampling == MotionSampling::Shot).then(|| {
+            let mi = motion_in.as_ref().expect("clap requires --motion");
+            motion::ShotPlan::shot_times(&offsets, comp.ngrad, tr).iter()
+                .map(|ts| ts.iter().map(|&t| mi.pose_at(t, tr)).collect()).collect()
+        });
+        let plan = motion::ShotPlan::with_shot_poses(&offsets, comp.ngrad, tr, volume_poses.as_deref(), shot_poses.as_deref(),
+                                                     events, &sig_grid);
         let gt = if cli.spin_history {
             let jumps = plan.events.iter().any(|e| e.jump_mm.iter().chain(&e.jump_deg).any(|x| *x != 0.0));
             if !jumps && volume_poses.is_none() {
@@ -617,8 +721,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::fs::write(format!("{}_desc-dropout_slices.tsv", cli.out), tsv)?;
         std::fs::write(format!("{}_desc-motionEvents.tsv", cli.out), motion::write_motion_events(&plan.events, &plan.schedule))?;
-        println!("Per-shot motion: mb={}, {:?} order, {} shots per volume, {} events -> {}_desc-dropout_slices.tsv, \
-                  {}_desc-motionEvents.tsv", cli.mb, cli.slice_order, n_shots, gt.len(), cli.out, cli.out);
+        std::fs::write(format!("{}_desc-motionShots.tsv", cli.out), motion::write_motion_shots(&plan))?;
+        println!("Per-shot motion: mb={}, {:?} order, {} shots per volume, {} events{} -> {}_desc-dropout_slices.tsv, \
+                  {}_desc-motionEvents.tsv, {}_desc-motionShots.tsv", cli.mb, cli.slice_order, n_shots, gt.len(),
+                 if shot_poses.is_some() { ", poses sampled per shot" } else { "" }, cli.out, cli.out, cli.out);
     } else if cli.mb > 1 && cli.dropout_rate > 0.0 {
         let n_shots = (sig_grid.dims[2] / cli.mb).max(1);
         let events = motion::dropout_events(&scheme.bvals, n_shots, cli.dropout_rate, motion::dropout_seed(cli.seed));
@@ -878,4 +984,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote GNL truth {}_desc-gnl_{{coeff.grad,disp,invdisp,graddev}}", cli.out);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec!["trxscan", "--wm", "w", "--gm", "g", "--csf", "c", "--mask", "m", "--streamlines", "s",
+                            "--bval", "b", "--bvec", "v", "-o", "out"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    fn file(dir: &std::path::Path, name: &str, text: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// P10: --motion is timed or not before it is read. An untimed trace reads as it always has
+    /// (zeros for cells it cannot parse, its rows taken as volumes); a timed one (a time column,
+    /// or a sidecar SamplingFrequency, an escaped key included) needs --tr, samples each volume at
+    /// `v x --tr`, and must cover what it is sampled at; a confounds JSON leaves it untimed.
+    #[test]
+    fn motion_traces_are_timed_or_not_before_they_are_read() {
+        let dir = std::env::temp_dir().join(format!("trxscan-motion-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n";
+        // untimed, lenient as before: an empty cell, a word and inf
+        let p = file(&dir, "untimed.tsv", &format!("{h}0\t\tabc\t0\t0\t0\n1\t0\tinf\t0\t0\t0\n"));
+        let m = read_motion(&p, &cli(&["--motion", "x"]), 6, 4).unwrap();
+        assert!(m.trace.is_none() && m.poses.len() == 2, "two rows for four volumes, as before");
+        assert_eq!(m.poses[0], motion::Pose::IDENTITY);
+        assert_eq!(m.poses[1].trans_mm[0], 1.0);
+        assert!(m.poses[1].trans_mm[2].is_infinite(), "inf parses as it always has");
+        assert_eq!(m.poses, motion::load_motion_tsv(&p).unwrap());
+        // a confounds sidecar without SamplingFrequency: still untimed
+        file(&dir, "untimed.json", r#"{"trans_x": {"Units": "mm"}}"#);
+        assert!(read_motion(&p, &cli(&["--motion", "x"]), 6, 4).unwrap().trace.is_none());
+        // a time column: needs --tr; each volume at v x TR
+        let t = file(&dir, "timed.tsv", &format!("time\t{h}0\t0\t0\t0\t0\t0\t0\n20\t0\t0\t4\t0\t0\t0\n"));
+        assert!(read_motion(&t, &cli(&["--motion", "x"]), 6, 4).unwrap_err().contains("needs --tr"));
+        let m = read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).unwrap();
+        assert_eq!(m.poses.iter().map(|q| q.trans_mm[2]).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(m.trace.as_ref().unwrap().1, "time column");
+        // coverage: volumes to 15 s are covered, their shots (to 15 + 2 x 5 / 3 s at mb 2) are, too;
+        // a trace ending at 15 s covers the volumes but not their last shots
+        let short = file(&dir, "short.tsv", &format!("time\t{h}0\t0\t0\t0\t0\t0\t0\n15\t0\t0\t3\t0\t0\t0\n"));
+        assert!(read_motion(&short, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).is_ok());
+        let e = read_motion(&short, &cli(&["--motion", "x", "--tr", "5", "--motion-sampling", "shot", "--mb", "2"]), 6, 4)
+            .map(|_| ()).unwrap_err();
+        assert!(e.contains("never extrapolated") && e.contains("short.tsv"), "{e}");
+        // a sidecar SamplingFrequency, with an escaped key: timed
+        let s = file(&dir, "side.tsv", &format!("{h}0\t0\t0\t0\t0\t0\n0\t0\t1\t0\t0\t0\n0\t0\t2\t0\t0\t0\n"));
+        file(&dir, "side.json", r#"{"SamplingFrequency": 0.1, "StartTime": 0}"#);
+        let m = read_motion(&s, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).unwrap();
+        assert_eq!(m.trace.as_ref().map(|(t, c)| (t.times.clone(), *c)), Some((vec![0.0, 10.0, 20.0], "sidecar SamplingFrequency")));
+        assert!((m.poses[1].trans_mm[2] - 0.5).abs() < 1e-12);
+        // two clocks; a broken sidecar
+        file(&dir, "timed.json", r#"{"SamplingFrequency": 10}"#);
+        assert!(read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).map(|_| ()).unwrap_err().contains("two clocks"));
+        file(&dir, "timed.json", "{oops");
+        assert!(read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).map(|_| ()).unwrap_err().contains("valid JSON"));
+        // --motion-sampling needs --motion
+        let mut args = vec!["trxscan", "--wm", "w", "--gm", "g", "--csf", "c", "--mask", "m", "--streamlines", "s",
+                            "--bval", "b", "--bvec", "v", "-o", "out", "--motion-sampling", "shot"];
+        assert!(Cli::try_parse_from(args.drain(..)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
