@@ -256,9 +256,21 @@ def test_shot_sampling_refusals(gtab6):
         obj.simulate(gtab6, proto.replace(mb=2), ts.Artifacts(motion=m, dropout=0.5), kspace=False, clean_b0=False)
 
 
-def test_a_protocol_slice_timing_offset_places_the_reference_pose(gtab6):
+def test_a_protocol_slice_timing_offset_places_the_reference_pose(gtab6, monkeypatch):
     # implementation review: a protocol SliceTiming that starts at 0.2 s puts each volume's first
-    # shot, and so its re-simulated pose, there
+    # shot, and so its re-simulated pose, there (final review: checked on the poses the
+    # re-simulation receives, not only on the shots table)
+    import importlib
+
+    sim_mod = importlib.import_module("trxscan.simulate")
+    seen = []
+    original = sim_mod._core.signal_moving
+
+    def spy(*args):
+        seen.append(np.asarray(args[-1], dtype=float).copy())
+        return original(*args)
+
+    monkeypatch.setattr(sim_mod._core, "signal_moving", spy)
     obj = _streamline_box(nz=6)
     proto = ts.Protocol.DEFAULT.replace(tr_s=3.0, slice_timing=(0.2, 0.7, 1.2, 1.7, 2.2, 2.7))
     n = int(gtab6.bvals.size)
@@ -269,6 +281,8 @@ def test_a_protocol_slice_timing_offset_places_the_reference_pose(gtab6):
     for r in first:
         v, t, z = int(r[0]), float(r[3]), float(r[6])
         assert t == pytest.approx(3.0 * v + 0.2) and z == pytest.approx(t, abs=1e-9)
+    assert len(seen) == 1, "one re-simulation"
+    assert np.allclose(seen[0][:, 2], 3.0 * np.arange(n) + 0.2, atol=1e-9), seen[0][:, 2]
 
 
 def _streamline_box(nz=6):

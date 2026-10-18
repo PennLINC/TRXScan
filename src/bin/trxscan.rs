@@ -729,7 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::fs::write(format!("{}_desc-dropout_slices.tsv", cli.out), tsv)?;
         std::fs::write(format!("{}_desc-motionEvents.tsv", cli.out), motion::write_motion_events(&plan.events, &plan.schedule))?;
-        std::fs::write(format!("{}_desc-motionShots.tsv", cli.out), motion::write_motion_shots(&plan))?;
+        std::fs::write(format!("{}_desc-motionShots.tsv", cli.out), motion::write_motion_shots(&plan)?)?;
         println!("Per-shot motion: mb={}, {:?} order, {} shots per volume, {} events{} -> {}_desc-dropout_slices.tsv, \
                   {}_desc-motionEvents.tsv, {}_desc-motionShots.tsv", cli.mb, cli.slice_order, n_shots, gt.len(),
                  if shot_poses.is_some() { ", poses sampled per shot" } else { "" }, cli.out, cli.out, cli.out);

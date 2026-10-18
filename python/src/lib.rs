@@ -1107,7 +1107,7 @@ fn motion_shots_tsv(affine: PyReadonlyArray2<'_, f64>, dims: [usize; 3], offsets
     let n_shots = motion::slice_schedule_from_times(&offsets).len();
     let shot = shot_poses_from(shot_poses, &poses, ngrad, n_shots)?;
     let plan = motion::ShotPlan::with_shot_poses(&offsets, ngrad, tr, poses.as_deref(), shot.as_deref(), events, &full);
-    Ok(motion::write_motion_shots(&plan))
+    motion::write_motion_shots(&plan).map_err(verr)
 }
 
 /// Resolve a motion mode to `(n_units, 6)` absolute poses `[tx, ty, tz mm, rx, ry, rz deg]`.

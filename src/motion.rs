@@ -377,19 +377,27 @@ impl ShotPlan {
 
 /// P10: the per-shot truth, aslscan's `desc-motionShots_gt.tsv` format: `volume`, `shot`, `slices`,
 /// `time` (s, the series clock) and the six parameters of the head's pose at the shot
-/// (`history`), rotations in radians.
-pub fn write_motion_shots(plan: &ShotPlan) -> String {
+/// (`history`), rotations in radians. A pose the `Rz Ry Rx` angles cannot reproduce (pitch at 90
+/// degrees) is refused rather than written wrong.
+pub fn write_motion_shots(plan: &ShotPlan) -> Result<String, String> {
     let mut s = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
     for (v, times) in plan.times.iter().enumerate() {
         for (k, t) in times.iter().enumerate() {
             let q = plan.pose(v, k);
+            let m = plan.history[v][k];
+            let err = q.to_matrix(plan.center).iter().flatten().zip(m.iter().flatten()).fold(0.0f64, |e, (a, b)| e.max((a - b).abs()));
+            if err > 1e-9 {
+                return Err(format!(
+                    "the head's pose at volume {v}, shot {k} ({t} s) is a rotation at 90 degrees of pitch, which the shots \
+                     table's Rz Ry Rx angles cannot represent (reconstruction error {err:.2e})"));
+            }
             let r = q.rot_deg.map(f64::to_radians);
             let slices = plan.schedule[k].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",");
             s.push_str(&format!("{v}\t{k}\t{slices}\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                                 q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
         }
     }
-    s
+    Ok(s)
 }
 
 /// Read an events TSV in aslscan's `desc-motionEvents_gt.tsv` format: `volume`, `shot`, `slices`
@@ -738,7 +746,7 @@ mod tests {
         let none = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&pv), None, vec![jump], &grid);
         assert_eq!((&none.geometry, &none.history), (&b.geometry, &b.history));
         // the shots table
-        let tsv = write_motion_shots(&plan);
+        let tsv = write_motion_shots(&plan).unwrap();
         let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
         assert_eq!(tsv.lines().next().unwrap(), "volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z");
         assert_eq!(rows.len(), 6);
@@ -750,6 +758,12 @@ mod tests {
             assert!((r[9].parse::<f64>().unwrap() - q.rot_deg[2].to_radians()).abs() < 1e-12);
         }
         assert_eq!(rows[1][2], plan.schedule[1].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
+        // final review: a trajectory at (20, 45, 0) degrees with a (0, 45, 0) jump is at 90 degrees of
+        // pitch; the table refuses it rather than writing angles that do not reproduce it
+        let lock = vec![vec![Pose { rot_deg: [20.0, 45.0, 0.0], trans_mm: [0.0; 3] }; 3]; 2];
+        let tilt = MotionEvent { volume: 0, shot: 0, severity: 0.0, jump_mm: [0.0; 3], jump_deg: [0.0, 45.0, 0.0] };
+        let bad = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&[Pose::IDENTITY; 2]), Some(&lock), vec![tilt], &grid);
+        assert!(write_motion_shots(&bad).unwrap_err().contains("90 degrees"));
     }
 
     /// Final-review fix: shot timing is checked before a plan is built.
