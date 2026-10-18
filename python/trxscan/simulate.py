@@ -423,9 +423,11 @@ def run(
             warnings.warn("weights and kappa are ignored in motion mode (per-segment re-simulation)", stacklevel=2)
         # a timed trace (P10): each volume at the trace's pose at its first shot, v * tr_s
         poses = artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s, offsets=ref_offsets)
+        # a slab rotates about the full stack's centre, so the slabs of a chunked run agree
         comp = _core.signal_moving(
             sub.sim_dims, sub.sim_wm, sub.sim_gm, sub.sim_csf, sub.sim_mask, sim_affine,
             positions, offsets, bvals, bvecs, params, np.ascontiguousarray(poses),
+            z_offset=int(sub.z_offset), nz_full=nz_full,
         )
     else:
         if sub.fibers is not None:

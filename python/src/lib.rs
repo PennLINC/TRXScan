@@ -946,9 +946,11 @@ fn signal_from_mixture(
 
 /// The faithful motion path (`generate_compartments_moving`): per volume, streamlines and tissue
 /// are rigidly moved by that volume's pose and re-rasterized. `poses` is `(ngrad, 6)`
-/// `[tx, ty, tz mm, rx, ry, rz deg]`.
+/// `[tx, ty, tz mm, rx, ry, rz deg]`. On a slab, `z_offset` is its first slice's full-stack index
+/// and `nz_full` the stack's size: the rotations are about the full stack's centre (as
+/// `apply_shot_motion`'s), so every slab of a volume moves alike.
 #[pyfunction]
-#[pyo3(signature = (dims, wm, gm, csf, mask, affine, positions, offsets, bvals, bvecs, params, poses))]
+#[pyo3(signature = (dims, wm, gm, csf, mask, affine, positions, offsets, bvals, bvecs, params, poses, z_offset=0, nz_full=None))]
 #[allow(clippy::too_many_arguments)]
 fn signal_moving(
     py: Python<'_>,
@@ -958,10 +960,25 @@ fn signal_moving(
     positions: PyReadonlyArray2<'_, f64>, offsets: PyReadonlyArray1<'_, u32>,
     bvals: PyReadonlyArray1<'_, f64>, bvecs: PyReadonlyArray2<'_, f64>,
     params: &Bound<'_, PyDict>, poses: PyReadonlyArray2<'_, f64>,
+    z_offset: usize, nz_full: Option<usize>,
 ) -> PyResult<Compartments> {
     let dims = dims_of(dims);
     let tissue = tissue_from_flat(dims, &wm, &gm, &csf, &mask)?;
     let grid = Grid { dims, voxel_to_world: affine4(&affine)? };
+    let nz_full = nz_full.unwrap_or(z_offset + dims[2]);
+    if nz_full < z_offset + dims[2] {
+        return Err(verr(format!("signal_moving: slices {z_offset}..{} do not fit in nz_full {nz_full}", z_offset + dims[2])));
+    }
+    // the full stack's grid: this grid's affine moved back by its first slice's offset
+    let center = if (z_offset, nz_full) == (0, dims[2]) {
+        None
+    } else {
+        let mut full_v2w = grid.voxel_to_world;
+        for r in 0..3 {
+            full_v2w[r][3] -= grid.voxel_to_world[r][2] * z_offset as f64;
+        }
+        Some(motion::fov_center([dims[0], dims[1], nz_full], full_v2w))
+    };
     let positions = rows3(&positions, "positions")?;
     let offsets = u32s(&offsets)?;
     if offsets.is_empty() || *offsets.last().unwrap() as usize != positions.len() {
@@ -971,7 +988,10 @@ fn signal_moving(
     let params = params_from_dict(params)?;
     let poses = poses_from(&poses)?;
     check_len("poses", poses.len(), scheme.len())?;
-    let c = py.detach(move || comp::generate_compartments_moving(&grid, &positions, &offsets, &tissue, &scheme, &params, &poses));
+    let c = py.detach(move || match center {
+        Some(c) => comp::generate_compartments_moving_about(&grid, c, &positions, &offsets, &tissue, &scheme, &params, &poses),
+        None => comp::generate_compartments_moving(&grid, &positions, &offsets, &tissue, &scheme, &params, &poses),
+    });
     Ok(Compartments { inner: Mutex::new(c) })
 }
 

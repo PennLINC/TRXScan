@@ -266,9 +266,9 @@ def test_a_protocol_slice_timing_offset_places_the_reference_pose(gtab6, monkeyp
     seen = []
     original = sim_mod._core.signal_moving
 
-    def spy(*args):
+    def spy(*args, **kw):
         seen.append(np.asarray(args[-1], dtype=float).copy())
-        return original(*args)
+        return original(*args, **kw)
 
     monkeypatch.setattr(sim_mod._core, "signal_moving", spy)
     obj = _streamline_box(nz=6)
@@ -300,6 +300,33 @@ def _streamline_box(nz=6):
             offs.append(len(pts))
     sl = ts.Streamlines(np.array(pts), np.array(offs))
     return dataclasses.replace(box, streamlines=sl, fibers=None)
+
+
+def test_rotating_motion_on_slabs_uses_the_full_stack(gtab6):
+    # the re-simulation of a slab rotates about the full stack's centre, so a chunked run (or a
+    # slices= run) of a rotating head is the unchunked one: the slabs of a volume move alike
+    obj = _streamline_box(nz=12)
+    n = int(gtab6.bvals.size)
+    rot = np.tile([3.0, -2.5, 1.5], (n, 1)) * np.arange(n)[:, None] / n
+    m = ts.Motion.from_arrays(np.tile([0.2, -0.1, 0.15], (n, 1)), rot)
+    run = lambda **kw: np.asarray(obj.simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(motion=m), kspace=False,  # noqa: E731
+                                               clean_b0=False, **kw).magnitude.dataobj, dtype=float)
+    full = run()
+    chunked = run(chunk=4)
+    # away from the slab edges (the slabs' context reaches 3 slices)
+    inner = [z for z in range(12) if z % 4 not in (0, 3)]
+    assert np.allclose(chunked[..., inner, :], full[..., inner, :], rtol=1e-5, atol=1e-6 * full.max())
+    part = run(slices=[5, 6])
+    assert np.allclose(part, full[..., 5:7, :], rtol=1e-5, atol=1e-6 * full.max())
+    still = np.asarray(obj.simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(), kspace=False, clean_b0=False).magnitude.dataobj)
+    assert not np.allclose(full[..., -1], still[..., -1], rtol=1e-3), "the last volume is rotated"
+    from trxscan import _core
+
+    with pytest.raises(ValueError, match="nz_full"):
+        _core.signal_moving(obj.sim_dims, obj.sim_wm, obj.sim_gm, obj.sim_csf, obj.sim_mask, np.asarray(obj.sim_affine),
+                            obj.streamlines.positions, obj.streamlines.offsets, gtab6.bvals, gtab6.bvecs,
+                            ts.Protocol.DEFAULT.tissue.to_params(float(gtab6.bvals.max()), ts.Protocol.DEFAULT.diff_scale),
+                            np.zeros((n, 6)), z_offset=2, nz_full=12)
 
 
 def test_a_timed_trace_sampled_per_shot_writes_each_shots_pose(gtab6):
