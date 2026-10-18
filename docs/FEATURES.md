@@ -63,6 +63,26 @@ future work.
   (`Protocol.head` is refused). Under the re-simulation path the spin-history weights are read
   from the re-simulated images moved back by each volume's pose (trilinear), into the head frame.
 
+**Since then (P10, shared with aslscan through mrsim-acq).**
+
+- *Timed motion traces* (`motion::load_motion_trace`, `--motion` with a `time` column or a sidecar
+  `SamplingFrequency`, `Motion.from_confounds` / `Motion.timed` in Python): the trace's rows are
+  samples on the run's clock (volume `v` starts at `v x --tr`), usually faster than the repetition,
+  so a movement lands where it happened instead of being spread over a repetition. An untimed
+  trace is read exactly as before.
+- *Two samplings:* `--motion-sampling volume` (the default; `Motion(sampling="volume")`) gives
+  each volume the trace's pose at its first shot, and the re-simulation alone.
+  `--motion-sampling shot` also gives each shot the trace's pose at its own time. The plan's
+  `history` is `J . P(t)`, the head's actual pose (spin history uses it). Its `geometry` is
+  `J . P(t) . P_v^-1`, the motion left after the re-simulation's `P_v`, which is **resampled, not
+  re-simulated**: inside the otherwise faithful `--motion` path, the fibre-gradient angle follows
+  the volume's pose and not the shot's. Every per-shot run writes `<out>_desc-motionShots.tsv`
+  (`Simulation.motion_shots`): each shot's time and pose.
+- *Coverage:* a timed trace must cover every time it is sampled at; it is never extrapolated.
+  A pose within 1e-9 mm and degrees of the identity is the identity, so the clock's rounding at
+  a still sample does not blank an end slice.
+- *Making one:* aslscan's `tools/motion_trace.py` writes timed traces from nods, steps and drifts.
+
 ## 2. GRAPPA (parallel imaging)
 
 **What the ported model already provides.** Fiberfox synthesizes a **per-coil complex forward model** — the coil loop
