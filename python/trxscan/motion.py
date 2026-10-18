@@ -72,7 +72,15 @@ class ShotEvents:
 @dataclass(frozen=True, eq=False)
 class Motion:
     """A per-volume rigid motion specification, resolved against a gradient table at
-    simulation time (:meth:`poses_for`)."""
+    simulation time (:meth:`poses_for`).
+
+    A **timed** trajectory (P10, ``times`` set) holds samples on the run's clock (volume ``v``
+    starts at ``v * Protocol.tr_s``) instead of one row per volume, usually faster than the
+    repetition. Each volume's pose is the trace's at its first shot, which the re-simulation uses;
+    with ``sampling="shot"`` each shot also takes the trace's pose at its own time, the motion
+    beyond its volume's pose resampled per shot (not re-simulated: the fibre-gradient angle follows
+    the volume's pose). The trace must cover every time it is sampled at, and is never
+    extrapolated."""
 
     kind: Kind
     #: ``(n, 6)`` ``[tx, ty, tz mm, rx, ry, rz deg]`` for ``"trajectory"``; unused otherwise.
@@ -82,6 +90,29 @@ class Motion:
     volumes: tuple[int, ...] | None = None
     seed: int = 0
     source: str = ""
+    #: P10: ``(n,)`` sample times (s) of a timed trajectory, strictly increasing; ``None`` when
+    #: the rows are volumes.
+    times: np.ndarray | None = None
+    #: P10: ``"volume"`` (one pose per volume) or ``"shot"`` (each shot at its own time).
+    sampling: Literal["volume", "shot"] = "volume"
+
+    def __post_init__(self) -> None:
+        if self.sampling not in ("volume", "shot"):
+            raise ValueError(f"sampling {self.sampling!r}: expected 'volume' or 'shot'")
+        if self.times is not None:
+            if self.kind != "trajectory" or self.poses is None:
+                raise ValueError("times belong to a trajectory")
+            t = np.asarray(self.times, dtype=np.float64)
+            if t.ndim != 1 or t.size != self.poses.shape[0]:
+                raise ValueError(f"times: {t.size} values for {self.poses.shape[0]} poses")
+            if t.size < 2 or not np.all(np.isfinite(t)) or not np.all(np.diff(t) > 0):
+                raise ValueError("times: at least two, finite and strictly increasing")
+        if self.sampling == "shot" and self.kind != "trajectory":
+            raise ValueError("sampling='shot' needs a trajectory (random poses are impulses, not a path)")
+
+    @property
+    def is_timed(self) -> bool:
+        return self.times is not None
 
     # -- constructors --------------------------------------------------------
 
@@ -104,11 +135,45 @@ class Motion:
         return cls(kind="trajectory", poses=np.ascontiguousarray(np.hstack([t, r])), source=source)
 
     @classmethod
-    def from_confounds(cls, path: str | Path) -> "Motion":
+    def timed(cls, times: Any, trans_mm: Any, rot: Any, *, rot_units: Literal["deg", "rad"] = "deg",
+                    sampling: Literal["volume", "shot"] = "volume", source: str = "timed") -> "Motion":
+        """A timed trajectory (P10) from arrays: ``(n,)`` sample times (s on the run's clock) and
+        ``(n, 3)`` translations (mm) and rotations."""
+        m = cls.from_arrays(trans_mm, rot, rot_units=rot_units, source=source)
+        return dataclasses.replace(m, times=np.ascontiguousarray(np.asarray(times, dtype=np.float64)), sampling=sampling)
+
+    @classmethod
+    def from_confounds(cls, path: str | Path, *, sampling: Literal["volume", "shot"] = "volume") -> "Motion":
         """From a qsiprep / fMRIPrep-style confounds TSV: columns ``trans_x/y/z`` (mm) and
         ``rot_x/y/z`` (**radians**), one row per volume; ``n/a`` -> 0. Exactly what the CLI's
-        ``--motion`` reads (``motion::load_motion_tsv``)."""
+        ``--motion`` reads (``motion::load_motion_tsv``).
+
+        P10: a ``time`` column, or a sidecar at the same path with ``.json`` holding
+        ``SamplingFrequency`` (and optionally ``StartTime``), makes it a timed trace, read strictly
+        (``motion::load_motion_trace``); a sidecar without ``SamplingFrequency`` leaves it as
+        above."""
         path = Path(path)
+        side = path.with_suffix(".json")
+        hz, start = None, 0.0
+        if side.is_file():
+            import json
+
+            try:
+                meta = json.loads(side.read_text())
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{side}: {e} (it decides whether the trace is timed, so it must be valid JSON)") from e
+            if "SamplingFrequency" in meta:
+                hz, start = float(meta["SamplingFrequency"]), float(meta.get("StartTime", 0.0))
+        with open(path) as f:
+            header = f.readline().rstrip("\n").split("\t")
+        if hz is not None or "time" in [h.strip() for h in header]:
+            times, flat = _core.load_motion_trace(str(path), hz, start)
+            poses = np.asarray(flat, dtype=np.float64).reshape(-1, 6)
+            return cls(kind="trajectory", poses=np.ascontiguousarray(poses), times=np.asarray(times), sampling=sampling,
+                       source=str(path))
+        if sampling == "shot":
+            m = cls.from_confounds(path)
+            return dataclasses.replace(m, sampling="shot")
         with open(path) as f:
             header = f.readline().rstrip("\n").split("\t")
             rows = [line.rstrip("\n").split("\t") for line in f if line.strip()]
@@ -180,11 +245,32 @@ class Motion:
 
     @property
     def n_vol(self) -> int | None:
-        return None if self.poses is None else int(self.poses.shape[0])
+        """The number of volumes of an untimed trajectory (``None`` for a timed one, whose rows are
+        samples)."""
+        return None if self.poses is None or self.times is not None else int(self.poses.shape[0])
 
-    def poses_for(self, n_vol: int, *, seed: int | None = None) -> np.ndarray:
+    def _trace_at(self, query: Any) -> np.ndarray:
+        """A timed trace's ``(m, 6)`` poses at ``query`` times (``Trace::pose_at``), refused unless
+        the trace covers every one."""
+        assert self.times is not None and self.poses is not None
+        q = np.ascontiguousarray(np.asarray(query, dtype=np.float64).ravel())
+        flat = _core.sample_poses(np.asarray(self.times, dtype=np.float64), np.ascontiguousarray(self.poses), q,
+                                  f"motion trace {self.source or 'timed'}")
+        return np.asarray(flat).reshape(-1, 6)
+
+    def poses_for(self, n_vol: int, *, seed: int | None = None, tr_s: float | None = None,
+                  offsets: Any = None) -> np.ndarray:
         """``(n_vol, 6)`` absolute poses for a scheme of ``n_vol`` volumes. A trajectory longer
-        than the scheme is truncated; a shorter one raises (use :meth:`resample`)."""
+        than the scheme is truncated; a shorter one raises (use :meth:`resample`).
+
+        A timed trace (P10) gives each volume its pose at its first shot, ``v * tr_s`` plus the
+        earliest of ``offsets`` (the slices' excitation offsets; 0 when not given), and needs
+        ``tr_s``."""
+        if self.times is not None:
+            if tr_s is None:
+                raise ValueError("a timed motion trace needs tr_s (Protocol.tr_s) to place the volumes on its clock")
+            first = float(np.min(offsets)) if offsets is not None and len(offsets) else 0.0
+            return self._trace_at(np.arange(n_vol) * float(tr_s) + first)
         if self.kind == "trajectory":
             assert self.poses is not None
             if self.poses.shape[0] < n_vol:
@@ -194,8 +280,22 @@ class Motion:
         flat = _core.resolve_poses(self.kind, n_vol, self.seed if seed is None else seed, tuple(self.trans_mm), tuple(self.rot_deg), vols, None)
         return flat.reshape(n_vol, 6)
 
+    def shot_poses_for(self, n_vol: int, shot_times: Any, *, tr_s: float, offsets: Any = None) -> np.ndarray:
+        """P10: ``(n_vol * n_shots, 6)`` poses at each shot's time, volume-major (``shot_times``
+        ``(n_vol, n_shots)`` seconds on the run's clock): a timed trace's, refused unless it covers
+        them; an untimed trajectory's volume poses placed at each volume's first shot and
+        interpolated between them (held past the last)."""
+        st = np.asarray(shot_times, dtype=np.float64)
+        if self.times is not None:
+            return self._trace_at(st)
+        nodes = np.arange(n_vol) * float(tr_s) + (float(np.min(offsets)) if offsets is not None and len(offsets) else 0.0)
+        flat = _core.sample_poses(nodes, np.ascontiguousarray(self.poses_for(n_vol)), np.ascontiguousarray(st.ravel()), None)
+        return np.asarray(flat).reshape(-1, 6)
+
     def resample(self, n_vol: int) -> "Motion":
         """Linearly interpolate a trajectory to ``n_vol`` volumes over the same scan time."""
+        if self.times is not None:
+            raise ValueError("a timed motion trace is sampled at the run's own times; resampling it by volume count has no meaning")
         if self.kind != "trajectory":
             return dataclasses.replace(self)
         assert self.poses is not None
@@ -207,30 +307,42 @@ class Motion:
         out = np.column_stack([np.interp(dst, src, self.poses[:, c]) for c in range(6)])
         return dataclasses.replace(self, poses=out, source=f"{self.source} (resampled {n}->{n_vol})")
 
-    def matrices(self, n_vol: int, center: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> np.ndarray:
-        """``(n_vol, 4, 4)`` world transforms (``Pose::to_matrix``) about ``center``."""
-        flat = _core.poses_to_matrices(np.ascontiguousarray(self.poses_for(n_vol)), tuple(float(c) for c in center))
+    def matrices(self, n_vol: int, center: tuple[float, float, float] = (0.0, 0.0, 0.0), *,
+                 tr_s: float | None = None, offsets: Any = None) -> np.ndarray:
+        """``(n_vol, 4, 4)`` world transforms (``Pose::to_matrix``) about ``center``; a timed trace
+        needs ``tr_s`` (its volumes' poses, :meth:`poses_for`)."""
+        poses = self.poses_for(n_vol, tr_s=tr_s, offsets=offsets)
+        flat = _core.poses_to_matrices(np.ascontiguousarray(poses), tuple(float(c) for c in center))
         return flat.reshape(n_vol, 4, 4)
 
-    def framewise_displacement(self, n_vol: int | None = None, radius_mm: float = 50.0) -> np.ndarray:
+    def framewise_displacement(self, n_vol: int | None = None, radius_mm: float = 50.0, *,
+                               tr_s: float | None = None, offsets: Any = None) -> np.ndarray:
         """Power-style FD per volume: sum of absolute translation and rotation (converted to arc
-        length at ``radius_mm``) differences between consecutive volumes; first volume 0."""
-        p = self.poses_for(n_vol if n_vol is not None else (self.n_vol or 0))
+        length at ``radius_mm``) differences between consecutive volumes; first volume 0. A timed
+        trace needs ``n_vol`` and ``tr_s`` (its volumes' poses)."""
+        if self.times is not None and n_vol is None:
+            raise ValueError("a timed motion trace needs n_vol and tr_s for a per-volume displacement")
+        p = self.poses_for(n_vol if n_vol is not None else (self.n_vol or 0), tr_s=tr_s, offsets=offsets)
         d = np.diff(p, axis=0, prepend=p[:1])
         return np.abs(d[:, :3]).sum(axis=1) + np.abs(np.radians(d[:, 3:])).sum(axis=1) * radius_mm
 
-    def plot(self, n_vol: int | None = None, ax: Any = None):
-        """Plot translations and rotations per volume (matplotlib)."""
+    def plot(self, n_vol: int | None = None, ax: Any = None, *, tr_s: float | None = None, offsets: Any = None):
+        """Plot translations and rotations per volume (matplotlib). A timed trace without ``tr_s``
+        is drawn against its own times, its samples as they are."""
         import matplotlib.pyplot as plt
 
-        p = self.poses_for(n_vol if n_vol is not None else (self.n_vol or 0))
+        if self.times is not None and tr_s is None:
+            x, p, xlabel = np.asarray(self.times), np.asarray(self.poses), "time (s)"
+        else:
+            p = self.poses_for(n_vol if n_vol is not None else (self.n_vol or 0), tr_s=tr_s, offsets=offsets)
+            x, xlabel = np.arange(p.shape[0]), "volume"
         if ax is None:
             _, ax = plt.subplots(1, 2, figsize=(9, 3))
         for i, lab in enumerate("xyz"):
-            ax[0].plot(p[:, i], label=f"trans {lab} (mm)")
-            ax[1].plot(p[:, 3 + i], label=f"rot {lab} (deg)")
+            ax[0].plot(x, p[:, i], label=f"trans {lab} (mm)")
+            ax[1].plot(x, p[:, 3 + i], label=f"rot {lab} (deg)")
         for a in ax:
-            a.set_xlabel("volume")
+            a.set_xlabel(xlabel)
             a.legend(fontsize=8)
         ax[0].set_title(self.source or self.kind)
         return ax

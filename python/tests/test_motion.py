@@ -139,6 +139,113 @@ def test_spin_history_is_signal_weighted_and_independent_of_b(gtab6):
     assert abs(a - b) <= 1e-4 * abs(a), f"{a} vs {b}"
 
 
+# ---- P10: timed traces ----
+
+
+def test_timed_traces_are_read_strictly_and_untimed_ones_as_before(tmp_path):
+    from trxscan import _core
+
+    h = "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n"
+    # untimed: unchanged, n/a and words as zeros, truncation, short-trace refusal
+    u = tmp_path / "u.tsv"
+    u.write_text(h + "1\tn/a\tabc\t0\t0\t0\n0\t0\t0\t0\t0\t0\n0\t0\t1\t0\t0\t0\n")
+    m = ts.Motion.from_confounds(u)
+    assert not m.is_timed and m.n_vol == 3
+    assert m.poses_for(2)[0, :3].tolist() == [1, 0, 0]
+    with pytest.raises(ValueError, match="volumes"):
+        m.poses_for(4)
+    (tmp_path / "u.json").write_text('{"trans_x": {"Units": "mm"}}')
+    assert not ts.Motion.from_confounds(u).is_timed, "a confounds JSON leaves it untimed"
+    # a time column: timed, read by the same reader as the CLI's
+    t = tmp_path / "t.tsv"
+    t.write_text("time\t" + h + "0\t0\t0\t0\t0\t0\t0\n10\t0\t0\t2\t0\t0\t0.1\n")
+    m = ts.Motion.from_confounds(t)
+    times, flat = _core.load_motion_trace(str(t))
+    assert m.is_timed and m.n_vol is None
+    assert np.array_equal(m.times, times) and np.array_equal(m.poses, np.asarray(flat).reshape(-1, 6))
+    with pytest.raises(ValueError, match="tr_s"):
+        m.poses_for(3)
+    p = m.poses_for(3, tr_s=4.0)
+    assert np.allclose(p[:, 2], [0.0, 0.8, 1.6]) and p[2, 5] == pytest.approx(np.degrees(0.1) * 0.8)
+    with pytest.raises(ValueError, match="never extrapolated"):
+        m.poses_for(4, tr_s=4.0)
+    with pytest.raises(ValueError, match="resampling"):
+        m.resample(5)
+    with pytest.raises(ValueError):
+        (tmp_path / "bad.tsv").write_text("time\t" + h + "0\t0\t0\t0\t0\t0\t0\n1\tabc\t0\t0\t0\t0\t0\n")
+        ts.Motion.from_confounds(tmp_path / "bad.tsv")
+    # a sidecar SamplingFrequency
+    s = tmp_path / "s.tsv"
+    s.write_text(h + "0\t0\t0\t0\t0\t0\n0\t0\t1\t0\t0\t0\n0\t0\t2\t0\t0\t0\n")
+    (tmp_path / "s.json").write_text('{"SamplingFrequency": 0.5, "StartTime": -1}')
+    m = ts.Motion.from_confounds(s)
+    assert m.times.tolist() == [-1.0, 1.0, 3.0]
+    # the utilities: per volume with tr_s; a timed trace's displacement needs it
+    assert m.matrices(2, tr_s=1.0).shape == (2, 4, 4)
+    assert m.framewise_displacement(2, tr_s=1.0)[1] == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        m.framewise_displacement()
+    # Motion.timed from arrays
+    mt = ts.Motion.timed([0.0, 1.0], [[0, 0, 0], [0, 0, 1]], [[0, 0, 0], [0, 0, 0]], sampling="shot")
+    assert mt.sampling == "shot" and mt.poses_for(2, tr_s=0.5)[1, 2] == pytest.approx(0.5)
+    with pytest.raises(ValueError):
+        ts.Motion.timed([0.0, 0.0], [[0, 0, 0], [0, 0, 1]], [[0, 0, 0], [0, 0, 0]])
+
+
+def test_shot_pose_bindings_check_their_shapes(gtab6):
+    box = ts.objects.box(8, matrix=16, nz=6)
+    from trxscan import _core
+
+    offsets = _core.shot_offsets(6, 1, "sequential", 3.0)
+    vp = np.zeros((int(gtab6.bvals.size), 6))
+    ok = np.zeros((int(gtab6.bvals.size) * 6, 6))
+    tsv = _core.motion_shots_tsv(np.asarray(box.sim_affine), tuple(box.sim_dims), offsets, 3.0, int(gtab6.bvals.size), [],
+                                 0, vp, ok)
+    assert tsv.splitlines()[0].startswith("volume\tshot\tslices\ttime") and len(tsv.splitlines()) == 1 + vp.shape[0] * 6
+    with pytest.raises(ValueError, match="volume_poses"):
+        _core.motion_shots_tsv(np.asarray(box.sim_affine), tuple(box.sim_dims), offsets, 3.0, int(gtab6.bvals.size), [], 0, None, ok)
+    with pytest.raises(ValueError, match="shot_poses"):
+        _core.motion_shots_tsv(np.asarray(box.sim_affine), tuple(box.sim_dims), offsets, 3.0, int(gtab6.bvals.size), [], 0, vp, ok[:-1])
+
+
+def _streamline_box(nz=6):
+    """A box with straight streamlines along x through it (the re-simulation path needs them)."""
+    import dataclasses
+
+    box = ts.objects.box(8, matrix=16, nz=nz)
+    aff = np.asarray(box.affine, dtype=float)
+    nx, ny, _ = box.dims
+    pts, offs = [], [0]
+    for j in np.linspace(2, ny - 3, 5):
+        for k in np.linspace(0.5, nz - 1.5, 4):
+            line = [aff @ np.array([x, j, k, 1.0]) for x in np.linspace(0, nx - 1, 24)]
+            pts.extend(p[:3] for p in line)
+            offs.append(len(pts))
+    sl = ts.Streamlines(np.array(pts), np.array(offs))
+    return dataclasses.replace(box, streamlines=sl, fibers=None)
+
+
+def test_a_timed_trace_sampled_per_shot_writes_each_shots_pose(gtab6):
+    obj = _streamline_box()
+    proto = ts.Protocol.DEFAULT.replace(tr_s=3.0)
+    n = int(gtab6.bvals.size)
+    ramp = ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 0, 2.0]], [[0, 0, 0], [0, 0, 0]], sampling="shot")
+    sim = obj.simulate(gtab6, proto, ts.Artifacts(motion=ramp, shot_events=ts.ShotEvents(slice_order="sequential")),
+                       kspace=False, clean_b0=False)
+    rows = [l.split("\t") for l in sim.motion_shots.splitlines()[1:]]
+    assert len(rows) == n * 6
+    for r in rows:
+        v, s, t, z = int(r[0]), int(r[1]), float(r[3]), float(r[6])
+        assert t == pytest.approx(3.0 * v + 0.5 * s)
+        assert z == pytest.approx(2.0 * t / (3.0 * n), abs=1e-9), "the shot's pose is the trace at its time"
+    # one pose per volume: the re-simulation alone, no shots table
+    vol = obj.simulate(gtab6, proto, ts.Artifacts(motion=ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 0, 2.0]], [[0, 0, 0], [0, 0, 0]])),
+                       kspace=False, clean_b0=False)
+    assert vol.motion_shots is None
+    with pytest.raises(ValueError, match="tr_s"):
+        obj.simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(motion=ramp), kspace=False, clean_b0=False)
+
+
 def test_shot_events_refuse_duplicates_and_state_their_timing(gtab6):
     e = {"volume": 1, "shot": 2, "severity": 0.5, "jump_mm": (0.0, 0.0, 0.0), "jump_deg": (0.0, 0.0, 0.0)}
     with pytest.raises(ValueError, match="second event"):

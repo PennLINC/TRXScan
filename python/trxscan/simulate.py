@@ -15,6 +15,7 @@ import numpy as np
 from . import _core
 from ._arrays import affine4, as_gtab, b_max_of, complex_pairs, flat_f32, nifti, series, vectors, volume
 from .artifacts import Artifacts, Gre
+from .motion import ShotEvents
 from .kspace import KSpace
 from .protocol import EpiReadout, Protocol, _readout_from_acquisition
 
@@ -98,6 +99,9 @@ class Simulation:
     #: The within-volume events of an `Artifacts.shot_events` run, as the events TSV text
     #: (`_desc-motionEvents.tsv`, raw severities; `load_motion_events` reads it back).
     motion_events: str | None = None
+    #: P10: every shot's time and pose on the per-shot path, as the TSV text
+    #: (`_desc-motionShots.tsv`, aslscan's `desc-motionShots_gt.tsv` format, rotations in radians).
+    motion_shots: str | None = None
     #: The spin-history correction of the tissue (`ShotEvents(spin_history=True)`), summed over the
     #: compartments, per volume on the acquisition grid, in signal units; zero means no effect.
     spin_history: nib.Nifti1Image | None = None
@@ -400,7 +404,8 @@ def run(
             raise ValueError("the motion path needs streamlines; synthetic fibre objects cannot move (yet)")
         if weights is not None or protocol.kappa is not None:
             warnings.warn("weights and kappa are ignored in motion mode (per-segment re-simulation)", stacklevel=2)
-        poses = artifacts.motion.poses_for(ngrad, seed=seed)
+        # a timed trace (P10): each volume at the trace's pose at its first shot, v * tr_s
+        poses = artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s)
         comp = _core.signal_moving(
             sub.sim_dims, sub.sim_wm, sub.sim_gm, sub.sim_csf, sub.sim_mask, sim_affine,
             positions, offsets, bvals, bvecs, params, np.ascontiguousarray(poses),
@@ -435,11 +440,16 @@ def run(
     # ---- within-volume motion and dropout ----
     dropped: list[DroppedShot] = []
     motion_events: str | None = None
+    motion_shots: str | None = None
     spin_corr = None
     shot_offsets_used = None
-    if artifacts.shot_events is not None:
-        # P9: per-shot motion on the full stack's shots, any slice order, single band too
-        se = artifacts.shot_events
+    shot_sampled = artifacts.motion is not None and artifacts.motion.sampling == "shot"
+    if artifacts.shot_events is not None or shot_sampled:
+        # P9: per-shot motion on the full stack's shots, any slice order, single band too; P10: a
+        # trajectory sampled per shot runs here too, in ShotEvents' default order without them
+        se = artifacts.shot_events if artifacts.shot_events is not None else ShotEvents()
+        if shot_sampled and protocol.tr_s is None:
+            raise ValueError("Motion(sampling='shot') needs Protocol.tr_s (the shots' times)")
         tr = float(protocol.tr_s) if protocol.tr_s is not None else 1.0
         offsets = se.offsets(nz_full, int(protocol.mb), tr, protocol)
         shot_offsets_used = offsets
@@ -451,16 +461,23 @@ def run(
             events = _core.load_motion_events(str(se.events), int(ngrad), n_shots)
         else:
             events = list(se.events)
-        poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed)) if artifacts.motion is not None else None
+        poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s)) if artifacts.motion is not None else None
+        shot_poses = None
+        if shot_sampled:
+            # P10: each shot at the trajectory's pose at its own time, v * tr + the shot's offset
+            st = np.array([[v * tr + offsets[s[0]] for s in schedule] for v in range(ngrad)], dtype=np.float64)
+            shot_poses = np.ascontiguousarray(artifacts.motion.shot_poses_for(ngrad, st, tr_s=tr))
         if se.spin_history:
             jumps = any(any(v != 0.0 for v in (*e["jump_mm"], *e["jump_deg"])) for e in events)
             if not jumps and poses is None:
                 raise ValueError("spin history needs motion to have a history of: events that jump, or Artifacts.motion")
-            gt, spin_corr = comp.apply_shot_motion_spin_history(sim_affine, offsets, tr, list(protocol.t1_s), bvals, b_max, events, poses, int(protocol.mb))
+            gt, spin_corr = comp.apply_shot_motion_spin_history(sim_affine, offsets, tr, list(protocol.t1_s), bvals, b_max, events, poses, int(protocol.mb), shot_poses=shot_poses)
         else:
-            gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses, int(protocol.mb))
+            gt = comp.apply_shot_motion(sim_affine, offsets, tr, bvals, b_max, events, sub_global_z, nz_full, poses, int(protocol.mb), shot_poses=shot_poses)
         dropped = [DroppedShot(int(d["volume"]), int(d["shot"]), tuple(int(s) for s in d["slices"]), float(d["attenuation"])) for d in gt]
         motion_events = _core.write_motion_events(events, schedule)
+        motion_shots = _core.motion_shots_tsv(sim_affine, tuple(int(d) for d in sub.sim_dims), offsets, tr, int(ngrad), events,
+                                              int(sub_global_z[0]) if sub_global_z else 0, poses, shot_poses)
     elif protocol.mb > 1 and artifacts.dropout > 0.0:
         n_shots = max(nz_full // protocol.mb, 1)
         events = _core.dropout_events(bvals, n_shots, float(artifacts.dropout), _core.dropout_seed(seed))
@@ -644,7 +661,7 @@ def run(
     return Simulation(
         re=re_, im=im_, mag=mag_, ph=ph_, dims=out_dims, affine=out_affine, slices=np.asarray(global_z),
         bvals=bvals, bvecs=bvecs, bvecs_fsl=bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
-        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped, motion_events=motion_events, spin_history=spin_img,
+        readout=readout, kspace=ks, truth_peaks=tp_img, gre=gre_result, gnl=gnl_result, dropout=dropped, motion_events=motion_events, motion_shots=motion_shots, spin_history=spin_img,
         noise_sigma=ns_img, fieldmap=fmap_img, clean_b0=clean_img, mixture=mixture, compartments=comp, object=sub, timing=timing,
     )
 
@@ -748,7 +765,7 @@ def _run_chunked(obj, gtab, protocol, artifacts, sel, chunk, context, gre, truth
         dims=dims, affine=first.affine, slices=np.concatenate([p.slices for p in parts]),
         bvals=first.bvals, bvecs=first.bvecs, bvecs_fsl=first.bvecs_fsl, protocol=protocol, artifacts=artifacts, sidecar=sidecar,
         readout=first.readout, kspace=None, truth_peaks=_cat_images([p.truth_peaks for p in parts]), gre=gre_result, gnl=gnl,
-        dropout=dropped, motion_events=first.motion_events, noise_sigma=_cat_images([p.noise_sigma for p in parts]), fieldmap=_cat_images([p.fieldmap for p in parts]),
+        dropout=dropped, motion_events=first.motion_events, motion_shots=first.motion_shots, noise_sigma=_cat_images([p.noise_sigma for p in parts]), fieldmap=_cat_images([p.fieldmap for p in parts]),
         clean_b0=_cat_images([p.clean_b0 for p in parts]), mixture=None, compartments=None, object=obj, timing=timing,
     )
 

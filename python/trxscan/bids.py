@@ -99,6 +99,8 @@ def write_bids(sim: "Simulation", prefix: str | Path) -> list[Path]:
         nib.save(sim.spin_history, p("_desc-spinHistory.nii.gz"))
     if sim.motion_events is not None:
         p("_desc-motionEvents.tsv").write_text(sim.motion_events)
+    if sim.motion_shots is not None:
+        p("_desc-motionShots.tsv").write_text(sim.motion_shots)
     if sim.gre is not None:
         g = sim.gre
         gp = f"{prefix}_gre"
@@ -621,7 +623,7 @@ class Dataset:
 
     def _add_truth(self, sim: "Simulation", sub: str, ses: str | None, ent: dict[str, Any], suffix: str) -> list[Path]:
         has_field = sim.fieldmap is not None and bool(np.any(np.asanyarray(sim.fieldmap.dataobj)))
-        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout and sim.motion_events is None and sim.spin_history is None and sim.clean_b0 is None and not has_field:
+        if sim.noise_sigma is None and sim.truth_peaks is None and sim.gnl is None and not sim.dropout and sim.motion_events is None and sim.motion_shots is None and sim.spin_history is None and sim.clean_b0 is None and not has_field:
             return []
         out_dir = self.folder(sub, ses, "dwi", derivative=True)
         written: list[Path] = []
@@ -666,6 +668,8 @@ class Dataset:
             put("spinHistory", sim.spin_history, {"Description": "The spin-history correction added to the tissue (ShotEvents(spin_history=True)): the compartments' longitudinal magnetization at each excitation minus the closed form 1 - exp(-TR/T1), weighted by their signal, summed over compartments; per volume, in signal units; zero means no effect. Box slice profile, voxel tilt ignored."})
         if sim.motion_events is not None:
             put("motionEvents", text=sim.motion_events, ext=".tsv", meta={"Description": "Within-volume events (ShotEvents): volume, shot, slices, attenuation = 1 - severity before the b-value scaling, jumps in mm and radians; read back with trxscan._core.load_motion_events or ShotEvents(events=path)."})
+        if sim.motion_shots is not None:
+            put("motionShots", text=sim.motion_shots, ext=".tsv", meta={"Description": "Every shot's time (s, volume v at v x RepetitionTime) and the head's pose at it (the volume's pose or a timed trace's at the shot, composed with the events' jumps), translations in mm and rotations in radians about the field-of-view centre (Rz Ry Rx); aslscan's desc-motionShots_gt.tsv format."})
         return written
 
     def add_anat(

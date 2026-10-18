@@ -319,6 +319,35 @@ fn poses_to_py<'py>(py: Python<'py>, poses: &[Pose]) -> Bound<'py, PyArray1<f64>
     PyArray1::from_vec(py, v)
 }
 
+/// Rows `[tx, ty, tz mm, rx, ry, rz deg]` as poses, every value finite.
+fn poses_from_rows(name: &str, a: &PyReadonlyArray2<'_, f64>) -> PyResult<Vec<Pose>> {
+    let a = a.as_array();
+    if a.ncols() != 6 {
+        return Err(verr(format!("{name}: expected 6 columns, got {}", a.ncols())));
+    }
+    if a.iter().any(|x| !x.is_finite()) {
+        return Err(verr(format!("{name}: a value is not finite")));
+    }
+    Ok(a.rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect())
+}
+
+/// P10: the per-shot poses of a plan, `(n_volumes * n_shots, 6)` volume-major, as `[volume][shot]`;
+/// they need the volume poses (the re-simulation's, which the remainder is taken against).
+fn shot_poses_from(a: Option<PyReadonlyArray2<'_, f64>>, volume: &Option<Vec<Pose>>, n_volumes: usize, n_shots: usize)
+    -> PyResult<Option<Vec<Vec<Pose>>>>
+{
+    let Some(a) = a else { return Ok(None) };
+    if volume.is_none() {
+        return Err(verr("shot_poses needs volume_poses: the per-shot remainder is taken against the volume's pose"));
+    }
+    if volume.as_ref().is_some_and(|v| v.len() != n_volumes) {
+        return Err(verr(format!("volume_poses: {} rows for {n_volumes} volumes", volume.as_ref().map_or(0, |v| v.len()))));
+    }
+    let rows = poses_from_rows("shot_poses", &a)?;
+    check_len("shot_poses rows (volumes x shots)", rows.len(), n_volumes * n_shots)?;
+    Ok(Some(rows.chunks(n_shots).map(|c| c.to_vec()).collect()))
+}
+
 fn events_from(list: &Bound<'_, PyAny>) -> PyResult<Vec<MotionEvent>> {
     let mut out = Vec::new();
     for item in list.try_iter()? {
@@ -597,13 +626,16 @@ impl Compartments {
     /// `slice_z` gives each local slice's full-stack index and `nz_full` the stack's size: the plan
     /// is the full stack's, its rotations about the full stack's centre. `volume_poses` (`(n, 6)`,
     /// `[tx, ty, tz mm, rx, ry, rz deg]`) are the re-simulation path's poses, which the images
-    /// already carry: the geometry applies only the jumps.
-    #[pyo3(signature = (affine, offsets, tr, bvals, b_max, events, slice_z=None, nz_full=None, volume_poses=None, mb=1))]
+    /// already carry: the geometry applies only the jumps. `shot_poses` (P10, `(n * n_shots, 6)`,
+    /// volume-major, the same units) are a trajectory's poses at each shot's time; with them the
+    /// geometry applies each shot's motion beyond its volume's pose (they need `volume_poses`).
+    #[pyo3(signature = (affine, offsets, tr, bvals, b_max, events, slice_z=None, nz_full=None, volume_poses=None, mb=1, shot_poses=None))]
     #[allow(clippy::too_many_arguments)]
     fn apply_shot_motion<'py>(
         &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64,
         bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>,
         slice_z: Option<Vec<usize>>, nz_full: Option<usize>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
+        shot_poses: Option<PyReadonlyArray2<'_, f64>>,
     ) -> PyResult<Bound<'py, PyList>> {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
@@ -632,7 +664,8 @@ impl Compartments {
         let full = Grid { dims: [dims[0], dims[1], nz_full], voxel_to_world: full_v2w };
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
         check_events(&events, ngrad, n_shots)?;
-        let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &full);
+        let shot = shot_poses_from(shot_poses, &poses, ngrad, n_shots)?;
+        let plan = motion::ShotPlan::with_shot_poses(&offsets, ngrad, tr, poses.as_deref(), shot.as_deref(), events, &full);
         let c: &mut comp::Compartments = &mut g;
         let dropped = py.detach(|| motion::apply_shot_motion(
             &mut c.images, dims, ngrad, v2w, &plan, slice_z.as_deref(), &bvals, b_max,
@@ -651,11 +684,12 @@ impl Compartments {
     /// [`apply_shot_motion`] with spin history (P9 part C3), on the whole slice stack: returns the
     /// dropped-shot dicts and the correction summed over compartments (flat, voxel-major
     /// interleaved, this grid). `t1_s` one per compartment (seconds); `tr` the repetition.
-    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None, mb=1))]
+    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None, mb=1, shot_poses=None))]
     #[allow(clippy::too_many_arguments)]
     fn apply_shot_motion_spin_history<'py>(
         &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64, t1_s: Vec<f64>,
         bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
+        shot_poses: Option<PyReadonlyArray2<'_, f64>>,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<f32>>)> {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
@@ -671,7 +705,8 @@ impl Compartments {
         let grid = Grid { dims, voxel_to_world: v2w };
         let n_shots = motion::slice_schedule_from_times(&offsets).len();
         check_events(&events, ngrad, n_shots)?;
-        let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &grid);
+        let shot = shot_poses_from(shot_poses, &poses, ngrad, n_shots)?;
+        let plan = motion::ShotPlan::with_shot_poses(&offsets, ngrad, tr, poses.as_deref(), shot.as_deref(), events, &grid);
         let c: &mut comp::Compartments = &mut g;
         let (dropped, sum) = py.detach(|| motion::apply_shot_motion_with_spin_history(
             &mut c.images, &grid, ngrad, &plan, &bvals, b_max, &t1_s, tr,
@@ -1012,6 +1047,68 @@ fn load_motion_events<'py>(py: Python<'py>, path: PathBuf, n_volumes: usize, n_s
 #[pyfunction]
 fn write_motion_events(events: &Bound<'_, PyAny>, schedule: Vec<Vec<usize>>) -> PyResult<String> {
     Ok(motion::write_motion_events(&events_from(events)?, &schedule))
+}
+
+/// P10: a timed motion trace (`motion::load_motion_trace`): a `time` column, or `sampling_hz`
+/// (and `start_s`) from its sidecar. Returns `(times, poses)`, the poses flat `(n * 6)`,
+/// `[tx, ty, tz mm, rx, ry, rz deg]` per sample.
+#[pyfunction]
+#[pyo3(signature = (path, sampling_hz=None, start_s=0.0))]
+fn load_motion_trace<'py>(py: Python<'py>, path: PathBuf, sampling_hz: Option<f64>, start_s: f64)
+    -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)>
+{
+    let sampling = sampling_hz.map(|frequency_hz| motion::Sampling { frequency_hz, start_s });
+    let t = motion::load_motion_trace(&path, sampling).map_err(verr)?;
+    let flat: Vec<f64> = t.poses.iter().flat_map(|p| [p.trans_mm[0], p.trans_mm[1], p.trans_mm[2], p.rot_deg[0], p.rot_deg[1], p.rot_deg[2]]).collect();
+    Ok((PyArray1::from_vec(py, t.times), PyArray1::from_vec(py, flat)))
+}
+
+/// P10: a trajectory's poses at `query` times, flat `(m * 6)`. With `what` (a timed trace's name,
+/// for the message) the samples are a timed trace (`Trace::pose_at`): every query inside the
+/// trace or an error, the identity within `TRACE_POSE_EPSILON`. Without it, an untimed trajectory's
+/// nodes, held past either end (`sample_trajectory`).
+#[pyfunction]
+#[pyo3(signature = (times, poses, query, what=None))]
+fn sample_poses<'py>(py: Python<'py>, times: Vec<f64>, poses: PyReadonlyArray2<'_, f64>, query: Vec<f64>, what: Option<String>)
+    -> PyResult<Bound<'py, PyArray1<f64>>>
+{
+    let poses = poses_from_rows("poses", &poses)?;
+    check_len("poses rows", poses.len(), times.len())?;
+    let at: Vec<Pose> = match what {
+        Some(w) => {
+            if times.windows(2).any(|p| !(p[1] > p[0])) || times.iter().any(|t| !t.is_finite()) {
+                return Err(verr(format!("{w}: times must be finite and strictly increasing")));
+            }
+            let trace = motion::Trace { times, poses };
+            trace.check_covers(&query, &w).map_err(verr)?;
+            query.iter().map(|&t| trace.pose_at(t)).collect()
+        }
+        None => query.iter().map(|&t| motion::sample_trajectory(&times, &poses, t)).collect(),
+    };
+    Ok(PyArray1::from_vec(py, at.iter().flat_map(|p| [p.trans_mm[0], p.trans_mm[1], p.trans_mm[2], p.rot_deg[0], p.rot_deg[1], p.rot_deg[2]]).collect()))
+}
+
+/// P10: the per-shot truth (`motion::write_motion_shots`, aslscan's `desc-motionShots_gt.tsv`
+/// format) of the plan `apply_shot_motion` builds from the same arguments: `affine` and `dims` a
+/// grid whose first slice is the full stack's `z0`, `ngrad` volumes.
+#[pyfunction]
+#[pyo3(signature = (affine, dims, offsets, tr, ngrad, events, z0=0, volume_poses=None, shot_poses=None))]
+#[allow(clippy::too_many_arguments)]
+fn motion_shots_tsv(affine: PyReadonlyArray2<'_, f64>, dims: [usize; 3], offsets: Vec<f64>, tr: f64, ngrad: usize,
+                    events: &Bound<'_, PyAny>, z0: usize, volume_poses: Option<PyReadonlyArray2<'_, f64>>,
+                    shot_poses: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<String> {
+    let v2w = affine4(&affine)?;
+    let mut full_v2w = v2w;
+    for r in 0..3 {
+        full_v2w[r][3] -= v2w[r][2] * z0 as f64;
+    }
+    let full = Grid { dims: [dims[0], dims[1], offsets.len()], voxel_to_world: full_v2w };
+    let events = events_from(events)?;
+    let poses = volume_poses.map(|a| poses_from_rows("volume_poses", &a)).transpose()?;
+    let n_shots = motion::slice_schedule_from_times(&offsets).len();
+    let shot = shot_poses_from(shot_poses, &poses, ngrad, n_shots)?;
+    let plan = motion::ShotPlan::with_shot_poses(&offsets, ngrad, tr, poses.as_deref(), shot.as_deref(), events, &full);
+    Ok(motion::write_motion_shots(&plan))
 }
 
 /// Resolve a motion mode to `(n_units, 6)` absolute poses `[tx, ty, tz mm, rx, ry, rz deg]`.
@@ -1661,6 +1758,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shot_offsets, m)?)?;
     m.add_function(wrap_pyfunction!(slice_schedule_from_times, m)?)?;
     m.add_function(wrap_pyfunction!(load_motion_events, m)?)?;
+    m.add_function(wrap_pyfunction!(load_motion_trace, m)?)?;
+    m.add_function(wrap_pyfunction!(sample_poses, m)?)?;
+    m.add_function(wrap_pyfunction!(motion_shots_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(write_motion_events, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_poses, m)?)?;
     m.add_function(wrap_pyfunction!(poses_to_matrices, m)?)?;
