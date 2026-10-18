@@ -267,8 +267,8 @@ class Motion:
         earliest of ``offsets`` (the slices' excitation offsets; 0 when not given), and needs
         ``tr_s``."""
         if self.times is not None:
-            if tr_s is None:
-                raise ValueError("a timed motion trace needs tr_s (Protocol.tr_s) to place the volumes on its clock")
+            if tr_s is None or not (np.isfinite(tr_s) and tr_s > 0):
+                raise ValueError("a timed motion trace needs a positive tr_s (Protocol.tr_s) to place the volumes on its clock")
             first = float(np.min(offsets)) if offsets is not None and len(offsets) else 0.0
             return self._trace_at(np.arange(n_vol) * float(tr_s) + first)
         if self.kind == "trajectory":

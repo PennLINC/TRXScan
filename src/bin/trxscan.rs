@@ -61,7 +61,12 @@ enum MotionSampling {
 /// `v x --tr`, when timed) and, when timed, the trace and where its clock came from.
 #[derive(Debug)]
 struct MotionInput {
+    /// The re-simulation's poses, as read (an untimed trace's rows: volumes beyond them get the
+    /// identity, rows beyond the volumes are unused).
     poses: Vec<motion::Pose>,
+    /// One pose per volume, exactly: `poses` padded with the identity or truncated, which is what
+    /// the re-simulation applies; the per-shot sampling of an untimed trace runs between these.
+    per_volume: Vec<motion::Pose>,
     trace: Option<(motion::Trace, &'static str)>,
 }
 
@@ -71,8 +76,8 @@ impl MotionInput {
         match &self.trace {
             Some((trace, _)) => trace.pose_at(t),
             None => {
-                let nodes: Vec<f64> = (0..self.poses.len()).map(|v| v as f64 * tr).collect();
-                motion::sample_trajectory(&nodes, &self.poses, t)
+                let nodes: Vec<f64> = (0..self.per_volume.len()).map(|v| v as f64 * tr).collect();
+                motion::sample_trajectory(&nodes, &self.per_volume, t)
             }
         }
     }
@@ -109,12 +114,14 @@ fn read_motion(path: &std::path::Path, cli: &Cli, nz: usize, n_volumes: usize) -
     let column = motion::has_time_column(path)?;
     let timed = sampling.is_some() || column;
     let shot = cli.motion_sampling == MotionSampling::Shot;
-    if (timed || shot) && cli.tr.is_none() {
-        return Err(format!("--motion {}: a timed trace, or --motion-sampling shot, needs --tr (the volumes' times)",
-                           path.display()));
+    if (timed || shot) && !cli.tr.is_some_and(|t| t.is_finite() && t > 0.0) {
+        return Err(format!("--motion {}: a timed trace, or --motion-sampling shot, needs a positive --tr (the volumes' \
+                            times)", path.display()));
     }
+    let per_volume = |poses: &[motion::Pose]| (0..n_volumes).map(|v| poses.get(v).copied().unwrap_or(motion::Pose::IDENTITY)).collect();
     if !timed {
-        return Ok(MotionInput { poses: motion::load_motion_tsv(path)?, trace: None });
+        let poses = motion::load_motion_tsv(path)?;
+        return Ok(MotionInput { per_volume: per_volume(&poses), poses, trace: None });
     }
     let tr = cli.tr.expect("checked above");
     let trace = motion::load_motion_trace(path, sampling)?;
@@ -125,8 +132,9 @@ fn read_motion(path: &std::path::Path, cli: &Cli, nz: usize, n_volumes: usize) -
         refs.clone()
     };
     trace.check_covers(&queried, &format!("--motion {}", path.display()))?;
-    let poses = refs.iter().map(|&t| trace.pose_at(t)).collect();
-    Ok(MotionInput { poses, trace: Some((trace, if column { "time column" } else { "sidecar SamplingFrequency" })) })
+    let poses: Vec<motion::Pose> = refs.iter().map(|&t| trace.pose_at(t)).collect();
+    Ok(MotionInput { per_volume: poses.clone(), poses,
+                     trace: Some((trace, if column { "time column" } else { "sidecar SamplingFrequency" })) })
 }
 
 /// Simulate a realistic complex 4D diffusion-MRI acquisition from a tractogram and tissue maps.
@@ -1025,7 +1033,7 @@ mod tests {
         assert!(read_motion(&p, &cli(&["--motion", "x"]), 6, 4).unwrap().trace.is_none());
         // a time column: needs --tr; each volume at v x TR
         let t = file(&dir, "timed.tsv", &format!("time\t{h}0\t0\t0\t0\t0\t0\t0\n20\t0\t0\t4\t0\t0\t0\n"));
-        assert!(read_motion(&t, &cli(&["--motion", "x"]), 6, 4).unwrap_err().contains("needs --tr"));
+        assert!(read_motion(&t, &cli(&["--motion", "x"]), 6, 4).unwrap_err().contains("positive --tr"));
         let m = read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).unwrap();
         assert_eq!(m.poses.iter().map(|q| q.trans_mm[2]).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0]);
         assert_eq!(m.trace.as_ref().unwrap().1, "time column");
@@ -1047,6 +1055,15 @@ mod tests {
         assert!(read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).map(|_| ()).unwrap_err().contains("two clocks"));
         file(&dir, "timed.json", "{oops");
         assert!(read_motion(&t, &cli(&["--motion", "x", "--tr", "5"]), 6, 4).map(|_| ()).unwrap_err().contains("valid JSON"));
+        // implementation review: --tr must be a positive time; untimed shot sampling runs between the
+        // poses the re-simulation applies (two rows for four volumes: volumes 2-3 at the identity)
+        assert!(read_motion(&short, &cli(&["--motion", "x", "--tr", "0"]), 6, 4).map(|_| ()).unwrap_err().contains("positive --tr"));
+        let two = file(&dir, "two.tsv", &format!("{h}0\t0\t1\t0\t0\t0\n0\t0\t2\t0\t0\t0\n"));
+        let m = read_motion(&two, &cli(&["--motion", "x", "--tr", "5", "--motion-sampling", "shot"]), 6, 4).unwrap();
+        assert_eq!(m.poses.len(), 2);
+        assert_eq!(m.per_volume.len(), 4);
+        assert_eq!(m.pose_at(15.0, 5.0), motion::Pose::IDENTITY, "volume 3's first shot: the identity, as re-simulated");
+        assert!((m.pose_at(7.5, 5.0).trans_mm[2] - 1.0).abs() < 1e-12, "half way from volume 1 (2 mm) to volume 2 (0)");
         // --motion-sampling needs --motion
         let mut args = vec!["trxscan", "--wm", "w", "--gm", "g", "--csf", "c", "--mask", "m", "--streamlines", "s",
                             "--bval", "b", "--bvec", "v", "-o", "out", "--motion-sampling", "shot"];

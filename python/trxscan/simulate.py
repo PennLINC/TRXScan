@@ -331,6 +331,17 @@ def run(
     say = progress or (lambda *_: None)
 
     sel = _resolve_slices(slices, z_mm, obj)
+    mo = artifacts.motion
+    if mo is not None and mo.sampling == "shot":
+        # P10: the re-simulation rotates about the grid it is given, the shot plan about the whole
+        # stack's centre; they agree only on the whole stack
+        whole = len(sel) == nz and int(obj.z_offset or 0) == 0 and int(obj.nz_full or nz) == nz
+        if chunk is not None or not whole:
+            raise ValueError("Motion(sampling='shot') needs the whole slice stack: no chunk=, slices=, z_mm= or slab object "
+                             "(the re-simulation and the per-shot remainder must share one rotation centre)")
+        if artifacts.shot_events is None and artifacts.dropout > 0.0:
+            raise ValueError("Motion(sampling='shot') with Artifacts.dropout: give the dropout as ShotEvents(rate=...), "
+                             "which the per-shot path draws from")
     se = artifacts.shot_events
     if se is not None and se.spin_history:
         # P9 part C3: the spin-history state spans the whole slice stack
@@ -393,6 +404,12 @@ def run(
     say("signal", 0, 1)
     mixture = None
     peaks_flat = None
+    # P10: a timed trace places each volume at its first shot, so the shot schedule's earliest offset
+    # (a protocol's SliceTiming need not start at 0) is resolved before the re-simulation uses it
+    ref_offsets = None
+    if mo is not None and mo.is_timed and (artifacts.shot_events is not None or mo.sampling == "shot") and protocol.tr_s is not None:
+        se_ref = artifacts.shot_events if artifacts.shot_events is not None else ShotEvents()
+        ref_offsets = se_ref.offsets(nz_full, int(protocol.mb), float(protocol.tr_s), protocol)
     if artifacts.motion is not None:
         if protocol.head:
             raise ValueError("Protocol.head is not available together with motion (the head would not move with the brain)")
@@ -405,7 +422,7 @@ def run(
         if weights is not None or protocol.kappa is not None:
             warnings.warn("weights and kappa are ignored in motion mode (per-segment re-simulation)", stacklevel=2)
         # a timed trace (P10): each volume at the trace's pose at its first shot, v * tr_s
-        poses = artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s)
+        poses = artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s, offsets=ref_offsets)
         comp = _core.signal_moving(
             sub.sim_dims, sub.sim_wm, sub.sim_gm, sub.sim_csf, sub.sim_mask, sim_affine,
             positions, offsets, bvals, bvecs, params, np.ascontiguousarray(poses),
@@ -461,12 +478,12 @@ def run(
             events = _core.load_motion_events(str(se.events), int(ngrad), n_shots)
         else:
             events = list(se.events)
-        poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s)) if artifacts.motion is not None else None
+        poses = np.ascontiguousarray(artifacts.motion.poses_for(ngrad, seed=seed, tr_s=protocol.tr_s, offsets=ref_offsets)) if artifacts.motion is not None else None
         shot_poses = None
         if shot_sampled:
             # P10: each shot at the trajectory's pose at its own time, v * tr + the shot's offset
             st = np.array([[v * tr + offsets[s[0]] for s in schedule] for v in range(ngrad)], dtype=np.float64)
-            shot_poses = np.ascontiguousarray(artifacts.motion.shot_poses_for(ngrad, st, tr_s=tr))
+            shot_poses = np.ascontiguousarray(artifacts.motion.shot_poses_for(ngrad, st, tr_s=tr, offsets=offsets))
         if se.spin_history:
             jumps = any(any(v != 0.0 for v in (*e["jump_mm"], *e["jump_deg"])) for e in events)
             if not jumps and poses is None:

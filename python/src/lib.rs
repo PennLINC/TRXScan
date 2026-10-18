@@ -640,9 +640,7 @@ impl Compartments {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
         let events = events_from(events)?;
-        let poses: Option<Vec<Pose>> = volume_poses.map(|a| {
-            a.as_array().rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect()
-        });
+        let poses = volume_poses.map(|a| poses_from_rows("volume_poses", &a)).transpose()?;
         let mut g = self.lock()?;
         check_len("bvals", bvals.len(), g.ngrad)?;
         let (dims, ngrad) = (g.dims, g.ngrad);
@@ -694,9 +692,7 @@ impl Compartments {
         let v2w = affine4(&affine)?;
         let bvals = f64s(&bvals)?;
         let events = events_from(events)?;
-        let poses: Option<Vec<Pose>> = volume_poses.map(|a| {
-            a.as_array().rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect()
-        });
+        let poses = volume_poses.map(|a| poses_from_rows("volume_poses", &a)).transpose()?;
         let mut g = self.lock()?;
         check_len("bvals", bvals.len(), g.ngrad)?;
         let (dims, ngrad) = (g.dims, g.ngrad);
@@ -1074,6 +1070,9 @@ fn sample_poses<'py>(py: Python<'py>, times: Vec<f64>, poses: PyReadonlyArray2<'
 {
     let poses = poses_from_rows("poses", &poses)?;
     check_len("poses rows", poses.len(), times.len())?;
+    if let Some(bad) = query.iter().find(|t| !t.is_finite()) {
+        return Err(verr(format!("sample_poses: query time {bad} is not finite")));
+    }
     let at: Vec<Pose> = match what {
         Some(w) => {
             if times.windows(2).any(|p| !(p[1] > p[0])) || times.iter().any(|t| !t.is_finite()) {

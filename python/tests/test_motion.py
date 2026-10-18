@@ -208,6 +208,69 @@ def test_shot_pose_bindings_check_their_shapes(gtab6):
         _core.motion_shots_tsv(np.asarray(box.sim_affine), tuple(box.sim_dims), offsets, 3.0, int(gtab6.bvals.size), [], 0, vp, ok[:-1])
 
 
+def test_shot_motion_bindings_validate_volume_poses(gtab6):
+    # implementation review: the bindings that apply the motion check volume_poses too, with a
+    # ValueError rather than an index panic
+    from trxscan import _core
+    from trxscan._arrays import as_gtab, b_max_of
+
+    box = ts.objects.box(8, matrix=16, nz=6)
+    bvals, bvecs, _, _ = as_gtab(gtab6)
+    b_max = b_max_of(bvals)
+    params = ts.Protocol.DEFAULT.tissue.to_params(b_max, ts.Protocol.DEFAULT.diff_scale)
+    mix = _core.mixture_from_fibers(box.sim_dims, box.fibers.voxel, box.fibers.dirs, box.fibers.weight,
+                                    box.sim_wm, box.sim_gm, box.sim_csf, box.sim_mask, params, None)
+    comp = _core.signal_from_mixture(mix, bvals, bvecs, None)
+    offsets = _core.shot_offsets(6, 1, "sequential", 3.0)
+    n = int(bvals.size)
+    good = np.zeros((n * 6, 6))
+    for bad in (np.zeros((n, 5)), np.full((n, 6), np.nan)):
+        with pytest.raises(ValueError, match="volume_poses"):
+            comp.apply_shot_motion(np.asarray(box.sim_affine), offsets, 3.0, bvals, b_max, [], None, None, bad, 1, shot_poses=good)
+    with pytest.raises(ValueError, match="volume_poses"):
+        comp.apply_shot_motion(np.asarray(box.sim_affine), offsets, 3.0, bvals, b_max, [], None, None, None, 1, shot_poses=good)
+    with pytest.raises(ValueError, match="shot_poses"):
+        comp.apply_shot_motion(np.asarray(box.sim_affine), offsets, 3.0, bvals, b_max, [], None, None, np.zeros((n, 6)), 1,
+                               shot_poses=good[:-1])
+    # sample_poses refuses what a timed trace cannot answer
+    with pytest.raises(ValueError):
+        _core.sample_poses(np.array([]), np.zeros((0, 6)), [0.0], "trace")
+    with pytest.raises(ValueError, match="not finite"):
+        _core.sample_poses(np.array([0.0, 1.0]), np.zeros((2, 6)), [np.nan], "trace")
+    m = ts.Motion.timed([0.0, 10.0], [[0, 0, 0], [0, 0, 1]], [[0, 0, 0], [0, 0, 0]])
+    with pytest.raises(ValueError, match="positive tr_s"):
+        m.poses_for(2, tr_s=0.0)
+
+
+def test_shot_sampling_refusals(gtab6):
+    # implementation review: shot sampling needs the whole stack (one rotation centre for the
+    # re-simulation and the remainder), and Artifacts.dropout is not silently dropped
+    obj = _streamline_box(nz=6)
+    proto = ts.Protocol.DEFAULT.replace(tr_s=3.0)
+    m = ts.Motion.timed([0.0, 100.0], [[0, 0, 0], [0, 0, 1]], [[0, 0, 0], [0, 0, 5.0]], sampling="shot")
+    with pytest.raises(ValueError, match="whole slice stack"):
+        obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, chunk=2)
+    with pytest.raises(ValueError, match="whole slice stack"):
+        obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, slices=[2, 3])
+    with pytest.raises(ValueError, match="ShotEvents"):
+        obj.simulate(gtab6, proto.replace(mb=2), ts.Artifacts(motion=m, dropout=0.5), kspace=False, clean_b0=False)
+
+
+def test_a_protocol_slice_timing_offset_places_the_reference_pose(gtab6):
+    # implementation review: a protocol SliceTiming that starts at 0.2 s puts each volume's first
+    # shot, and so its re-simulated pose, there
+    obj = _streamline_box(nz=6)
+    proto = ts.Protocol.DEFAULT.replace(tr_s=3.0, slice_timing=(0.2, 0.7, 1.2, 1.7, 2.2, 2.7))
+    n = int(gtab6.bvals.size)
+    ramp = ts.Motion.timed([0.0, 3.0 * n + 1], [[0, 0, 0], [0, 0, 3.0 * n + 1]], [[0, 0, 0], [0, 0, 0]], sampling="shot")
+    sim = obj.simulate(gtab6, proto, ts.Artifacts(motion=ramp, shot_events=ts.ShotEvents(slice_order="protocol")),
+                       kspace=False, clean_b0=False)
+    first = [l.split("\t") for l in sim.motion_shots.splitlines()[1:] if l.split("\t")[1] == "0"]
+    for r in first:
+        v, t, z = int(r[0]), float(r[3]), float(r[6])
+        assert t == pytest.approx(3.0 * v + 0.2) and z == pytest.approx(t, abs=1e-9)
+
+
 def _streamline_box(nz=6):
     """A box with straight streamlines along x through it (the re-simulation path needs them)."""
     import dataclasses
