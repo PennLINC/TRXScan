@@ -120,8 +120,10 @@ class KSpace:
 
         One ``Acquisition`` per (volume, slice, ky line) with data ``(coil, nx)``; volumes map to
         ``idx.repetition``, slices to ``idx.slice``, the ky index to
-        ``idx.kspace_encode_step_1``; lines inside the ACS band are flagged
-        ``ACQ_IS_PARALLEL_CALIBRATION``. Un-acquired lines are not written.
+        ``idx.kspace_encode_step_1``. Un-acquired lines are not written. Under GRAPPA a volume reads
+        every ``accel``-th line only: the kernel is fitted on a separate reference scan
+        (``calibrationMode`` ``separate``), which is not exported, so no line is flagged
+        ``ACQ_IS_PARALLEL_CALIBRATION``.
         """
         try:
             import ismrmrd
@@ -134,7 +136,6 @@ class KSpace:
         if path.exists():
             path.unlink()
         n_vol, n_sl, n_coil, ny, nx = self.acquired.shape
-        acs = int(self.meta.get("acs_lines", 0))
         accel = int(self.meta.get("accel", 1))
         ys = ny // 2
         dset = ismrmrd.Dataset(str(path), "dataset", create_if_needed=True)
@@ -170,7 +171,7 @@ class KSpace:
             af = xsd.accelerationFactorType()
             af.kspace_encoding_step_1, af.kspace_encoding_step_2 = accel, 1
             pi.accelerationFactor = af
-            pi.calibrationMode = xsd.calibrationModeType.EMBEDDED
+            pi.calibrationMode = xsd.calibrationModeType.SEPARATE
             enc.parallelImaging = pi
         header.encoding.append(enc)
         dset.write_xml_header(xsd.ToXML(header))
@@ -189,8 +190,6 @@ class KSpace:
                     acq.center_sample = nx // 2
                     acq.available_channels = n_coil
                     acq.active_channels = n_coil
-                    if accel > 1 and abs(ky - ys) <= acs // 2:
-                        acq.setFlag(ismrmrd.ACQ_IS_PARALLEL_CALIBRATION)
                     if ky == self.mask[:, 0].nonzero()[0][0]:
                         acq.setFlag(ismrmrd.ACQ_FIRST_IN_SLICE)
                     if ky == self.mask[:, 0].nonzero()[0][-1]:

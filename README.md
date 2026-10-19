@@ -192,7 +192,7 @@ sidecars (`PhaseEncodingDirection`, `TotalReadoutTime`, `EchoTime`, …). Option
 | `--noise-map <nii>` | — | per-voxel noise SD on the acquisition grid (image-space, shared by mag and phase); writes `<out>_desc-noise_sigma.nii.gz` as ground truth |
 | `--eddy <s>` / `--eddy-quad <s>` | 0 | linear / quadratic eddy-current geometric distortion (b0 exempt) |
 | `--eddy-phase <s>` | 0 | direction- and b-dependent eddy phase ramp on the reconstructed phase (about 1.7e-5 matches a 3T HBCD scan) |
-| `--accel <R>` | 1 | GRAPPA acceleration (24 ACS lines) |
+| `--accel <R>` | 1 | GRAPPA acceleration: each volume reads every R-th line; the kernel is fitted once per series on a separate 24-line reference scan |
 | `--coils <n>` | 1 | receiver coils (ring-arranged sensitivities, Roemer combine) |
 | `--motion <tsv>` | — | qsiprep/eddy confounds TSV (`trans_x/y/z` mm, `rot_x/y/z` rad); per-volume re-simulation. A `time` column (s), or a sidecar at the same path with `.json` holding `SamplingFrequency` (and `StartTime`), makes it a timed trace on the run's clock (volume `v` at `v x --tr`; needs `--tr`), which must cover every time it is sampled at |
 | `--motion-sampling <s>` | shot for a timed trace, volume otherwise | `shot`: each shot at the trace's pose at its own time, the motion beyond the volume's pose resampled per shot (not re-simulated); writes `<out>_desc-motionShots.tsv`. `volume`: each volume at the trace's pose at its first shot. aslscan's `tools/motion_trace.py` makes timed traces (nods, steps, drifts) |

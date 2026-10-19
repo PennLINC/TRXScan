@@ -1295,6 +1295,8 @@ fn simulate_acquisition<'py>(
             capture: cap,
             t_echo_per_volume: te_per_volume.as_deref(),
             progress: if cb.is_some() { Some(&call_progress) } else { None },
+            // GRAPPA's reference scan: mrsim-acq's default, the call's first volume
+            ..Default::default()
         };
         kspace::simulate_acquisition_complex(&inp, &acq, &opts)
     });
