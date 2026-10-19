@@ -12,8 +12,16 @@ places:**
   whole-volume signal and resamples the finished images per slice-group, layering within-volume
   shot jumps and b-scaled dropout on top (with the dropped-slice ground truth). The
   per-volume re-simulation (`compartments::generate_compartments_moving`) is volume-level only.
-- *GRAPPA* (§2) is as designed except the coil combination: it is a Roemer combine with the
-  known sensitivities, not RSS (`kspace.rs`, `simulate_slice`).
+- *GRAPPA* (§2) differs in two ways:
+  - The coil combination is a Roemer combine with the known sensitivities, not RSS (`kspace.rs`,
+    `simulate_slice`).
+  - Since mrsim-acq tag `grappa-reference-scan`, a volume no longer keeps the ACS band. It reads
+    every `R`-th line, as a scanner's EPI does, and the kernel synthesizes the rest, the centre
+    included. Each slice's kernel is fitted once per series, on the central `acs_lines` of a
+    separate, fully sampled reference scan of the first volume's object, then applied to every
+    volume. The Tikhonov term is relative to the fit, so the temporal noise is thermal noise
+    through one linear map. (Per-volume fits on an ACS band kept in each volume made it high-pass
+    along phase encode and sub-thermal in its scaling.)
 - The *TOML config surface* was never written: `config.rs` is a `todo!()` stub and the protocol is
   `kspace::hbcd_acquisition` in the library plus `clap` flags in `src/bin/trxscan.rs`.
 
