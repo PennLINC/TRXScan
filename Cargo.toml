@@ -34,7 +34,7 @@ config = ["dep:serde", "dep:toml", "mrsim-acq/config"]
 # ground-truth ODF/peak export + optional SH `todf` fast-mode (pulls odx-rs → hdf5)
 odx = ["dep:odx-rs", "io"]
 # command-line front end (clap); implies `io` since the binaries read/write NIfTI + TRX
-cli = ["dep:clap", "io"]
+cli = ["dep:clap", "dep:serde_json", "io"]
 # parallelism
 par = ["dep:rayon", "mrsim-acq/par"]
 
@@ -62,7 +62,7 @@ odx-rs = { git = "https://github.com/PennLINC/odx-rs", tag = "v0.1.3", optional 
 # volume I/O), shared with aslscan. To build against a local checkout, add to .cargo/config.toml:
 #   [patch."https://github.com/PennLINC/mrsim-acq"]
 #   mrsim-acq = { path = "../mrsim-acq" }
-mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "p9-complete" }
+mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "p10-complete" }
 # --- I/O + math (versions matched to the sibling crates) ---
 nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
 ndarray = { version = "0.16", optional = true }
@@ -74,3 +74,5 @@ rayon = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+# --motion sidecars (P10: a timed trace's SamplingFrequency)
+serde_json = { version = "1", optional = true }

@@ -268,7 +268,9 @@ pub fn check_shot_timing(offsets: &[f64], mb: usize, tr_s: f64) -> Result<(), St
 /// images are resampled by) and `history` (the head's actual pose, for spin history). Without
 /// per-volume poses both are the shot's cumulative jump `J`. With them (the `--motion` /
 /// `Artifacts.motion` path, whose images the re-simulation already put at the volume pose `P`),
-/// `geometry` is `J` and `history` is `J . P`.
+/// `geometry` is `J` and `history` is `J . P`. With per-shot poses `P(t)` from a trajectory (P10,
+/// [`ShotPlan::with_shot_poses`]), `history` is `J . P(t)` and `geometry` is `J . P(t) . P^-1`, the
+/// motion left after the re-simulation's `P`; where `P(t)` is `P` that is `J` exactly.
 #[derive(Debug, Clone)]
 pub struct ShotPlan {
     pub schedule: Vec<Vec<usize>>,
@@ -280,6 +282,8 @@ pub struct ShotPlan {
     /// images already carry.
     pub volume: Vec<[[f64; 4]; 4]>,
     pub events: Vec<MotionEvent>,
+    /// The rotation centre every transform is built about (the full stack's field-of-view centre).
+    pub center: [f64; 3],
 }
 
 /// The inverse of a rigid world-space transform: `[R^T | -R^T t]`.
@@ -309,6 +313,16 @@ impl ShotPlan {
     /// centre is the rotation centre).
     pub fn new(offsets: &[f64], n_volumes: usize, tr_s: f64, volume_poses: Option<&[Pose]>, events: Vec<MotionEvent>,
                full_grid: &mrsim_acq::grid::Grid) -> ShotPlan {
+        Self::with_shot_poses(offsets, n_volumes, tr_s, volume_poses, None, events, full_grid)
+    }
+
+    /// [`ShotPlan::new`] with each shot's pose from a trajectory (P10): `shot_poses[v][s]`, the
+    /// trajectory's pose `P(t)` at shot `s` of volume `v` (see [`ShotPlan::shot_times`]). `None` is
+    /// [`ShotPlan::new`]'s plan exactly.
+    pub fn with_shot_poses(offsets: &[f64], n_volumes: usize, tr_s: f64, volume_poses: Option<&[Pose]>,
+                           shot_poses: Option<&[Vec<Pose>]>, events: Vec<MotionEvent>, full_grid: &mrsim_acq::grid::Grid)
+        -> ShotPlan
+    {
         let schedule = slice_schedule_from_times(offsets);
         let c = fov_center(full_grid.dims, full_grid.voxel_to_world);
         let mat = |p: Pose| if p == Pose::IDENTITY { IDENTITY_MATRIX } else { p.to_matrix(c) };
@@ -319,7 +333,8 @@ impl ShotPlan {
         let mut volume = vec![IDENTITY_MATRIX; n_volumes];
         for v in 0..n_volumes {
             let mut cum = Pose::IDENTITY;
-            let pm = mat(volume_poses.and_then(|p| p.get(v).copied()).unwrap_or(Pose::IDENTITY));
+            let pv = volume_poses.and_then(|p| p.get(v).copied()).unwrap_or(Pose::IDENTITY);
+            let pm = mat(pv);
             volume[v] = pm;
             for (s, slices) in schedule.iter().enumerate() {
                 for e in events.iter().filter(|e| e.volume == v && e.shot == s) {
@@ -330,12 +345,59 @@ impl ShotPlan {
                 }
                 times[v][s] = v as f64 * tr_s + offsets[slices[0]];
                 let jm = mat(cum);
-                geometry[v][s] = jm;
-                history[v][s] = if pm == IDENTITY_MATRIX { jm } else if jm == IDENTITY_MATRIX { pm } else { matmul4(&jm, &pm) };
+                match shot_poses.and_then(|sp| sp.get(v)).and_then(|r| r.get(s)).copied() {
+                    None => {
+                        geometry[v][s] = jm;
+                        history[v][s] = if pm == IDENTITY_MATRIX { jm } else if jm == IDENTITY_MATRIX { pm } else { matmul4(&jm, &pm) };
+                    }
+                    Some(pt) => {
+                        let ptm = mat(pt);
+                        let a = if ptm == IDENTITY_MATRIX { jm } else if jm == IDENTITY_MATRIX { ptm } else { matmul4(&jm, &ptm) };
+                        history[v][s] = a;
+                        geometry[v][s] = if pt == pv { jm } else { matmul4(&a, &rigid_inverse(&pm)) };
+                    }
+                }
             }
         }
-        ShotPlan { schedule, times, geometry, history, volume, events }
+        ShotPlan { schedule, times, geometry, history, volume, events, center: c }
     }
+
+    /// Each shot's time (`v * tr_s + offset`, the clock a timed trace is sampled on) for `offsets`
+    /// and `n_volumes`, without building a plan: what [`ShotPlan::with_shot_poses`] needs poses at.
+    pub fn shot_times(offsets: &[f64], n_volumes: usize, tr_s: f64) -> Vec<Vec<f64>> {
+        let schedule = slice_schedule_from_times(offsets);
+        (0..n_volumes).map(|v| schedule.iter().map(|sl| v as f64 * tr_s + offsets[sl[0]]).collect()).collect()
+    }
+
+    /// `history[v][s]` as a pose (the head's pose at the shot), for `desc-motionShots.tsv`.
+    pub fn pose(&self, v: usize, s: usize) -> Pose {
+        Pose::from_matrix(self.history[v][s], self.center)
+    }
+}
+
+/// P10: the per-shot truth, aslscan's `desc-motionShots_gt.tsv` format: `volume`, `shot`, `slices`,
+/// `time` (s, the series clock) and the six parameters of the head's pose at the shot
+/// (`history`), rotations in radians. A pose the `Rz Ry Rx` angles cannot reproduce (pitch at 90
+/// degrees) is refused rather than written wrong.
+pub fn write_motion_shots(plan: &ShotPlan) -> Result<String, String> {
+    let mut s = String::from("volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n");
+    for (v, times) in plan.times.iter().enumerate() {
+        for (k, t) in times.iter().enumerate() {
+            let q = plan.pose(v, k);
+            let m = plan.history[v][k];
+            let err = q.to_matrix(plan.center).iter().flatten().zip(m.iter().flatten()).fold(0.0f64, |e, (a, b)| e.max((a - b).abs()));
+            if err > 1e-9 {
+                return Err(format!(
+                    "the head's pose at volume {v}, shot {k} ({t} s) is a rotation at 90 degrees of pitch, which the shots \
+                     table's Rz Ry Rx angles cannot represent (reconstruction error {err:.2e})"));
+            }
+            let r = q.rot_deg.map(f64::to_radians);
+            let slices = plan.schedule[k].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(",");
+            s.push_str(&format!("{v}\t{k}\t{slices}\t{t}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                q.trans_mm[0], q.trans_mm[1], q.trans_mm[2], r[0], r[1], r[2]));
+        }
+    }
+    Ok(s)
 }
 
 /// Read an events TSV in aslscan's `desc-motionEvents_gt.tsv` format: `volume`, `shot`, `slices`
@@ -643,6 +705,65 @@ mod tests {
         assert!(at(4, 3) < -1e-3, "the tissue at x = 4 is corrected: {}", at(4, 3));
         assert!(at(6, 3).abs() < 1e-7 && at(2, 3).abs() < 1e-7, "nothing where there is no tissue: {} {}", at(6, 3), at(2, 3));
         assert!(shot_offsets(5, 2, SliceOrder::Sequential, 3.0).is_err(), "5 slices at multiband 2");
+    }
+
+    /// P10: per-shot poses from a trajectory. `geometry . P_v` is `history` for every shot (the
+    /// re-simulation put the images at `P_v`); shot poses equal to the volume's give `new`'s plan
+    /// bit for bit; `None` is `new` exactly; the shots table holds the plan's times and poses.
+    #[test]
+    fn shot_poses_leave_the_rest_of_the_motion_to_the_geometry() {
+        let mut v2w = IDENTITY_MATRIX;
+        v2w[0][0] = 1.5;
+        v2w[1][1] = 1.5;
+        v2w[2][2] = 3.0;
+        let grid = mrsim_acq::grid::Grid { dims: [8, 6, 6], voxel_to_world: v2w };
+        let offsets = shot_offsets(6, 2, SliceOrder::Interleaved, 3.0).unwrap();
+        let pv = [Pose { trans_mm: [0.5, 0.0, 0.2], rot_deg: [0.0, 1.5, 3.0] }, Pose::IDENTITY];
+        let jump = MotionEvent { volume: 0, shot: 1, severity: 0.0, jump_mm: [0.0, 0.3, 0.0], jump_deg: [1.0, 0.0, 0.0] };
+        let times = ShotPlan::shot_times(&offsets, 2, 3.0);
+        assert_eq!(times[1], vec![3.0, 4.0, 5.0]);
+        // a trajectory that keeps moving through the volume
+        let shot_poses: Vec<Vec<Pose>> = times.iter().map(|ts| ts.iter().map(|t| Pose {
+            trans_mm: [0.5, 0.1 * t, 0.2 + 0.3 * t], rot_deg: [0.2 * t, 1.5, 3.0 - t] }).collect()).collect();
+        let plan = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&pv), Some(&shot_poses), vec![jump], &grid);
+        for v in 0..2 {
+            for s in 0..3 {
+                let back = matmul4(&plan.geometry[v][s], &plan.volume[v]);
+                for (a, b) in back.iter().flatten().zip(plan.history[v][s].iter().flatten()) {
+                    assert!((a - b).abs() < 1e-12, "v{v} s{s}: geometry . P_v {a} vs history {b}");
+                }
+            }
+        }
+        // the shot's own pose, with the jump composed on top
+        let c = plan.center;
+        let want = matmul4(&Pose { rot_deg: jump.jump_deg, trans_mm: jump.jump_mm }.to_matrix(c), &shot_poses[0][2].to_matrix(c));
+        assert_eq!(plan.history[0][2], want);
+        // held at the volume pose: new's plan, bit for bit
+        let held: Vec<Vec<Pose>> = (0..2).map(|v| vec![pv[v]; 3]).collect();
+        let a = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&pv), Some(&held), vec![jump], &grid);
+        let b = ShotPlan::new(&offsets, 2, 3.0, Some(&pv), vec![jump], &grid);
+        assert_eq!((&a.geometry, &a.history, &a.volume, &a.times), (&b.geometry, &b.history, &b.volume, &b.times));
+        let none = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&pv), None, vec![jump], &grid);
+        assert_eq!((&none.geometry, &none.history), (&b.geometry, &b.history));
+        // the shots table
+        let tsv = write_motion_shots(&plan).unwrap();
+        let rows: Vec<Vec<&str>> = tsv.lines().skip(1).map(|l| l.split('\t').collect()).collect();
+        assert_eq!(tsv.lines().next().unwrap(), "volume\tshot\tslices\ttime\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z");
+        assert_eq!(rows.len(), 6);
+        for r in &rows {
+            let (v, s): (usize, usize) = (r[0].parse().unwrap(), r[1].parse().unwrap());
+            assert_eq!(r[3].parse::<f64>().unwrap(), plan.times[v][s]);
+            let q = plan.pose(v, s);
+            assert!((r[6].parse::<f64>().unwrap() - q.trans_mm[2]).abs() < 1e-12);
+            assert!((r[9].parse::<f64>().unwrap() - q.rot_deg[2].to_radians()).abs() < 1e-12);
+        }
+        assert_eq!(rows[1][2], plan.schedule[1].iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
+        // final review: a trajectory at (20, 45, 0) degrees with a (0, 45, 0) jump is at 90 degrees of
+        // pitch; the table refuses it rather than writing angles that do not reproduce it
+        let lock = vec![vec![Pose { rot_deg: [20.0, 45.0, 0.0], trans_mm: [0.0; 3] }; 3]; 2];
+        let tilt = MotionEvent { volume: 0, shot: 0, severity: 0.0, jump_mm: [0.0; 3], jump_deg: [0.0, 45.0, 0.0] };
+        let bad = ShotPlan::with_shot_poses(&offsets, 2, 3.0, Some(&[Pose::IDENTITY; 2]), Some(&lock), vec![tilt], &grid);
+        assert!(write_motion_shots(&bad).unwrap_err().contains("90 degrees"));
     }
 
     /// Final-review fix: shot timing is checked before a plan is built.

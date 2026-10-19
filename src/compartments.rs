@@ -864,6 +864,24 @@ pub fn generate_compartments_moving(
     params: &CompartmentParams,
     poses: &[crate::motion::Pose],
 ) -> Compartments {
+    let center = crate::motion::fov_center(grid.dims, grid.voxel_to_world);
+    generate_compartments_moving_about(grid, center, positions, offsets, tissue, scheme, params, poses)
+}
+
+/// [`generate_compartments_moving`] rotating about `center` (world mm) rather than `grid`'s own
+/// FOV centre: a slab of a larger stack passes the full stack's centre, so every slab of a volume
+/// moves by the same rigid transform.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_compartments_moving_about(
+    grid: &Grid,
+    center: [f64; 3],
+    positions: &[[f64; 3]],
+    offsets: &[u32],
+    tissue: &TissueFractions,
+    scheme: &GradientScheme,
+    params: &CompartmentParams,
+    poses: &[crate::motion::Pose],
+) -> Compartments {
     let [nx, ny, nz] = grid.dims;
     let nvox = nx * ny * nz;
     let ngrad = scheme.len();
@@ -876,7 +894,19 @@ pub fn generate_compartments_moving(
     let seg_area = PI * params.fiber_radius_mm * params.fiber_radius_mm;
     let md = (params.d_extra.0 + params.d_extra.1 + params.d_extra.2) / 3.0;
     let n_streamlines = offsets.len().saturating_sub(1);
-    let center = crate::motion::fov_center(grid.dims, grid.voxel_to_world);
+    // `resample_by_pose` rotates about the grid's own centre c; about `center` c' the same motion is
+    // that rotation plus the translation (I - R)(c' - c)
+    let own = crate::motion::fov_center(grid.dims, grid.voxel_to_world);
+    let shift = [center[0] - own[0], center[1] - own[1], center[2] - own[2]];
+    let resample_pose = |pose: crate::motion::Pose| {
+        if shift == [0.0; 3] {
+            return pose;
+        }
+        let r = mat::rotation_zyx_deg(pose.rot_deg[0], pose.rot_deg[1], pose.rot_deg[2]);
+        let rs = mat::matvec(&r, shift);
+        let t = pose.trans_mm;
+        crate::motion::Pose { trans_mm: [t[0] + (shift[0] - rs[0]), t[1] + (shift[1] - rs[1]), t[2] + (shift[2] - rs[2])], ..pose }
+    };
     let mask_f: Vec<f32> = tissue.mask.iter().map(|&m| m as f32).collect();
 
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -891,6 +921,7 @@ pub fn generate_compartments_moving(
         };
         let grad = grads[g];
         // tissue moves with the head
+        let pose = resample_pose(pose);
         let (mwm, mgm, mcsf, mmask) = (
             crate::motion::resample_by_pose(&tissue.wm, grid.dims, grid.voxel_to_world, pose),
             crate::motion::resample_by_pose(&tissue.gm, grid.dims, grid.voxel_to_world, pose),
@@ -987,6 +1018,65 @@ mod tests {
                 [0.0, 0.0, 0.0, 1.0],
             ],
         }
+    }
+
+    #[test]
+    fn a_slab_moved_about_the_full_stack_centre_matches_the_full_run() {
+        // a 10-slice stack and its slices 3..8: rotated about the full stack's centre, the slab's
+        // interior slices are the full run's; about the slab's own centre they are not
+        let (n, nz, z0, z1) = (8usize, 10usize, 3usize, 8usize);
+        let full = Grid { dims: [n, n, nz], ..grid_1mm(n) };
+        let nv = n * n * nz;
+        let flat = |x: usize, y: usize, z: usize| x + n * (y + n * z);
+        let (mut wm, mut gm, csf, mut mask) = (vec![0f32; nv], vec![0f32; nv], vec![0f32; nv], vec![0u8; nv]);
+        for z in 1..nz - 1 {
+            for y in 1..n - 1 {
+                for x in 1..n - 1 {
+                    let w = if (2..6).contains(&y) { 0.8 } else { 0.1 };
+                    (wm[flat(x, y, z)], gm[flat(x, y, z)], mask[flat(x, y, z)]) = (w, 1.0 - w, 1);
+                }
+            }
+        }
+        // streamlines along x and one oblique through the stack
+        let mut positions = Vec::new();
+        let mut offsets = vec![0u32];
+        for (y, z) in [(2.5, 2.5), (3.5, 4.5), (4.5, 6.5), (3.0, 5.0)] {
+            positions.extend([[0.2, y, z], [7.8, y, z]]);
+            offsets.push(positions.len() as u32);
+        }
+        positions.extend([[1.5, 2.2, 0.5], [6.5, 5.8, 9.5]]);
+        offsets.push(positions.len() as u32);
+        let tissue = TissueFractions { dims: [n, n, nz], wm: wm.clone(), gm: gm.clone(), csf: csf.clone(), mask: mask.clone() };
+        let scheme = GradientScheme::from_str("0 1000 1000", "0 1 0\n0 0 1\n0 0 0").unwrap();
+        let params = CompartmentParams { b_value: 1000.0, ..Default::default() };
+        let poses = vec![crate::motion::Pose { trans_mm: [0.2, -0.3, 0.1], rot_deg: [4.0, -3.0, 5.0] }; 3];
+        let whole = generate_compartments_moving(&full, &positions, &offsets, &tissue, &scheme, &params, &poses);
+
+        let per = n * n;
+        let cut = |v: &[f32]| v[z0 * per..z1 * per].to_vec();
+        let cut8 = |v: &[u8]| v[z0 * per..z1 * per].to_vec();
+        let slab_tissue = TissueFractions { dims: [n, n, z1 - z0], wm: cut(&wm), gm: cut(&gm), csf: cut(&csf), mask: cut8(&mask) };
+        let mut slab = Grid { dims: [n, n, z1 - z0], ..full.clone() };
+        slab.voxel_to_world[2][3] += z0 as f64;
+        let c = crate::motion::fov_center(full.dims, full.voxel_to_world);
+        let about = generate_compartments_moving_about(&slab, c, &positions, &offsets, &slab_tissue, &scheme, &params, &poses);
+        let own = generate_compartments_moving(&slab, &positions, &offsets, &slab_tissue, &scheme, &params, &poses);
+        let ng = scheme.len();
+        // the slab's interior (local slices 1..4, away from its cut faces)
+        let (lo, hi) = (per * ng, 4 * per * ng);
+        let (mut worst, mut own_worst) = (0.0f32, 0.0f32);
+        for k in 0..whole.images.len() {
+            let w = &whole.images[k][(z0 * per * ng + lo)..(z0 * per * ng + hi)];
+            for (i, &v) in w.iter().enumerate() {
+                worst = worst.max((about.images[k][lo + i] - v).abs());
+                own_worst = own_worst.max((own.images[k][lo + i] - v).abs());
+            }
+        }
+        assert!(worst < 1e-5, "about the full stack's centre the slab matches the full run: {worst}");
+        assert!(own_worst > 1e-2, "about the slab's own centre it does not: {own_worst}");
+        // on the full grid, its own centre is the same run bit for bit
+        let again = generate_compartments_moving_about(&full, c, &positions, &offsets, &tissue, &scheme, &params, &poses);
+        assert_eq!(again.images, whole.images);
     }
 
     #[test]

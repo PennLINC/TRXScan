@@ -81,7 +81,7 @@ Signal   streamlines + tissue maps + scheme → clean per-voxel, per-gradient si
          raster (exact 3D-DDA) → signal (Stick/Tensor/Ball) → compartments
 Acquire  per-slice k-space: distortion · T2* · eddy · ghost · PF · ringing · spikes · coils · GRAPPA · noise
          readout (EPI trajectory/timing) → kspace
-Motion   cuts across both: poses per volume, or per shot (any slice order, single band too), with spin history
+Motion   cuts across both: poses per volume, or per shot (any slice order, single band too, from timed traces), with spin history
 ```
 
 **The acquisition stage lives in [mrsim-acq](https://github.com/PennLINC/mrsim-acq)**, shared with
@@ -193,7 +193,7 @@ F-contiguous `(nx, ny, nz)` array; 4-D as `(x + nx*(y + ny*z))*ngrad + g` = a C-
 `float32` pairs viewed as `complex64`; every heavy call releases the GIL. The Rust entry points
 the binding needs are `kspace::simulate_acquisition_complex` (complex output, k-space capture,
 per-volume TE, `slice_z`/`nz_full` for slab runs), `compartments::mixture_from_fibers`,
-`streamlines::subsample_streamlines`, `motion::{dropout_events, apply_multiband_motion_slab, ShotPlan, apply_shot_motion, apply_shot_motion_with_spin_history, load_motion_events, write_motion_events}`. `Artifacts.shot_events` (a `ShotEvents`) is per-shot motion and is independent of `Artifacts.motion`, so it never selects the re-simulation path; spin history needs `Protocol.t1_s`, `Protocol.tr_s` and the whole slice stack.
+`streamlines::subsample_streamlines`, `motion::{dropout_events, apply_multiband_motion_slab, ShotPlan, apply_shot_motion, apply_shot_motion_with_spin_history, load_motion_events, write_motion_events, load_motion_trace, write_motion_shots}`. `Artifacts.shot_events` (a `ShotEvents`) is per-shot motion and is independent of `Artifacts.motion`, so it never selects the re-simulation path; spin history needs `Protocol.t1_s`, `Protocol.tr_s` and the whole slice stack. A timed `Motion` (P10, `Motion.times`) is sampled on the run's clock and needs `Protocol.tr_s`; `Motion(sampling="shot")`, its default, runs the per-shot path (`ShotPlan::with_shot_poses`, chunked runs included) with each shot's remainder beyond its volume's pose **resampled, not re-simulated**, and fills `Simulation.motion_shots`.
 
 ```bash
 cd python && maturin develop --release && pytest tests -m "not phantom"   # in a virtualenv
