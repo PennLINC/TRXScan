@@ -62,7 +62,7 @@ odx-rs = { git = "https://github.com/PennLINC/odx-rs", tag = "v0.1.3", optional 
 # volume I/O), shared with aslscan. To build against a local checkout, add to .cargo/config.toml:
 #   [patch."https://github.com/PennLINC/mrsim-acq"]
 #   mrsim-acq = { path = "../mrsim-acq" }
-mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "p10-complete" }
+mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "trilinear-edge-fix" }
 # --- I/O + math (versions matched to the sibling crates) ---
 nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
 ndarray = { version = "0.16", optional = true }
