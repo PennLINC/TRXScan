@@ -245,11 +245,12 @@ def test_shot_motion_bindings_validate_volume_poses(gtab6):
 def test_shot_sampling_works_chunked_and_refuses_dropout(gtab6):
     # per-shot sampling on slabs: the re-simulation and the shot plan both rotate about the whole
     # stack's centre, so a chunked run equals the unchunked one; Artifacts.dropout is refused
-    # rather than silently dropped
+    # rather than silently dropped (review: the pitch makes a slab-centred rotation differ, which
+    # a rotation about z alone cannot show)
     obj = _streamline_box(nz=12)
     proto = ts.Protocol.DEFAULT.replace(tr_s=3.0)
     n = int(gtab6.bvals.size)
-    m = ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 1.0, 0.3]], [[0, 0, 0], [0, 0, 5.0]])
+    m = ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 1.0, 0.3]], [[0, 0, 0], [2.0, 0, 5.0]])
     assert m.sampling == "shot", "a timed trace is sampled per shot by default"
     full = obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False)
     chunked = obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, chunk=4)
@@ -257,6 +258,9 @@ def test_shot_sampling_works_chunked_and_refuses_dropout(gtab6):
     b = np.asarray(chunked.magnitude.dataobj, dtype=float)
     assert np.allclose(a, b, rtol=1e-5, atol=1e-6 * a.max())
     assert full.motion_shots == chunked.motion_shots
+    part = obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, slices=range(4, 8))
+    c = np.asarray(part.magnitude.dataobj, dtype=float)
+    assert np.allclose(a[:, :, 4:8], c, rtol=1e-5, atol=1e-6 * a.max())
     with pytest.raises(ValueError, match="ShotEvents"):
         obj.simulate(gtab6, proto.replace(mb=2), ts.Artifacts(motion=m, dropout=0.5), kspace=False, clean_b0=False)
 

@@ -94,7 +94,9 @@ class Motion:
     #: the rows are volumes.
     times: np.ndarray | None = None
     #: P10: ``"volume"`` (one pose per volume) or ``"shot"`` (each shot at its own time); ``None``
-    #: resolves to ``"shot"`` for a timed trajectory and ``"volume"`` otherwise.
+    #: resolves to ``"shot"`` for a timed trajectory and ``"volume"`` otherwise. It resolves at
+    #: construction, so ``dataclasses.replace`` keeps the resolved value: give ``sampling`` too
+    #: when a copy adds or removes ``times``.
     sampling: Literal["volume", "shot"] | None = None
 
     def __post_init__(self) -> None:

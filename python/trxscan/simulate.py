@@ -318,7 +318,11 @@ def run(
     slab's orientation histogram instead of the whole volume's. The result equals the unchunked
     run exactly, except that the GNL warp agrees only to float rounding and within-volume
     dropout jumps (which resample across slices) agree to the extent ``context`` covers the
-    jump, as for any slab run. k-space capture is not available chunked. ``progress`` is called as
+    jump, as for any slab run. Motion is bounded the same way: a slab run (``slices``, ``z_mm``,
+    ``chunk``) holds only its slices plus ``context``, so where a volume's pose, a shot's motion
+    beyond it, or a jump carries tissue further through the slices than that, it reads zero; give
+    ``context`` enough slices to cover the largest through-plane displacement. k-space capture is
+    not available chunked. ``progress`` is called as
     ``progress(stage, done, total)``.
     """
     t_start = time.perf_counter()
