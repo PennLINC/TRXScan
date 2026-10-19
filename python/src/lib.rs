@@ -16,6 +16,7 @@
 //! * Dimension mismatches are validated here and raised as `ValueError`; the core's own
 //!   `assert!`s are never reached from Python.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2};
@@ -590,6 +591,102 @@ impl Compartments {
         }
         Ok(out)
     }
+    /// Per-shot motion + slice dropout (P9, `motion::apply_shot_motion`), in place; returns the
+    /// dropped-shot ground truth as dicts. `offsets` are the full stack's per-slice excitation
+    /// offsets (s; `shot_offsets` or a protocol's `SliceTiming`), `tr` the repetition. On a slab,
+    /// `slice_z` gives each local slice's full-stack index and `nz_full` the stack's size: the plan
+    /// is the full stack's, its rotations about the full stack's centre. `volume_poses` (`(n, 6)`,
+    /// `[tx, ty, tz mm, rx, ry, rz deg]`) are the re-simulation path's poses, which the images
+    /// already carry: the geometry applies only the jumps.
+    #[pyo3(signature = (affine, offsets, tr, bvals, b_max, events, slice_z=None, nz_full=None, volume_poses=None, mb=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn apply_shot_motion<'py>(
+        &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64,
+        bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>,
+        slice_z: Option<Vec<usize>>, nz_full: Option<usize>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let v2w = affine4(&affine)?;
+        let bvals = f64s(&bvals)?;
+        let events = events_from(events)?;
+        let poses: Option<Vec<Pose>> = volume_poses.map(|a| {
+            a.as_array().rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect()
+        });
+        let mut g = self.lock()?;
+        check_len("bvals", bvals.len(), g.ngrad)?;
+        let (dims, ngrad) = (g.dims, g.ngrad);
+        let nz_full = nz_full.unwrap_or(dims[2]);
+        check_len("offsets", offsets.len(), nz_full)?;
+        motion::check_shot_timing(&offsets, mb, tr).map_err(verr)?;
+        let z0 = match &slice_z {
+            Some(sz) => {
+                check_len("slice_z", sz.len(), dims[2])?;
+                sz.first().copied().unwrap_or(0)
+            }
+            None => 0,
+        };
+        // the full stack's grid: this grid's affine moved back by its first slice's offset
+        let mut full_v2w = v2w;
+        for r in 0..3 {
+            full_v2w[r][3] -= v2w[r][2] * z0 as f64;
+        }
+        let full = Grid { dims: [dims[0], dims[1], nz_full], voxel_to_world: full_v2w };
+        let n_shots = motion::slice_schedule_from_times(&offsets).len();
+        check_events(&events, ngrad, n_shots)?;
+        let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &full);
+        let c: &mut comp::Compartments = &mut g;
+        let dropped = py.detach(|| motion::apply_shot_motion(
+            &mut c.images, dims, ngrad, v2w, &plan, slice_z.as_deref(), &bvals, b_max,
+        ));
+        let out = PyList::empty(py);
+        for d in dropped {
+            let e = PyDict::new(py);
+            e.set_item("volume", d.volume)?;
+            e.set_item("shot", d.shot)?;
+            e.set_item("slices", d.slices)?;
+            e.set_item("attenuation", d.attenuation as f64)?;
+            out.append(e)?;
+        }
+        Ok(out)
+    }
+    /// [`apply_shot_motion`] with spin history (P9 part C3), on the whole slice stack: returns the
+    /// dropped-shot dicts and the correction summed over compartments (flat, voxel-major
+    /// interleaved, this grid). `t1_s` one per compartment (seconds); `tr` the repetition.
+    #[pyo3(signature = (affine, offsets, tr, t1_s, bvals, b_max, events, volume_poses=None, mb=1))]
+    #[allow(clippy::too_many_arguments)]
+    fn apply_shot_motion_spin_history<'py>(
+        &self, py: Python<'py>, affine: PyReadonlyArray2<'_, f64>, offsets: Vec<f64>, tr: f64, t1_s: Vec<f64>,
+        bvals: PyReadonlyArray1<'_, f64>, b_max: f64, events: &Bound<'_, PyAny>, volume_poses: Option<PyReadonlyArray2<'_, f64>>, mb: usize,
+    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyArray1<f32>>)> {
+        let v2w = affine4(&affine)?;
+        let bvals = f64s(&bvals)?;
+        let events = events_from(events)?;
+        let poses: Option<Vec<Pose>> = volume_poses.map(|a| {
+            a.as_array().rows().into_iter().map(|r| Pose { trans_mm: [r[0], r[1], r[2]], rot_deg: [r[3], r[4], r[5]] }).collect()
+        });
+        let mut g = self.lock()?;
+        check_len("bvals", bvals.len(), g.ngrad)?;
+        let (dims, ngrad) = (g.dims, g.ngrad);
+        check_len("offsets", offsets.len(), dims[2])?;
+        motion::check_shot_timing(&offsets, mb, tr).map_err(verr)?;
+        let grid = Grid { dims, voxel_to_world: v2w };
+        let n_shots = motion::slice_schedule_from_times(&offsets).len();
+        check_events(&events, ngrad, n_shots)?;
+        let plan = motion::ShotPlan::new(&offsets, ngrad, tr, poses.as_deref(), events, &grid);
+        let c: &mut comp::Compartments = &mut g;
+        let (dropped, sum) = py.detach(|| motion::apply_shot_motion_with_spin_history(
+            &mut c.images, &grid, ngrad, &plan, &bvals, b_max, &t1_s, tr,
+        )).map_err(verr)?;
+        let out = PyList::empty(py);
+        for d in dropped {
+            let e = PyDict::new(py);
+            e.set_item("volume", d.volume)?;
+            e.set_item("shot", d.shot)?;
+            e.set_item("slices", d.slices)?;
+            e.set_item("attenuation", d.attenuation as f64)?;
+            out.append(e)?;
+        }
+        Ok((out, PyArray1::from_vec(py, sum)))
+    }
     /// A new `Compartments` holding only the given local slices, in that order.
     fn select_slices(&self, slices: Vec<usize>) -> PyResult<Compartments> {
         let g = self.lock()?;
@@ -858,6 +955,63 @@ fn dropout_seed(run_seed: u64) -> u64 {
 fn dropout_events<'py>(py: Python<'py>, bvals: PyReadonlyArray1<'_, f64>, n_shots: usize, rate: f64, seed: u64) -> PyResult<Bound<'py, PyList>> {
     let bvals = f64s(&bvals)?;
     events_to_py(py, &motion::dropout_events(&bvals, n_shots, rate, seed))
+}
+
+/// Explicit events, checked as `load_motion_events` checks a file (P9): volume and shot in range,
+/// severity in `[0, 1]`, finite jumps, one event per volume and shot, so a run's events table
+/// always replays it.
+fn check_events(events: &[MotionEvent], ngrad: usize, n_shots: usize) -> PyResult<()> {
+    for (i, e) in events.iter().enumerate() {
+        if e.volume >= ngrad || e.shot >= n_shots {
+            return Err(verr(format!("event {i} at volume {}, shot {} is outside {ngrad} volumes of {n_shots} shots", e.volume, e.shot)));
+        }
+        if !(0.0..=1.0).contains(&e.severity) {
+            return Err(verr(format!("event {i}: severity {} is not in [0, 1]", e.severity)));
+        }
+        if !e.jump_mm.iter().chain(&e.jump_deg).all(|x| x.is_finite()) {
+            return Err(verr(format!("event {i}: a jump is not finite")));
+        }
+        if events[..i].iter().any(|f| f.volume == e.volume && f.shot == e.shot) {
+            return Err(verr(format!("event {i}: a second event for volume {}, shot {}", e.volume, e.shot)));
+        }
+    }
+    Ok(())
+}
+
+fn slice_order_from(name: &str) -> PyResult<motion::SliceOrder> {
+    Ok(match name {
+        "interleaved" => motion::SliceOrder::Interleaved,
+        "sequential" => motion::SliceOrder::Sequential,
+        "descending" => motion::SliceOrder::Descending,
+        "odd-first" | "odd_first" => motion::SliceOrder::OddFirst,
+        other => return Err(verr(format!("slice order {other:?}: expected interleaved, sequential, descending or odd-first"))),
+    })
+}
+
+/// Each slice's excitation offset (s) in a repetition of `tr` (`nz` slices, multiband `mb`,
+/// `order` one of `"interleaved"`, `"sequential"`, `"descending"`, `"odd-first"`).
+#[pyfunction]
+fn shot_offsets(nz: usize, mb: usize, order: &str, tr: f64) -> PyResult<Vec<f64>> {
+    motion::shot_offsets(nz, mb, slice_order_from(order)?, tr).map_err(verr)
+}
+
+/// The shots a set of per-slice offsets describes (slices with equal offsets together, in
+/// increasing offset).
+#[pyfunction]
+fn slice_schedule_from_times(offsets: Vec<f64>) -> Vec<Vec<usize>> {
+    motion::slice_schedule_from_times(&offsets)
+}
+
+/// Events from a TSV in aslscan's `desc-motionEvents_gt.tsv` format (attenuation = 1 - severity).
+#[pyfunction]
+fn load_motion_events<'py>(py: Python<'py>, path: PathBuf, n_volumes: usize, n_shots: usize) -> PyResult<Bound<'py, PyList>> {
+    events_to_py(py, &motion::load_motion_events(&path, n_volumes, n_shots).map_err(verr)?)
+}
+
+/// The TSV text [`load_motion_events`] reads back (raw severities, full precision).
+#[pyfunction]
+fn write_motion_events(events: &Bound<'_, PyAny>, schedule: Vec<Vec<usize>>) -> PyResult<String> {
+    Ok(motion::write_motion_events(&events_from(events)?, &schedule))
 }
 
 /// Resolve a motion mode to `(n_units, 6)` absolute poses `[tx, ty, tz mm, rx, ry, rz deg]`.
@@ -1504,6 +1658,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(signal_moving, m)?)?;
     m.add_function(wrap_pyfunction!(dropout_seed, m)?)?;
     m.add_function(wrap_pyfunction!(dropout_events, m)?)?;
+    m.add_function(wrap_pyfunction!(shot_offsets, m)?)?;
+    m.add_function(wrap_pyfunction!(slice_schedule_from_times, m)?)?;
+    m.add_function(wrap_pyfunction!(load_motion_events, m)?)?;
+    m.add_function(wrap_pyfunction!(write_motion_events, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_poses, m)?)?;
     m.add_function(wrap_pyfunction!(poses_to_matrices, m)?)?;
     m.add_function(wrap_pyfunction!(fov_center, m)?)?;
