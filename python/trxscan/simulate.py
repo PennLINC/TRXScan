@@ -333,12 +333,8 @@ def run(
     sel = _resolve_slices(slices, z_mm, obj)
     mo = artifacts.motion
     if mo is not None and mo.sampling == "shot":
-        # P10: the re-simulation rotates about the grid it is given, the shot plan about the whole
-        # stack's centre; they agree only on the whole stack
-        whole = len(sel) == nz and int(obj.z_offset or 0) == 0 and int(obj.nz_full or nz) == nz
-        if chunk is not None or not whole:
-            raise ValueError("Motion(sampling='shot') needs the whole slice stack: no chunk=, slices=, z_mm= or slab object "
-                             "(the re-simulation and the per-shot remainder must share one rotation centre)")
+        # P10: on a slab too, the re-simulation and the shot plan both rotate about the whole stack's
+        # centre, so per-shot sampling works chunked
         if artifacts.shot_events is None and artifacts.dropout > 0.0:
             raise ValueError("Motion(sampling='shot') with Artifacts.dropout: give the dropout as ShotEvents(rate=...), "
                              "which the per-shot path draws from")

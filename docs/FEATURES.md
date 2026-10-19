@@ -70,9 +70,11 @@ future work.
   samples on the run's clock (volume `v` starts at `v x --tr`), usually faster than the repetition,
   so a movement lands where it happened instead of being spread over a repetition. An untimed
   trace is read exactly as before.
-- *Two samplings:* `--motion-sampling volume` (the default; `Motion(sampling="volume")`) gives
-  each volume the trace's pose at its first shot, and the re-simulation alone.
-  `--motion-sampling shot` also gives each shot the trace's pose at its own time. The plan's
+- *Two samplings:* `--motion-sampling shot` (the default for a timed trace;
+  `Motion(sampling="shot")`) gives each shot the trace's pose at its own time.
+  `--motion-sampling volume` (the default for an untimed trace) gives each volume the trace's pose
+  at its first shot, and the re-simulation alone. Per-shot sampling works on chunked and slab runs
+  too: the re-simulation and the shot plan both rotate about the whole stack's centre. The plan's
   `history` is `J . P(t)`, the head's actual pose (spin history uses it). Its `geometry` is
   `J . P(t) . P_v^-1`, the motion left after the re-simulation's `P_v`, which is **resampled, not
   re-simulated**: inside the otherwise faithful `--motion` path, the fibre-gradient angle follows

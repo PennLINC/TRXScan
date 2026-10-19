@@ -242,16 +242,21 @@ def test_shot_motion_bindings_validate_volume_poses(gtab6):
         m.poses_for(2, tr_s=0.0)
 
 
-def test_shot_sampling_refusals(gtab6):
-    # implementation review: shot sampling needs the whole stack (one rotation centre for the
-    # re-simulation and the remainder), and Artifacts.dropout is not silently dropped
-    obj = _streamline_box(nz=6)
+def test_shot_sampling_works_chunked_and_refuses_dropout(gtab6):
+    # per-shot sampling on slabs: the re-simulation and the shot plan both rotate about the whole
+    # stack's centre, so a chunked run equals the unchunked one; Artifacts.dropout is refused
+    # rather than silently dropped
+    obj = _streamline_box(nz=12)
     proto = ts.Protocol.DEFAULT.replace(tr_s=3.0)
-    m = ts.Motion.timed([0.0, 100.0], [[0, 0, 0], [0, 0, 1]], [[0, 0, 0], [0, 0, 5.0]], sampling="shot")
-    with pytest.raises(ValueError, match="whole slice stack"):
-        obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, chunk=2)
-    with pytest.raises(ValueError, match="whole slice stack"):
-        obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, slices=[2, 3])
+    n = int(gtab6.bvals.size)
+    m = ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 1.0, 0.3]], [[0, 0, 0], [0, 0, 5.0]])
+    assert m.sampling == "shot", "a timed trace is sampled per shot by default"
+    full = obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False)
+    chunked = obj.simulate(gtab6, proto, ts.Artifacts(motion=m), kspace=False, clean_b0=False, chunk=4)
+    a = np.asarray(full.magnitude.dataobj, dtype=float)
+    b = np.asarray(chunked.magnitude.dataobj, dtype=float)
+    assert np.allclose(a, b, rtol=1e-5, atol=1e-6 * a.max())
+    assert full.motion_shots == chunked.motion_shots
     with pytest.raises(ValueError, match="ShotEvents"):
         obj.simulate(gtab6, proto.replace(mb=2), ts.Artifacts(motion=m, dropout=0.5), kspace=False, clean_b0=False)
 
@@ -342,10 +347,12 @@ def test_a_timed_trace_sampled_per_shot_writes_each_shots_pose(gtab6):
         v, s, t, z = int(r[0]), int(r[1]), float(r[3]), float(r[6])
         assert t == pytest.approx(3.0 * v + 0.5 * s)
         assert z == pytest.approx(2.0 * t / (3.0 * n), abs=1e-9), "the shot's pose is the trace at its time"
-    # one pose per volume: the re-simulation alone, no shots table
-    vol = obj.simulate(gtab6, proto, ts.Artifacts(motion=ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 0, 2.0]], [[0, 0, 0], [0, 0, 0]])),
-                       kspace=False, clean_b0=False)
+    # one pose per volume, asked for: the re-simulation alone, no shots table
+    once = ts.Motion.timed([0.0, 3.0 * n], [[0, 0, 0], [0, 0, 2.0]], [[0, 0, 0], [0, 0, 0]], sampling="volume")
+    vol = obj.simulate(gtab6, proto, ts.Artifacts(motion=once), kspace=False, clean_b0=False)
     assert vol.motion_shots is None
+    # an untimed trajectory stays one pose per volume
+    assert ts.Motion.from_arrays(np.zeros((2, 3)), np.zeros((2, 3))).sampling == "volume"
     with pytest.raises(ValueError, match="tr_s"):
         obj.simulate(gtab6, ts.Protocol.DEFAULT, ts.Artifacts(motion=ramp), kspace=False, clean_b0=False)
 

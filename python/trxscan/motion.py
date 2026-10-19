@@ -77,10 +77,10 @@ class Motion:
     A **timed** trajectory (P10, ``times`` set) holds samples on the run's clock (volume ``v``
     starts at ``v * Protocol.tr_s``) instead of one row per volume, usually faster than the
     repetition. Each volume's pose is the trace's at its first shot, which the re-simulation uses;
-    with ``sampling="shot"`` each shot also takes the trace's pose at its own time, the motion
-    beyond its volume's pose resampled per shot (not re-simulated: the fibre-gradient angle follows
-    the volume's pose). The trace must cover every time it is sampled at, and is never
-    extrapolated."""
+    with ``sampling="shot"`` (the default for a timed trajectory) each shot also takes the trace's
+    pose at its own time, the motion beyond its volume's pose resampled per shot (not re-simulated:
+    the fibre-gradient angle follows the volume's pose). ``sampling="volume"`` keeps one pose per
+    volume. The trace must cover every time it is sampled at, and is never extrapolated."""
 
     kind: Kind
     #: ``(n, 6)`` ``[tx, ty, tz mm, rx, ry, rz deg]`` for ``"trajectory"``; unused otherwise.
@@ -93,10 +93,13 @@ class Motion:
     #: P10: ``(n,)`` sample times (s) of a timed trajectory, strictly increasing; ``None`` when
     #: the rows are volumes.
     times: np.ndarray | None = None
-    #: P10: ``"volume"`` (one pose per volume) or ``"shot"`` (each shot at its own time).
-    sampling: Literal["volume", "shot"] = "volume"
+    #: P10: ``"volume"`` (one pose per volume) or ``"shot"`` (each shot at its own time); ``None``
+    #: resolves to ``"shot"`` for a timed trajectory and ``"volume"`` otherwise.
+    sampling: Literal["volume", "shot"] | None = None
 
     def __post_init__(self) -> None:
+        if self.sampling is None:
+            object.__setattr__(self, "sampling", "shot" if self.times is not None else "volume")
         if self.sampling not in ("volume", "shot"):
             raise ValueError(f"sampling {self.sampling!r}: expected 'volume' or 'shot'")
         if self.times is not None:
@@ -136,14 +139,14 @@ class Motion:
 
     @classmethod
     def timed(cls, times: Any, trans_mm: Any, rot: Any, *, rot_units: Literal["deg", "rad"] = "deg",
-                    sampling: Literal["volume", "shot"] = "volume", source: str = "timed") -> "Motion":
+                    sampling: Literal["volume", "shot"] | None = None, source: str = "timed") -> "Motion":
         """A timed trajectory (P10) from arrays: ``(n,)`` sample times (s on the run's clock) and
         ``(n, 3)`` translations (mm) and rotations."""
         m = cls.from_arrays(trans_mm, rot, rot_units=rot_units, source=source)
         return dataclasses.replace(m, times=np.ascontiguousarray(np.asarray(times, dtype=np.float64)), sampling=sampling)
 
     @classmethod
-    def from_confounds(cls, path: str | Path, *, sampling: Literal["volume", "shot"] = "volume") -> "Motion":
+    def from_confounds(cls, path: str | Path, *, sampling: Literal["volume", "shot"] | None = None) -> "Motion":
         """From a qsiprep / fMRIPrep-style confounds TSV: columns ``trans_x/y/z`` (mm) and
         ``rot_x/y/z`` (**radians**), one row per volume; ``n/a`` -> 0. Exactly what the CLI's
         ``--motion`` reads (``motion::load_motion_tsv``).
