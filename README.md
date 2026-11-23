@@ -190,8 +190,8 @@ sidecars (`PhaseEncodingDirection`, `TotalReadoutTime`, `EchoTime`, …). Option
 | `--pf-mode <m>` | scanner | partial-Fourier rule: `scanner` (skips the first lines of the train, so the centre is reached sooner), `contiguous` (drops the last lines, timing unchanged) or `fiberfox` |
 | `--noise <var>` | 0 | complex k-space noise variance → Rician magnitude |
 | `--noise-map <nii>` | — | per-voxel noise SD on the acquisition grid (image-space, shared by mag and phase); writes `<out>_desc-noise_sigma.nii.gz` as ground truth |
-| `--eddy <s>` / `--eddy-quad <s>` | 0 | linear / quadratic eddy-current geometric distortion (b0 exempt) |
-| `--eddy-phase <s>` | 0 | direction- and b-dependent eddy phase ramp on the reconstructed phase (about 1.7e-5 matches a 3T HBCD scan) |
+| `--eddy <s>` / `--eddy-quad <s>` | 0 | linear / quadratic eddy-current geometric distortion (b0 exempt), per unit bvec·√bval: eddy currents follow the diffusion gradient's strength. From Python, `Artifacts.eddy_scale` sets the scale per volume (`bvals` gives the drive of 0.3.0 and earlier) |
+| `--eddy-phase <s>` | 0 | direction- and b-dependent eddy phase ramp on the reconstructed phase, per unit bvec·√bval (about 1.7e-5 matched a 3T HBCD scan when the ramp scaled with bvec·bval; not recalibrated since) |
 | `--accel <R>` | 1 | GRAPPA acceleration: each volume reads every R-th line; the kernel is fitted once per series on a separate 24-line reference scan |
 | `--coils <n>` | 1 | receiver coils (ring-arranged sensitivities, Roemer combine) |
 | `--motion <tsv>` | — | qsiprep/eddy confounds TSV (`trans_x/y/z` mm, `rot_x/y/z` rad); per-volume re-simulation. A `time` column (s), or a sidecar at the same path with `.json` holding `SamplingFrequency` (and `StartTime`), makes it a timed trace on the run's clock (volume `v` at `v x --tr`; needs `--tr`), which must cover every time it is sampled at |

@@ -10,7 +10,9 @@ use trxscan::benchmark::{
     factor_grid, gibbs_benchmark_acquisition, phase_model_for, produce_slice, PhaseKind,
 };
 use trxscan::io;
-use trxscan::kspace::{box_hires, default_acquisition, Acquisition, PartialFourierMode, T2Slice};
+use trxscan::kspace::{
+    box_hires, default_acquisition, diffusion_drives, Acquisition, PartialFourierMode, T2Slice,
+};
 use trxscan::phase::ShotPhase;
 use trxscan::raster::Grid;
 
@@ -128,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 produce_slice(
                     &comps, &[T2Slice::Uniform(100.0)], &fmap, &model, &shot,
                     [snx, sny], [n, n], z, nz, &acq,
-                    if bval.abs() > 1e-9 { Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]) } else { None },
+                    diffusion_drives(&[bval], &[bvec], None).0[0],
                     (z as u64).wrapping_mul(0x9E37) ^ 0x51E,
                 )
             })

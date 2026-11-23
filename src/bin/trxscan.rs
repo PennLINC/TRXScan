@@ -239,16 +239,18 @@ struct Cli {
     /// the SD map as <out>_desc-noise_sigma.nii.gz (ground truth for a denoiser's noise estimate).
     #[arg(long, value_name = "NII")]
     noise_map: Option<PathBuf>,
-    /// Linear eddy-current strength (DWI volumes only; b0 exempt)
+    /// Linear eddy-current strength, per unit bvec·√bval: eddy currents follow the diffusion
+    /// gradient's strength (DWI volumes only; b0 exempt)
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy: f64,
-    /// Quadratic eddy-current strength
+    /// Quadratic eddy-current strength, per unit bvec·√bval
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy_quad: f64,
-    /// Eddy-current OBJECT-phase ramp strength (rad per unit bvec·bval per acquired voxel). Unlike
+    /// Eddy-current OBJECT-phase ramp strength (rad per unit bvec·√bval per acquired voxel). Unlike
     /// --eddy (which distorts geometry), this imprints a direction- and b-dependent ramp on the
     /// reconstructed phase, reproducing the per-volume phase variation real DWI shows (~1.7e-5
-    /// matches a 3T HBCD-protocol scan). DWI volumes only.
+    /// matched a 3T HBCD-protocol scan when the ramp scaled with bvec·bval; not recalibrated
+    /// since). DWI volumes only.
     #[arg(long, default_value_t = 0.0, value_name = "S")]
     eddy_phase: f64,
     /// GRAPPA acceleration factor R
@@ -876,6 +878,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             phase: &phase_model,
             seed: cli.seed,
             noise_sigma: noise_sigma.as_deref(),
+            eddy_scale: None,
         },
         &acq,
     );
