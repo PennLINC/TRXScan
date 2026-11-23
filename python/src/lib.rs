@@ -1181,9 +1181,13 @@ fn fov_center(dims: (usize, usize, usize), affine: PyReadonlyArray2<'_, f64>) ->
 /// `kspace` (None, or a dict with `slices`, `nx`, `ny`, `n_coils`, `mask` (bool, ky*nx+kx),
 /// `sensitivities` (coil,y,x), `combined` (vol,slice,y,x as float32 pairs) and, when captured,
 /// `acquired` / `reconstructed` / `coil_images` (vol,slice,coil,ky,kx pairs)).
+///
+/// `eddy_scale` (one value per volume) replaces `sqrt(|bval|)` as the scale of each volume's
+/// eddy-current drive (`kspace::diffusion_drives`); `bvals` reproduces TRXScan 0.3.0's drive.
 #[pyfunction]
 #[pyo3(signature = (comp, fmap, acq_dims, bvals, bvecs, acquisition, phase_model="hbcd", seed=0, noise_sigma=None,
-                    te_per_volume=None, slice_z=None, nz_full=None, kspace_slices=None, capture=(false, false, false), progress=None))]
+                    te_per_volume=None, slice_z=None, nz_full=None, kspace_slices=None, capture=(false, false, false), progress=None,
+                    eddy_scale=None))]
 #[allow(clippy::too_many_arguments)]
 fn simulate_acquisition<'py>(
     py: Python<'py>,
@@ -1201,6 +1205,7 @@ fn simulate_acquisition<'py>(
     kspace_slices: Option<Vec<usize>>,
     capture: (bool, bool, bool),
     progress: Option<Py<PyAny>>,
+    eddy_scale: Option<Vec<f64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let acq = acquisition_from_dict(acquisition)?;
     let scheme = scheme_from(&bvals, &bvecs)?;
@@ -1234,6 +1239,9 @@ fn simulate_acquisition<'py>(
     };
     if let Some(t) = &te_per_volume {
         check_len("te_per_volume", t.len(), ngrad)?;
+    }
+    if let Some(s) = &eddy_scale {
+        check_len("eddy_scale", s.len(), ngrad)?;
     }
     // A readout that starts before its excitation is refused by the acquisition (mrsim-acq's timing
     // check): raise it here as a ValueError, before the GIL is released, instead of a Rust panic.
@@ -1287,6 +1295,7 @@ fn simulate_acquisition<'py>(
             phase: &phase,
             seed,
             noise_sigma: noise_sigma.as_deref(),
+            eddy_scale: eddy_scale.as_deref(),
         };
         let opts = AcquisitionOptions {
             slice_z: slice_z.as_deref(),

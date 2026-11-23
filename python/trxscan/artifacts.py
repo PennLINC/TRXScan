@@ -63,7 +63,10 @@ class Artifacts:
     k-space stage: ``noise`` (complex k-space noise variance -> Rician magnitude noise),
     ``noise_map`` (per-voxel noise SD image on the acquisition grid; writes the truth sigma),
     ``eddy``/``eddy_quad`` (linear/quadratic eddy-current geometric distortion), ``eddy_phase``
-    (eddy phase ramp in the complex output), ``ghost`` (Nyquist ghost kx offset), ``spikes`` +
+    (eddy phase ramp in the complex output), ``eddy_scale`` (one value per volume: the scale of
+    each volume's eddy-current drive, ``bvec * eddy_scale``; by default ``sqrt(bval)``, as eddy
+    currents follow the diffusion gradient's strength; ``bvals`` gives the drive of TRXScan 0.3.0
+    and earlier), ``ghost`` (Nyquist ghost kx offset), ``spikes`` +
     ``spike_amplitude`` (random k-space spikes per slice), ``window`` (reconstruction
     apodization: ``"hann"``, ``("tukey", alpha)``, ``("fermi", radius, width)``),
     ``distortion``/``relaxation`` (fieldmap and T2 effects on/off).
@@ -107,6 +110,7 @@ class Artifacts:
     te_per_volume: Any = None
     receive_bias: float = 0.0
     seed: int = 0
+    eddy_scale: Any = None
 
     def __post_init__(self) -> None:
         if self.motion is not None and not isinstance(self.motion, Motion):
@@ -135,7 +139,7 @@ class Artifacts:
         if not isinstance(other, Artifacts):
             return NotImplemented
         a, b = dataclasses.asdict(self), dataclasses.asdict(other)
-        for k in ("noise_map", "te_per_volume", "motion"):
+        for k in ("noise_map", "te_per_volume", "motion", "eddy_scale"):
             x, y = a.pop(k), b.pop(k)
             if (x is None) != (y is None):
                 return False

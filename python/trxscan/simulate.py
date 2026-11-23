@@ -540,6 +540,11 @@ def run(
         te_pv = [float(v) for v in np.asarray(artifacts.te_per_volume).reshape(-1)]
         if len(te_pv) != ngrad:
             raise ValueError(f"te_per_volume has {len(te_pv)} entries, the scheme {ngrad} volumes")
+    eddy_scale = None
+    if artifacts.eddy_scale is not None:
+        eddy_scale = [float(v) for v in np.asarray(artifacts.eddy_scale, dtype=float).reshape(-1)]
+        if len(eddy_scale) != ngrad:
+            raise ValueError(f"eddy_scale has {len(eddy_scale)} entries, the scheme {ngrad} volumes")
     cap_names = set(kspace_capture)
     bad = cap_names - {"acquired", "reconstructed", "coil_images"}
     if bad:
@@ -552,7 +557,7 @@ def run(
     try:
         out = _core.simulate_acquisition(
             comp_sel, fmap_sel, (nx, ny, nsl), bvals, bvecs, acq, protocol.phase_model, seed, noise_sigma, te_pv,
-            global_z, nz_full, list(range(nsl)) if kspace else None, capture, prog,
+            global_z, nz_full, list(range(nsl)) if kspace else None, capture, prog, eddy_scale=eddy_scale,
         )
     except BaseException as e:  # pyo3 panics are BaseExceptions
         if type(e).__name__ == "PanicException":

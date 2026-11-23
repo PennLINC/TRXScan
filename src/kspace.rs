@@ -9,8 +9,11 @@
 //! - [`SimulationInput`], [`simulate_acquisition`] and [`simulate_acquisition_complex`]: the entry
 //!   point by b-values and gradient directions. mrsim-acq takes the sequence-neutral drives
 //!   instead; the translation is P0's (`mrsim-acq/docs/plans/2026-09-21-p0-mrsim-acq-extraction.md`):
-//!   the eddy drive is `bvec * bval` where `|bval| > 1e-9` (none for b0), the prep-phase drive is
-//!   `(bval, bvec)` for every volume, and each compartment's T2 is a uniform `T2Volume`.
+//!   the eddy drive is `bvec * sqrt(|bval|)` where `|bval| > 1e-9` (none for b0), the prep-phase
+//!   drive is `(bval, bvec)` for every volume, and each compartment's T2 is a uniform `T2Volume`.
+//!   The eddy drive follows the diffusion gradient's strength, which goes as `sqrt(bval)` at fixed
+//!   timing; `SimulationInput::eddy_scale` replaces `sqrt(|bval|)` with any per-volume scale
+//!   (`bval` itself reproduces the drive of TRXScan 0.3.0 and earlier).
 //!
 //! One deliberate difference from the pre-mrsim-acq stage: a readout that starts before its
 //! excitation (`t_echo + t <= 0` on an acquired line) is refused (mrsim-acq's
@@ -72,6 +75,10 @@ pub struct SimulationInput<'a> {
     /// written SD map is the exact ground truth for a denoiser's estimated noise level. This is the
     /// image-space, spatially-varying counterpart to `Acquisition::noise_variance` (uniform, k-space).
     pub noise_sigma: Option<&'a [f32]>,
+    /// Optional per-volume scale of the eddy-current drive, which is then `bvec * eddy_scale[g]`
+    /// instead of `bvec * sqrt(|bval|)` (see [`diffusion_drives`]). It scales the linear and
+    /// quadratic eddy distortion and the eddy phase ramp alike. b0 volumes keep no drive.
+    pub eddy_scale: Option<&'a [f64]>,
 }
 
 /// The acquisition: every (volume, slice) of the object through the forward model — a finer
@@ -103,9 +110,15 @@ pub fn simulate_acquisition_complex(
     acq: &Acquisition,
     opts: &AcquisitionOptions,
 ) -> AcquisitionOutput {
-    let SimulationInput { sim_dims, acq_dims, ngrad, images, t2, fmap, bvals, bvecs, phase, seed, noise_sigma } = *inp;
+    let SimulationInput {
+        sim_dims, acq_dims, ngrad, images, t2, fmap, bvals, bvecs, phase, seed, noise_sigma, eddy_scale,
+    } = *inp;
+    if let Some(s) = eddy_scale {
+        assert!(s.len() >= ngrad, "eddy_scale has {} values for {ngrad} volumes", s.len());
+    }
     // the first `ngrad` entries, as main read them (`bvals[g]`, `bvecs[g]`)
-    let (eddy_drive, prep_drive) = diffusion_drives(&bvals[..ngrad], &bvecs[..ngrad]);
+    let (eddy_drive, prep_drive) =
+        diffusion_drives(&bvals[..ngrad], &bvecs[..ngrad], eddy_scale.map(|s| &s[..ngrad]));
     let t2: Vec<T2Volume> = t2.iter().map(|&v| T2Volume::Uniform(v)).collect();
     let general = AcquisitionInput {
         sim_dims, acq_dims, n_volumes: ngrad, images, t2: &t2, fmap, t_inhom: None, eddy_drive: &eddy_drive,
@@ -114,14 +127,32 @@ pub fn simulate_acquisition_complex(
     mrsim_acq::kspace::simulate_acquisition_complex(&general, acq, opts)
 }
 
-/// The per-volume drives of a diffusion scheme (module docs): the eddy drive `bvec * bval`, or
-/// `None` where `|bval| <= 1e-9` (the decision is made on the b-value, never on the vector), and
-/// the prep-phase drive `(bval, bvec)` exactly as read for every volume, b0 included (the prep
-/// phase's own magnitude guard disables those).
+/// The per-volume drives of a diffusion scheme (module docs): the eddy drive `bvec * scale`, or
+/// `None` where `|bval| <= 1e-9` (the decision is made on the b-value, never on the vector or the
+/// scale), and the prep-phase drive `(bval, bvec)` exactly as read for every volume, b0 included
+/// (the prep phase's own magnitude guard disables those).
+///
+/// Eddy currents follow the diffusion gradient's strength, and at fixed gradient timing the
+/// b-value grows with its square, so the scale is `sqrt(|bval|)` unless `eddy_scale` gives one
+/// per volume (`bval` itself reproduces the drive of TRXScan 0.3.0 and earlier).
+///
+/// # Panics
+/// If `eddy_scale` does not have one value per volume.
 #[allow(clippy::type_complexity)]
-pub fn diffusion_drives(bvals: &[f64], bvecs: &[[f64; 3]]) -> (Vec<Option<[f64; 3]>>, Vec<Option<(f64, [f64; 3])>>) {
-    let eddy = bvals.iter().zip(bvecs)
-        .map(|(&b, v)| if b.abs() > 1e-9 { Some([v[0] * b, v[1] * b, v[2] * b]) } else { None })
+pub fn diffusion_drives(
+    bvals: &[f64],
+    bvecs: &[[f64; 3]],
+    eddy_scale: Option<&[f64]>,
+) -> (Vec<Option<[f64; 3]>>, Vec<Option<(f64, [f64; 3])>>) {
+    if let Some(s) = eddy_scale {
+        assert_eq!(s.len(), bvals.len(), "eddy_scale has {} values for {} volumes", s.len(), bvals.len());
+    }
+    let eddy = bvals.iter().zip(bvecs).enumerate()
+        .map(|(g, (&b, v))| {
+            if b.abs() <= 1e-9 { return None; }
+            let s = eddy_scale.map_or_else(|| b.abs().sqrt(), |s| s[g]);
+            Some([v[0] * s, v[1] * s, v[2] * s])
+        })
         .collect();
     let prep = bvals.iter().zip(bvecs).map(|(&b, &v)| Some((b, v))).collect();
     (eddy, prep)
@@ -150,11 +181,46 @@ mod tests {
         assert_eq!(hbcd_acquisition(0).t_line, 91.7);
     }
 
-    /// The drives: eddy only where the b-value is nonzero, the prep drive for every volume.
+    /// The drives: eddy only where the b-value is nonzero, scaled by the gradient's strength
+    /// (`sqrt(bval)`), the prep drive for every volume.
     #[test]
-    fn diffusion_drives_follow_the_b_value() {
-        let (e, p) = diffusion_drives(&[0.0, 1000.0, 1e-12], &[[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 1.0, 0.0]]);
-        assert_eq!(e, vec![None, Some([600.0, 800.0, 0.0]), None]);
-        assert_eq!(p, vec![Some((0.0, [1.0, 0.0, 0.0])), Some((1000.0, [0.6, 0.8, 0.0])), Some((1e-12, [0.0, 1.0, 0.0]))]);
+    fn diffusion_drives_follow_the_gradient_strength() {
+        let bvecs = [[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let (e, p) = diffusion_drives(&[0.0, 1000.0, 1e-12, 4000.0], &bvecs, None);
+        let s = 1000f64.sqrt();
+        assert_eq!(e, vec![None, Some([0.6 * s, 0.8 * s, 0.0]), None, Some([0.0, 0.0, 4000f64.sqrt()])]);
+        assert_eq!(p, vec![
+            Some((0.0, [1.0, 0.0, 0.0])), Some((1000.0, [0.6, 0.8, 0.0])),
+            Some((1e-12, [0.0, 1.0, 0.0])), Some((4000.0, [0.0, 0.0, 1.0])),
+        ]);
+        // the drive of a b=4000 volume is twice that of a b=1000 volume along the same axis
+        let (e, _) = diffusion_drives(&[1000.0, 4000.0], &[[0.0, 0.0, 1.0]; 2], None);
+        assert_eq!(e[1].unwrap()[2], 2.0 * e[0].unwrap()[2]);
+    }
+
+    /// An explicit scale is used as given; b0 keeps no drive whatever its scale; `bval` as the
+    /// scale reproduces the drive of TRXScan 0.3.0.
+    #[test]
+    fn diffusion_drives_take_an_explicit_scale() {
+        let bvals = [0.0, 1000.0, 2000.0];
+        let bvecs = [[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 1.0, 0.0]];
+        let (e, p) = diffusion_drives(&bvals, &bvecs, Some(&[5.0, 2.0, 0.0]));
+        assert_eq!(e, vec![None, Some([1.2, 1.6, 0.0]), Some([0.0, 0.0, 0.0])]);
+        assert_eq!(p, diffusion_drives(&bvals, &bvecs, None).1);
+        let (old, _) = diffusion_drives(&bvals, &bvecs, Some(&bvals));
+        assert_eq!(old, vec![None, Some([600.0, 800.0, 0.0]), Some([0.0, 2000.0, 0.0])]);
+    }
+
+    /// A negative b-value (an invalid table) gives a finite drive, not NaN.
+    #[test]
+    fn diffusion_drives_stay_finite_on_a_negative_b_value() {
+        let (e, _) = diffusion_drives(&[-1000.0], &[[0.0, 1.0, 0.0]], None);
+        assert_eq!(e, vec![Some([0.0, 1000f64.sqrt(), 0.0])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "eddy_scale has 1 values for 2 volumes")]
+    fn diffusion_drives_refuse_a_scale_of_the_wrong_length() {
+        diffusion_drives(&[1000.0, 2000.0], &[[1.0, 0.0, 0.0]; 2], Some(&[1.0]));
     }
 }
